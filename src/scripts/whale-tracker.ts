@@ -1,5 +1,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { env } from "../config/env.js";
@@ -9,6 +11,8 @@ const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
 const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
 const PERFORMANCE_PATH = './src/data/performance.json';
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -118,8 +122,7 @@ async function logDecision(whaleWallet: string, mint: string) {
       console.warn(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} noch unbekannt. Trade wird trotzdem als aktiv gespeichert.`);
     }
 
-    const activeTradesPath = './src/data/active-trades.json';
-    let activeTrades: any = readJsonFileSync(activeTradesPath, {});
+    let activeTrades: any = readJsonFileSync(ACTIVE_TRADES_PATH, {});
 
     // NEU: Wir speichern jetzt das Hybrid-Objekt inkl. Preis und Wal-Adresse!
     activeTrades[mint] = {
@@ -133,7 +136,7 @@ async function logDecision(whaleWallet: string, mint: string) {
       entryPriceSol: fillPriceSol ?? null
     };
 
-    writeJsonFileSync(activeTradesPath, activeTrades);
+    writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
 
   } catch (e: any) {
     await sendTelegram(`❌ <b>KAUF FEHLGESCHLAGEN</b>\nFehler: ${e.message}`, {
@@ -154,10 +157,9 @@ async function executePanicSell(whaleWallet: string, mint: string) {
   });
 
   try {
-    const activeTradesPath = './src/data/active-trades.json';
-    if (!fs.existsSync(activeTradesPath)) return;
+    if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
     
-    const activeTrades = readJsonFileSync<Record<string, any>>(activeTradesPath, {});
+    const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     
     // Prüfen, ob wir den Token überhaupt noch haben
     if (!activeTrades[mint]) {
@@ -171,7 +173,7 @@ async function executePanicSell(whaleWallet: string, mint: string) {
     activeTrades[mint].panic = true; // Markierung für den Manager
     activeTrades[mint].panicMarkedAt = new Date().toISOString();
     
-    writeJsonFileSync(activeTradesPath, activeTrades);
+    writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
     
     console.log(`[PANIK] Token ${mint.slice(0,6)} für Notverkauf im Sell-Manager markiert!`);
 
@@ -203,8 +205,8 @@ async function start() {
 
       // --- 1. PRÜFE AUF WAL-VERKAUF (PANIK) ---
       try {
-        if (fs.existsSync('./src/data/active-trades.json')) {
-          const activeTrades = readJsonFileSync<Record<string, any>>('./src/data/active-trades.json', {});
+        if (fs.existsSync(ACTIVE_TRADES_PATH)) {
+          const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
           const activeMints = Object.keys(activeTrades);
 
           if (activeMints.length > 0) {

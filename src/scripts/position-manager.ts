@@ -1,5 +1,7 @@
 import fs from 'fs';
+import path from 'path';
 import { Connection, PublicKey } from "@solana/web3.js";
+import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
@@ -10,16 +12,18 @@ const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
 
 function readActiveTrades(): Record<string, any> {
-  return readJsonFileSync('./src/data/active-trades.json', {});
+  return readJsonFileSync(ACTIVE_TRADES_PATH, {});
 }
 
 function writeActiveTrades(activeTrades: Record<string, any>) {
-  writeJsonFileSync('./src/data/active-trades.json', activeTrades);
+  writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
 }
 
 function markTradeExitState(mint: string, patch: Record<string, unknown> | null): boolean {
@@ -240,7 +244,7 @@ async function getCurrentPrice(mint: string): Promise<number | null> {
 
 async function monitorPositions() {
   try {
-    if (!fs.existsSync('./src/data/active-trades.json')) return;
+    if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
     const walletAddress = getTrackedWalletAddress();
     const walletPubKey = new PublicKey(walletAddress);
     const connection = new Connection(RPC_URL);
