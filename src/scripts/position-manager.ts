@@ -19,6 +19,7 @@ const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
 const SELL_RETRY_ATTEMPTS = 3;
 const SELL_RETRY_DELAY_MS = 2_500;
+const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
 
 function readActiveTrades(): Record<string, any> {
   return readJsonFileSync(ACTIVE_TRADES_PATH, {});
@@ -54,6 +55,153 @@ function markTradeExitState(mint: string, patch: Record<string, unknown> | null)
 function toFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function fetchSolUsdPrice(): Promise<number | null> {
+  try {
+    const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
+    const data = await response.json();
+    const price = Number(data?.data?.[SOL_MINT]?.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+function getAccountKeyString(accountKey: unknown): string | undefined {
+  if (!accountKey) {
+    return undefined;
+  }
+
+  if (typeof accountKey === 'string') {
+    return accountKey;
+  }
+
+  if (typeof accountKey === 'object' && accountKey !== null) {
+    const maybePubkey = 'pubkey' in accountKey ? (accountKey as { pubkey?: unknown }).pubkey : accountKey;
+    if (typeof maybePubkey === 'string') {
+      return maybePubkey;
+    }
+
+    if (typeof maybePubkey === 'object' && maybePubkey !== null && 'toBase58' in maybePubkey) {
+      const toBase58 = (maybePubkey as { toBase58?: () => string }).toBase58;
+      if (typeof toBase58 === 'function') {
+        return toBase58.call(maybePubkey);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function getWalletNativeSolDelta(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string): number | undefined {
+  const accountKeys = (parsedTx?.transaction.message as { accountKeys?: unknown[] } | undefined)?.accountKeys;
+  const walletIndex = accountKeys?.findIndex((accountKey) => getAccountKeyString(accountKey) === walletAddress) ?? -1;
+
+  if (walletIndex < 0) {
+    return undefined;
+  }
+
+  const preBalance = parsedTx?.meta?.preBalances?.[walletIndex];
+  const postBalance = parsedTx?.meta?.postBalances?.[walletIndex];
+
+  if (preBalance === undefined || postBalance === undefined) {
+    return undefined;
+  }
+
+  return (postBalance - preBalance) / 1_000_000_000;
+}
+
+function getTokenDeltaUi(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string, mint: string): number | undefined {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+
+  if (deltaRaw === 0n) {
+    return undefined;
+  }
+
+  return Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+}
+
+async function tryBackfillEntryPrice(params: {
+  connection: Connection;
+  walletAddress: string;
+  mint: string;
+  tradeData: Record<string, any>;
+  activeTrades: Record<string, any>;
+}): Promise<boolean> {
+  const existingEntryPrice = toFiniteNumber(params.tradeData.entryPrice);
+  if (existingEntryPrice && existingEntryPrice > 0) {
+    return false;
+  }
+
+  const entryTxid = typeof params.tradeData.entryTxid === 'string' ? params.tradeData.entryTxid : undefined;
+  if (!entryTxid) {
+    return false;
+  }
+
+  const parsedTx = await params.connection.getParsedTransaction(entryTxid, {
+    maxSupportedTransactionVersion: 0,
+    commitment: 'confirmed',
+  });
+
+  if (!parsedTx) {
+    return false;
+  }
+
+  const nativeSolDelta = getWalletNativeSolDelta(parsedTx, params.walletAddress);
+  const tokenDeltaUi = getTokenDeltaUi(parsedTx, params.walletAddress, params.mint);
+
+  if (nativeSolDelta === undefined || nativeSolDelta >= 0 || !tokenDeltaUi || tokenDeltaUi <= 0) {
+    return false;
+  }
+
+  const fillPriceSol = Math.abs(nativeSolDelta) / tokenDeltaUi;
+  const solUsdPrice = await fetchSolUsdPrice();
+  const fillPriceUsd = solUsdPrice ? fillPriceSol * solUsdPrice : null;
+
+  params.tradeData.entryPriceSol = fillPriceSol;
+  params.tradeData.entryPrice = fillPriceUsd;
+  params.tradeData.entryPriceSource = fillPriceUsd ? 'receipt-backfill' : 'receipt-backfill-sol-only';
+  params.tradeData.entryBackfilledAt = new Date().toISOString();
+  params.activeTrades[params.mint] = params.tradeData;
+  writeActiveTrades(params.activeTrades);
+
+  console.log(`[MONITOR] Entry-Preis fuer ${params.mint.slice(0,6)} nachtraeglich aus TX ${entryTxid.slice(0,8)}... ergaenzt.`);
+  return true;
+}
+
+function isWithinBalanceGracePeriod(tradeData: unknown): boolean {
+  if (!tradeData || typeof tradeData !== 'object') {
+    return false;
+  }
+
+  const graceUntil = (tradeData as { balanceCheckGraceUntil?: unknown }).balanceCheckGraceUntil;
+  if (typeof graceUntil === 'string') {
+    const graceUntilMs = Date.parse(graceUntil);
+    if (Number.isFinite(graceUntilMs) && Date.now() < graceUntilMs) {
+      return true;
+    }
+  }
+
+  const openedAt = (tradeData as { openedAt?: unknown }).openedAt;
+  if (typeof openedAt === 'string') {
+    const openedAtMs = Date.parse(openedAt);
+    if (Number.isFinite(openedAtMs) && Date.now() - openedAtMs < NEW_POSITION_BALANCE_GRACE_MS) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function sleep(ms: number) {
@@ -306,6 +454,11 @@ async function monitorPositions() {
         }
 
         if (balance === 0) {
+          if (isWithinBalanceGracePeriod(activeTrades[mint])) {
+            console.warn(`[MONITOR] ${mint.slice(0,6)} noch ohne sichtbaren Token-Account. Loeschung waehrend Grace-Period uebersprungen.`);
+            continue;
+          }
+
           delete activeTrades[mint];
           writeActiveTrades(activeTrades);
           highWaterMarks.delete(mint);
@@ -315,6 +468,27 @@ async function monitorPositions() {
 
         const tradeData = activeTrades[mint];
         const hasStructuredTrade = typeof tradeData === 'object' && tradeData !== null;
+
+        if (hasStructuredTrade && tradeData.balanceCheckGraceUntil) {
+          delete tradeData.balanceCheckGraceUntil;
+          activeTrades[mint] = tradeData;
+          writeActiveTrades(activeTrades);
+        }
+
+        if (hasStructuredTrade) {
+          const backfilled = await tryBackfillEntryPrice({
+            connection,
+            walletAddress,
+            mint,
+            tradeData,
+            activeTrades,
+          });
+
+          if (backfilled) {
+            missingEntryWarnings.delete(mint);
+          }
+        }
+
         const baseline = hasStructuredTrade ? Number(tradeData.entryPrice) : Number.NaN;
         const hasValidEntryPrice = Number.isFinite(baseline) && baseline > 0;
 

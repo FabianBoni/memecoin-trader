@@ -10,6 +10,7 @@ import { loadExecutionWallet } from "../wallet.js";
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
 const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
 const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
@@ -25,6 +26,22 @@ function formatSolAmount(value: unknown): string {
   }
 
   return parsed >= 0.1 ? parsed.toFixed(3) : parsed.toFixed(4);
+}
+
+function getExecutedBuySizeSol(executionReceipt: any, fallbackSol: number): number {
+  if (executionReceipt?.inputMint === SOL_MINT) {
+    const quotedLamports = Number(executionReceipt.inputAmount);
+    if (Number.isFinite(quotedLamports) && quotedLamports > 0) {
+      return quotedLamports / 1_000_000_000;
+    }
+  }
+
+  const fallbackReceiptAmount = Number(executionReceipt?.inputAmountUi);
+  if (Number.isFinite(fallbackReceiptAmount) && fallbackReceiptAmount > 0) {
+    return fallbackReceiptAmount;
+  }
+
+  return fallbackSol;
 }
 
 function shouldSuppressBuyFailureTelegram(error: unknown): boolean {
@@ -45,6 +62,20 @@ const getWhales = (): string[] => {
     return [];
   }
 };
+
+function logSizingConfiguration() {
+  const defaultSize = env.AUTO_BUY_AMOUNT_SOL;
+  const eliteSize = Number(process.env.AUTO_BUY_ELITE_AMOUNT_SOL || defaultSize);
+  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || defaultSize);
+
+  console.log('[CONFIG] Whale sizing geladen:', {
+    walletAddress: WALLET_ADDRESS,
+    defaultSizeSol: defaultSize,
+    eliteSizeSol: eliteSize,
+    lowSizeSol: minimalSize,
+    minimumSampleSize: 3,
+  });
+}
 
 function getPositionSizeProfile(whaleWallet: string) {
   const defaultSize = env.AUTO_BUY_AMOUNT_SOL;
@@ -108,6 +139,8 @@ async function logDecision(whaleWallet: string, mint: string) {
     ? `${positionProfile.sampleSize} Trades (Testphase)`
     : `${positionProfile.winRate.toFixed(0)}% aus ${positionProfile.sampleSize} Trades`;
 
+  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whaleWallet.slice(0,8)}... tier=${positionProfile.tier} size=${positionProfile.positionSol} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'}`);
+
   try {
     const { executeJupiter } = await import("./execute-trade.js");
     const executionReceipt = await executeJupiter({
@@ -144,6 +177,7 @@ async function logDecision(whaleWallet: string, mint: string) {
       whale: whaleWallet,
       entryPrice: entryPrice ?? null,
       openedAt: new Date().toISOString(),
+      balanceCheckGraceUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
       positionSol: positionProfile.positionSol,
       whaleWinRateAtEntry: positionProfile.winRate,
       entryPriceSource: fillSource,
@@ -155,10 +189,7 @@ async function logDecision(whaleWallet: string, mint: string) {
 
     const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     const activeCount = Object.keys(persistedTrades).length;
-    const executedSol = Number(executionReceipt?.inputAmountUi);
-    const actualSizeSol = Number.isFinite(executedSol) && executedSol > 0
-      ? executedSol
-      : positionProfile.positionSol;
+    const actualSizeSol = getExecutedBuySizeSol(executionReceipt, positionProfile.positionSol);
 
     await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
@@ -225,6 +256,7 @@ async function executePanicSell(whaleWallet: string, mint: string) {
 // --- HAUPTSCHLEIFE ---
 async function start() {
   console.log("🏹 Jäger-Bot ONLINE (Präzisions-Modus inkl. Panik-Schild & Kassenzettel)");
+  logSizingConfiguration();
 
   connection.onLogs("all", async (logs) => {
     const whales = getWhales();

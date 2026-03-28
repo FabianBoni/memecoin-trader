@@ -17,7 +17,10 @@
     "trade:execute": "tsx src/scripts/execute-trade.ts",
     "monitor:positions": "tsx src/scripts/monitor-positions.ts",
     "position:manager": "tsx src/scripts/position-manager.ts",
-    "whale:tracker": "tsx src/scripts/whale-tracker.ts"
+    "whale:tracker": "tsx src/scripts/whale-tracker.ts",
+    "whale:scout": "tsx src/scripts/whale-scout.ts",
+    "dashboard": "tsx src/scripts/dashboard.ts",
+    "profit:report": "tsx src/scripts/profit-report.ts"
   },
   "dependencies": {
     "@pump-fun/pump-sdk": "^1.32.0",
