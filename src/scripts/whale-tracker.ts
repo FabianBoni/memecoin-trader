@@ -55,6 +55,78 @@ function shouldSuppressBuyFailureTelegram(error: unknown): boolean {
     || message.includes('signature has expired');
 }
 
+function isSlippageExceededError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes('slippagetoleranceexceeded')
+    || message.includes('custom program error: 6001')
+    || message.includes('exactoutamountnotmatched')
+    || message.includes('custom program error: 6017');
+}
+
+function isVolatileBuyToken(mint: string): boolean {
+  return mint.toLowerCase().endsWith('pump');
+}
+
+function getBuySlippageLadder(mint: string): number[] {
+  const baseSlippage = env.MAX_JUPITER_BUY_SLIPPAGE_BPS;
+  const volatileSlippage = Math.max(baseSlippage, env.MAX_JUPITER_VOLATILE_BUY_SLIPPAGE_BPS);
+
+  if (isVolatileBuyToken(mint) && volatileSlippage > baseSlippage) {
+    return [baseSlippage, volatileSlippage];
+  }
+
+  return [baseSlippage, baseSlippage];
+}
+
+async function executeBuyWithRetry(params: {
+  mint: string;
+  positionSol: number;
+}) {
+  const { executeJupiter } = await import('./execute-trade.js');
+  const slippageLadder = getBuySlippageLadder(params.mint);
+  let lastError: unknown;
+
+  for (let attemptIndex = 0; attemptIndex < slippageLadder.length; attemptIndex += 1) {
+    const maxSlippageBps = slippageLadder[attemptIndex];
+
+    try {
+      console.log(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} mit ${maxSlippageBps} bps.`);
+      const receipt = await executeJupiter({
+        planId: `AUTO-${Date.now()}-A${attemptIndex + 1}`,
+        tokenAddress: params.mint,
+        finalPositionSol: params.positionSol,
+        maxSlippageBps,
+        executionMode: 'jupiter',
+        dryRun: false,
+      } as any);
+
+      if (!receipt?.confirmed) {
+        throw new Error(`Buy execution returned without on-chain confirmation for ${params.mint}.`);
+      }
+
+      return { receipt, maxSlippageBps, attempts: attemptIndex + 1 };
+    } catch (error) {
+      lastError = error;
+      console.error(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} fehlgeschlagen:`, error);
+
+      const canRetry = attemptIndex < slippageLadder.length - 1;
+      if (!canRetry) {
+        break;
+      }
+
+      if (!isSlippageExceededError(error) && !shouldSuppressBuyFailureTelegram(error)) {
+        break;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(`Buy execution failed for ${params.mint}.`);
+}
+
 const getWhales = (): string[] => {
   try {
     return readJsonFileSync(WHALES_PATH, []);
@@ -73,6 +145,8 @@ function logSizingConfiguration() {
     defaultSizeSol: defaultSize,
     eliteSizeSol: eliteSize,
     lowSizeSol: minimalSize,
+    baseBuySlippageBps: env.MAX_JUPITER_BUY_SLIPPAGE_BPS,
+    volatileBuySlippageBps: env.MAX_JUPITER_VOLATILE_BUY_SLIPPAGE_BPS,
     minimumSampleSize: 3,
   });
 }
@@ -142,16 +216,16 @@ async function logDecision(whaleWallet: string, mint: string) {
   console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whaleWallet.slice(0,8)}... tier=${positionProfile.tier} size=${positionProfile.positionSol} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'}`);
 
   try {
-    const { executeJupiter } = await import("./execute-trade.js");
-    const executionReceipt = await executeJupiter({
-      planId: `AUTO-${Date.now()}`,
-      tokenAddress: mint,
-      finalPositionSol: positionProfile.positionSol,
-      executionMode: "jupiter",
-      dryRun: false
-    } as any);
+    const { receipt: executionReceipt, maxSlippageBps, attempts } = await executeBuyWithRetry({
+      mint,
+      positionSol: positionProfile.positionSol,
+    });
 
     const entryPrice = executionReceipt?.fillPriceUsd ?? await fetchEntryPriceUsd(mint);
+    if (!executionReceipt?.confirmed) {
+      throw new Error(`Trade for ${mint} was not confirmed on-chain and will not be persisted.`);
+    }
+
     if (!entryPrice) {
       await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`, {
         dedupeKey: `entry-price-unknown:${mint}`,
@@ -191,7 +265,7 @@ async function logDecision(whaleWallet: string, mint: string) {
     const activeCount = Object.keys(persistedTrades).length;
     const actualSizeSol = getExecutedBuySizeSol(executionReceipt, positionProfile.positionSol);
 
-    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
       cooldownMs: 300_000,
       priority: true,

@@ -50,6 +50,7 @@ const envSchema = z.object({
   JITO_BUNDLE_TIP_LAMPORTS: optionalNonNegativeInt(),
   MAX_PRIORITY_FEE_SOL: z.coerce.number().nonnegative().default(0.01),
   MAX_JUPITER_BUY_SLIPPAGE_BPS: z.coerce.number().int().positive().default(250),
+  MAX_JUPITER_VOLATILE_BUY_SLIPPAGE_BPS: z.coerce.number().int().positive().default(500),
   MAX_JUPITER_SELL_SLIPPAGE_BPS: z.coerce.number().int().positive().default(500),
   MAX_JUPITER_PRICE_IMPACT_PCT: z.coerce.number().nonnegative().default(15),
   MAX_JUPITER_ROUTE_HOPS: z.coerce.number().int().positive().default(2),
