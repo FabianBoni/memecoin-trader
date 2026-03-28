@@ -60,6 +60,8 @@ const envSchema = z.object({
   DEFAULT_STOP_LOSS_PCT: z.coerce.number().positive().default(30),
   DEFAULT_TAKE_PROFIT_PCT: z.coerce.number().positive().default(100),
   DEFAULT_TAKE_PROFIT_SELL_FRACTION: z.coerce.number().positive().max(1).default(0.5),
+  TRAILING_ARM_PCT: z.coerce.number().nonnegative().default(25),
+  TRAILING_DISTANCE_PCT: z.coerce.number().nonnegative().default(15),
   REQUIRE_EXPLICIT_GO: z
     .string()
     .optional()

@@ -6,10 +6,13 @@ import { sendTelegram } from "./telegram-notifier.js";
 import { logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { loadExecutionWallet } from "../wallet.js";
+import { env } from "../config/env.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
+const TRAILING_ARM_PCT = env.TRAILING_ARM_PCT;
+const TRAILING_DISTANCE_PCT = env.TRAILING_DISTANCE_PCT;
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -595,14 +598,14 @@ async function monitorPositions() {
         const maxSeen = highWaterMarks.get(mint) || changePct;
         let dynamicStopLoss = STOP_LOSS;
 
-        if (maxSeen >= 50) {
-          dynamicStopLoss = maxSeen - 30;
+        if (maxSeen >= TRAILING_ARM_PCT) {
+          dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
         }
 
         console.log(`[MONITOR] ${mint.slice(0,6)} | PnL: ${changePct.toFixed(1)}% | Max: ${maxSeen.toFixed(1)}% | SL: ${dynamicStopLoss.toFixed(1)}%`);
 
         if (changePct <= dynamicStopLoss) {
-          if (maxSeen >= 50) {
+          if (maxSeen >= TRAILING_ARM_PCT) {
             await logExitSignal(mint, balance, changePct, rawAmount, "TRAILING STOP (Gewinn gesichert!)");
           } else {
             await logExitSignal(mint, balance, changePct, rawAmount, "STOP LOSS");
