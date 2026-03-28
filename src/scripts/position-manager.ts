@@ -2,10 +2,12 @@ import fs from 'fs';
 import path from 'path';
 import { Connection, PublicKey } from "@solana/web3.js";
 import { fileURLToPath } from 'url';
+import { DexscreenerClient } from '../clients/dexscreener.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { discardPaperWhalePerformance, logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
+import type { DexPairSummary } from '../types/market.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { env, getReadOnlyRpcUrl } from "../config/env.js";
 import { sleep, withRpcRetry } from '../solana/rpc-guard.js';
@@ -31,9 +33,12 @@ const SELL_RETRY_DELAY_MS = 2_500;
 const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
 const paperHighWaterMarks = new Map<string, number>();
 const PRICE_CACHE_TTL_MS = 15_000;
+const DEX_PRICE_CACHE_TTL_MS = 60_000;
 const PAPER_TRADE_NO_PRICE_TIMEOUT_MS = 30 * 60 * 1000;
 const PAPER_TRADE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
+const dexPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
+const inFlightDexPriceRequests = new Map<string, Promise<number | null>>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 const RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 const FRACTION_SCALE = 10_000n;
@@ -41,6 +46,7 @@ const connection = new Connection(RPC_URL, {
   commitment: 'confirmed',
   disableRetryOnRateLimit: true,
 });
+const dexscreenerClient = new DexscreenerClient();
 let monitorRunInProgress = false;
 
 type WalletTokenBalance = {
@@ -233,6 +239,49 @@ async function fetchSolUsdPrice(): Promise<number | null> {
     solUsdPriceCache.price = null;
     return null;
   }
+}
+
+function getBestDexPriceUsd(pairs: DexPairSummary[]): number | null {
+  const bestPair = [...pairs]
+    .filter((pair) => pair.chainId === 'solana')
+    .filter((pair) => Number.isFinite(Number(pair.priceUsd)) && Number(pair.priceUsd) > 0)
+    .sort((left, right) => Number(right.liquidity?.usd ?? 0) - Number(left.liquidity?.usd ?? 0))[0];
+
+  if (!bestPair) {
+    return null;
+  }
+
+  const priceUsd = Number(bestPair.priceUsd);
+  return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+}
+
+async function getDexscreenerPrice(mint: string): Promise<number | null> {
+  const cached = dexPriceCache.get(mint);
+  if (cached && (Date.now() - cached.fetchedAt) < DEX_PRICE_CACHE_TTL_MS) {
+    return cached.price;
+  }
+
+  const inFlight = inFlightDexPriceRequests.get(mint);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async () => {
+    try {
+      const pairs = await dexscreenerClient.searchTokenPairs(mint);
+      const resolvedPrice = getBestDexPriceUsd(pairs);
+      dexPriceCache.set(mint, { fetchedAt: Date.now(), price: resolvedPrice });
+      return resolvedPrice;
+    } catch {
+      dexPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
+      return null;
+    }
+  })().finally(() => {
+    inFlightDexPriceRequests.delete(mint);
+  });
+
+  inFlightDexPriceRequests.set(mint, request);
+  return request;
 }
 
 function getAccountKeyString(accountKey: unknown): string | undefined {
@@ -759,9 +808,9 @@ async function logExitSignal(
   }
 }
 
-async function getCurrentPrice(mint: string): Promise<number | null> {
+async function getCurrentPrice(mint: string, options?: { allowDexscreenerFallback?: boolean }): Promise<number | null> {
   const cached = tokenPriceCache.get(mint);
-  if (cached && (Date.now() - cached.fetchedAt) < PRICE_CACHE_TTL_MS) {
+  if (cached && (Date.now() - cached.fetchedAt) < PRICE_CACHE_TTL_MS && cached.price !== null) {
     return cached.price;
   }
 
@@ -774,11 +823,15 @@ async function getCurrentPrice(mint: string): Promise<number | null> {
       return resolvedPrice;
     }
     tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
-    return null;
   } catch (e) {
     tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
-    return null;
   }
+
+  if (options?.allowDexscreenerFallback) {
+    return getDexscreenerPrice(mint);
+  }
+
+  return null;
 }
 
 async function getPaperTradeChangePct(trade: Record<string, any>, currentPriceUsd: number): Promise<number | null> {
@@ -865,7 +918,7 @@ async function monitorPaperTrades() {
 
     const tradeAgeMs = getTradeAgeMs(trade);
 
-    const currentPrice = await getCurrentPrice(mint);
+    const currentPrice = await getCurrentPrice(mint, { allowDexscreenerFallback: true });
     if (!currentPrice) {
       if (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_NO_PRICE_TIMEOUT_MS) {
         const lastObservedChangePct = toFiniteNumber(trade.lastObservedChangePct);
