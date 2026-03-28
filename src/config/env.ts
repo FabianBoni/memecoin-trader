@@ -4,6 +4,22 @@ import { createLogger, type LogLevel } from "../utils/logger.js";
 
 loadDotEnv();
 
+function emptyStringToUndefined(value: unknown): unknown {
+  return typeof value === "string" && value.trim().length === 0 ? undefined : value;
+}
+
+function optionalString() {
+  return z.preprocess(emptyStringToUndefined, z.string().optional());
+}
+
+function optionalUrl() {
+  return z.preprocess(emptyStringToUndefined, z.string().url().optional());
+}
+
+function optionalNonNegativeInt() {
+  return z.preprocess(emptyStringToUndefined, z.coerce.number().int().nonnegative().optional());
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -16,22 +32,22 @@ const envSchema = z.object({
     .optional()
     .transform((value) => value === undefined ? false : value.toLowerCase() === "true"),
   STORE_PATH: z.string().default("./data"),
-  HELIUS_API_KEY: z.string().optional(),
-  HELIUS_RPC_URL: z.string().url().optional(),
-  BIRDEYE_API_KEY: z.string().optional(),
-  SOLANA_RPC_URL: z.string().url().optional(),
-  FALLBACK_MAINNET_RPC_URL: z.string().url().optional(),
+  HELIUS_API_KEY: optionalString(),
+  HELIUS_RPC_URL: optionalUrl(),
+  BIRDEYE_API_KEY: optionalString(),
+  SOLANA_RPC_URL: optionalUrl(),
+  FALLBACK_MAINNET_RPC_URL: optionalUrl(),
   DEXSCREENER_BASE_URL: z.string().url().default("https://api.dexscreener.com/latest"),
-  SOLANA_WALLET_PUBLIC_KEY: z.string().optional(),
-  SOLANA_WALLET_PRIVATE_KEY: z.string().optional(),
-  SOLANA_PRIVATE_KEY: z.string().optional(),
-  RAYDIUM_AMM_PROGRAM_ID: z.string().optional(),
-  PUMPFUN_PROGRAM_ID: z.string().optional(),
-  PUMPFUN_AMM_PROGRAM_ID: z.string().optional(),
-  LP_LOCKER_ADDRESSES: z.string().optional(),
-  JITO_BLOCK_ENGINE_URL: z.string().url().optional(),
-  JITO_AUTH_KEY: z.string().optional(),
-  JITO_BUNDLE_TIP_LAMPORTS: z.coerce.number().int().nonnegative().optional(),
+  SOLANA_WALLET_PUBLIC_KEY: optionalString(),
+  SOLANA_WALLET_PRIVATE_KEY: optionalString(),
+  SOLANA_PRIVATE_KEY: optionalString(),
+  RAYDIUM_AMM_PROGRAM_ID: optionalString(),
+  PUMPFUN_PROGRAM_ID: optionalString(),
+  PUMPFUN_AMM_PROGRAM_ID: optionalString(),
+  LP_LOCKER_ADDRESSES: optionalString(),
+  JITO_BLOCK_ENGINE_URL: optionalUrl(),
+  JITO_AUTH_KEY: optionalString(),
+  JITO_BUNDLE_TIP_LAMPORTS: optionalNonNegativeInt(),
   MAX_PRIORITY_FEE_SOL: z.coerce.number().nonnegative().default(0.01),
   MAX_JUPITER_BUY_SLIPPAGE_BPS: z.coerce.number().int().positive().default(250),
   MAX_JUPITER_SELL_SLIPPAGE_BPS: z.coerce.number().int().positive().default(500),
