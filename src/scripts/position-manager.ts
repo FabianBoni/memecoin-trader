@@ -27,6 +27,8 @@ const SELL_RETRY_DELAY_MS = 2_500;
 const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
 const paperHighWaterMarks = new Map<string, number>();
 const PRICE_CACHE_TTL_MS = 15_000;
+const PAPER_TRADE_NO_PRICE_TIMEOUT_MS = 30 * 60 * 1000;
+const PAPER_TRADE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 
@@ -540,6 +542,19 @@ async function getPaperTradeChangePct(trade: Record<string, any>, currentPriceUs
   return ((currentPriceUsd - entryPriceUsd) / entryPriceUsd) * 100;
 }
 
+function getTradeAgeMs(trade: Record<string, any>): number | null {
+  if (typeof trade.openedAt !== 'string') {
+    return null;
+  }
+
+  const openedAtMs = Date.parse(trade.openedAt);
+  if (!Number.isFinite(openedAtMs)) {
+    return null;
+  }
+
+  return Math.max(0, Date.now() - openedAtMs);
+}
+
 async function monitorPaperTrades() {
   const paperTrades = readPaperTrades();
   const paperTradeIds = Object.keys(paperTrades);
@@ -553,8 +568,17 @@ async function monitorPaperTrades() {
       continue;
     }
 
+    const tradeAgeMs = getTradeAgeMs(trade);
+
     const currentPrice = await getCurrentPrice(mint);
     if (!currentPrice) {
+      if (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_NO_PRICE_TIMEOUT_MS) {
+        await logPaperWhalePerformance(whale, false);
+        delete paperTrades[tradeId];
+        writePaperTrades(paperTrades);
+        paperHighWaterMarks.delete(tradeId);
+        console.log(`[PAPER] NO-PRICE EXIT ${mint.slice(0,6)} fuer ${whale.slice(0,8)} nach ${Math.round(tradeAgeMs / 60000)}m als Loss geschlossen.`);
+      }
       continue;
     }
 
@@ -574,7 +598,10 @@ async function monitorPaperTrades() {
       dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
     }
 
-    const shouldClose = trade.panic || changePct <= dynamicStopLoss || changePct >= 1000;
+    const shouldClose = trade.panic
+      || changePct <= dynamicStopLoss
+      || changePct >= 1000
+      || (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_MAX_AGE_MS);
     if (!shouldClose) {
       continue;
     }
@@ -584,7 +611,12 @@ async function monitorPaperTrades() {
     delete paperTrades[tradeId];
     writePaperTrades(paperTrades);
     paperHighWaterMarks.delete(tradeId);
-    console.log(`[PAPER] ${trade.panic ? 'PANIC' : 'EXIT'} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${changePct.toFixed(2)}% geschlossen.`);
+    const exitReason = trade.panic
+      ? 'PANIC'
+      : (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_MAX_AGE_MS)
+        ? 'TIME EXIT'
+        : 'EXIT';
+    console.log(`[PAPER] ${exitReason} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${changePct.toFixed(2)}% geschlossen.`);
   }
 }
 
