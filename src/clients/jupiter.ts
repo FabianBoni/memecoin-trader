@@ -8,7 +8,19 @@ export interface JupiterQuoteResponse {
   otherAmountThreshold: string;
   swapMode: string;
   slippageBps: number;
-  routePlan?: unknown[];
+  priceImpactPct?: string;
+  routePlan?: Array<{
+    percent?: number;
+    swapInfo?: {
+      inputMint?: string;
+      outputMint?: string;
+      inAmount?: string;
+      outAmount?: string;
+      feeAmount?: string;
+      feeMint?: string;
+      label?: string;
+    };
+  }>;
 }
 
 export interface JupiterSwapResponse {

@@ -43,6 +43,53 @@ function amountToUiAmount(amount: bigint, decimals: number): number {
   return Number(amount) / 10 ** decimals;
 }
 
+function getEffectiveMaxSlippageBps(plan: TradePlan, isSellOrder: boolean): number {
+  const requestedSlippage = typeof plan.maxSlippageBps === "number" && Number.isFinite(plan.maxSlippageBps)
+    ? plan.maxSlippageBps
+    : (isSellOrder ? env.MAX_JUPITER_SELL_SLIPPAGE_BPS : env.MAX_JUPITER_BUY_SLIPPAGE_BPS);
+
+  const hardCap = isSellOrder ? env.MAX_JUPITER_SELL_SLIPPAGE_BPS : env.MAX_JUPITER_BUY_SLIPPAGE_BPS;
+  return Math.min(requestedSlippage, hardCap);
+}
+
+function validateJupiterQuote(params: {
+  quote: JupiterQuoteResponse;
+  effectiveMaxSlippageBps: number;
+  isSellOrder: boolean;
+  tokenAddress: string;
+}) {
+  if (params.quote.slippageBps > params.effectiveMaxSlippageBps) {
+    throw new Error(
+      `Trade aborted: Quote slippage ${params.quote.slippageBps} bps exceeds hard limit ${params.effectiveMaxSlippageBps} bps.`,
+    );
+  }
+
+  const routeHops = params.quote.routePlan?.length ?? 0;
+  if (routeHops > env.MAX_JUPITER_ROUTE_HOPS) {
+    throw new Error(
+      `Trade aborted: Jupiter route uses ${routeHops} hops for ${params.tokenAddress}, above safety limit ${env.MAX_JUPITER_ROUTE_HOPS}.`,
+    );
+  }
+
+  const priceImpactPct = Number(params.quote.priceImpactPct);
+  if (Number.isFinite(priceImpactPct) && priceImpactPct > env.MAX_JUPITER_PRICE_IMPACT_PCT) {
+    throw new Error(
+      `Trade aborted: Price impact ${priceImpactPct.toFixed(2)}% exceeds safety limit ${env.MAX_JUPITER_PRICE_IMPACT_PCT}%.`,
+    );
+  }
+
+  const worstCaseOutput = Number(params.quote.otherAmountThreshold);
+  const expectedOutput = Number(params.quote.outAmount);
+  if (Number.isFinite(worstCaseOutput) && Number.isFinite(expectedOutput) && expectedOutput > 0) {
+    const worstCaseHaircutPct = ((expectedOutput - worstCaseOutput) / expectedOutput) * 100;
+    if (worstCaseHaircutPct > env.MAX_JUPITER_PRICE_IMPACT_PCT && !params.isSellOrder) {
+      throw new Error(
+        `Trade aborted: Worst-case output haircut ${worstCaseHaircutPct.toFixed(2)}% exceeds safety limit ${env.MAX_JUPITER_PRICE_IMPACT_PCT}% on buy route.`,
+      );
+    }
+  }
+}
+
 async function fetchSolUsdPrice(): Promise<number | null> {
   try {
     const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
@@ -256,7 +303,7 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
     );
   }
 
-  if (plan.maxSlippageBps <= 0) {
+  if (typeof plan.maxSlippageBps === "number" && plan.maxSlippageBps <= 0) {
     throw new Error(`Plan ${plan.planId} has invalid maxSlippageBps.`);
   }
 
@@ -288,19 +335,22 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
 
   // Nimm die rohe Zahl (amount) beim Verkaufen, sonst rechne SOL in Lamports um beim Kaufen
   const quoteAmount = anyPlan.amount ? String(anyPlan.amount) : solToLamportsString(plan.finalPositionSol);
-  const quoteSlippage = plan.maxSlippageBps || (isSellOrder ? 1500 : 1000);
+  const effectiveMaxSlippageBps = getEffectiveMaxSlippageBps(plan, Boolean(isSellOrder));
 
   const quote = await jupiter.getQuote({
     inputMint: quoteInputMint,
     outputMint: quoteOutputMint,
     amount: quoteAmount,
-    slippageBps: quoteSlippage,
+    slippageBps: effectiveMaxSlippageBps,
   });
   // --- END DUAL MODE ---
 
-  if (quote.slippageBps > plan.maxSlippageBps) {
-    console.warn(`Quote slippage ${quote.slippageBps} exceeds plan max slippage ${plan.maxSlippageBps}, but proceeding due to dynamic adjustments.`);
-  }
+  validateJupiterQuote({
+    quote,
+    effectiveMaxSlippageBps,
+    isSellOrder: Boolean(isSellOrder),
+    tokenAddress: plan.tokenAddress,
+  });
 
   const swapParams: {
     quoteResponse: typeof quote;

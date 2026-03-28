@@ -19,13 +19,14 @@ const getWhales = (): string[] => {
 };
 
 function getPositionSizeProfile(whaleWallet: string) {
-  const fullSize = Number(process.env.AUTO_BUY_AMOUNT_SOL || 0.05);
-  const reducedSize = Number(process.env.AUTO_BUY_MID_AMOUNT_SOL || Math.min(fullSize, 0.1));
-  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || Math.min(reducedSize, 0.02));
+  const defaultSize = Number(process.env.AUTO_BUY_AMOUNT_SOL || 0.1);
+  const eliteSize = Number(process.env.AUTO_BUY_ELITE_AMOUNT_SOL || 0.3);
+  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || 0.02);
+  const minimumSampleSize = 3;
 
   try {
     if (!fs.existsSync(PERFORMANCE_PATH)) {
-      return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+      return { positionSol: defaultSize, sampleSize: 0, winRate: null as number | null, tier: "test" };
     }
 
     const performance = JSON.parse(fs.readFileSync(PERFORMANCE_PATH, 'utf-8'));
@@ -33,25 +34,25 @@ function getPositionSizeProfile(whaleWallet: string) {
       ? performance[whaleWallet].filter((value: unknown) => typeof value === 'boolean')
       : [];
 
-    if (history.length === 0) {
-      return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+    if (history.length < minimumSampleSize) {
+      return { positionSol: defaultSize, sampleSize: history.length, winRate: null as number | null, tier: "test" };
     }
 
     const wins = history.filter(Boolean).length;
     const winRate = (wins / history.length) * 100;
 
     if (winRate > 60) {
-      return { positionSol: fullSize, sampleSize: history.length, winRate, tier: "full" };
+      return { positionSol: eliteSize, sampleSize: history.length, winRate, tier: "elite" };
     }
 
-    if (winRate >= 30) {
-      return { positionSol: reducedSize, sampleSize: history.length, winRate, tier: "reduced" };
+    if (winRate < 40) {
+      return { positionSol: minimalSize, sampleSize: history.length, winRate, tier: "caution" };
     }
 
-    return { positionSol: minimalSize, sampleSize: history.length, winRate, tier: "minimal" };
+    return { positionSol: defaultSize, sampleSize: history.length, winRate, tier: "standard" };
   } catch (error) {
     console.error("Konnte Wal-Performance nicht auswerten:", error);
-    return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+    return { positionSol: defaultSize, sampleSize: 0, winRate: null as number | null, tier: "test" };
   }
 }
 
@@ -76,10 +77,14 @@ async function logDecision(whaleWallet: string, mint: string) {
   const positionProfile = getPositionSizeProfile(whaleWallet);
 
   const winRateLabel = positionProfile.winRate === null
-    ? "keine Historie"
+    ? `${positionProfile.sampleSize} Trades (Testphase)`
     : `${positionProfile.winRate.toFixed(0)}% aus ${positionProfile.sampleSize} Trades`;
 
-  await sendTelegram(`🚀 <b>WAL-SIGNAL!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBetrag: ${positionProfile.positionSol} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}`);
+  await sendTelegram(`🚀 <b>WAL-SIGNAL!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBetrag: ${positionProfile.positionSol} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}`, {
+    dedupeKey: `whale-signal:${whaleWallet}:${mint}`,
+    cooldownMs: 30 * 60 * 1000,
+    priority: true,
+  });
 
   try {
     const { executeJupiter } = await import("./execute-trade.js");
@@ -93,7 +98,10 @@ async function logDecision(whaleWallet: string, mint: string) {
 
     const entryPrice = executionReceipt?.fillPriceUsd ?? await fetchEntryPriceUsd(mint);
     if (!entryPrice) {
-      await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`);
+      await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`, {
+        dedupeKey: `entry-price-unknown:${mint}`,
+        cooldownMs: 6 * 60 * 60 * 1000,
+      });
       return;
     }
 
@@ -123,14 +131,22 @@ async function logDecision(whaleWallet: string, mint: string) {
     fs.writeFileSync(activeTradesPath, JSON.stringify(activeTrades, null, 2));
 
   } catch (e: any) {
-    await sendTelegram(`❌ <b>KAUF FEHLGESCHLAGEN</b>\nFehler: ${e.message}`);
+    await sendTelegram(`❌ <b>KAUF FEHLGESCHLAGEN</b>\nFehler: ${e.message}`, {
+      dedupeKey: `buy-failed:${mint}:${e.message}`,
+      cooldownMs: 300_000,
+      priority: true,
+    });
   }
 }
 
 // --- VERKAUFS LOGIK (Panik-Exit / Wal-Verkauf) ---
 async function executePanicSell(whaleWallet: string, mint: string) {
   console.log(`🚨 [PANIK] Wal ${whaleWallet.slice(0,6)} verkauft ${mint.slice(0,6)}! Notverkauf initiiert!`);
-  await sendTelegram(`🚨 <b>WAL EXIT ERKANNT!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBot triggert sofortigen Panik-Verkauf!`);
+  await sendTelegram(`🚨 <b>WAL EXIT ERKANNT!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBot triggert sofortigen Panik-Verkauf!`, {
+    dedupeKey: `panic-exit:${whaleWallet}:${mint}`,
+    cooldownMs: 60 * 60 * 1000,
+    priority: true,
+  });
 
   try {
     const activeTradesPath = './src/data/active-trades.json';
@@ -140,7 +156,10 @@ async function executePanicSell(whaleWallet: string, mint: string) {
     
     // Prüfen, ob wir den Token überhaupt noch haben
     if (!activeTrades[mint]) {
-         await sendTelegram(`ℹ <b>INFO</b>\nToken: ${mint.slice(0,6)}...\nWal hat verkauft, aber wir waren schon vorher draußen!`);
+         await sendTelegram(`ℹ <b>INFO</b>\nToken: ${mint.slice(0,6)}...\nWal hat verkauft, aber wir waren schon vorher draußen!`, {
+           dedupeKey: `already-out:${mint}`,
+           cooldownMs: 60 * 60 * 1000,
+         });
          return;
     }
 
@@ -153,7 +172,11 @@ async function executePanicSell(whaleWallet: string, mint: string) {
 
   } catch (e: any) {
     console.error("Panik-Markierung fehlgeschlagen:", e);
-    await sendTelegram(`❌ <b>PANIK-MARKIERUNG FEHLGESCHLAGEN</b>\nToken: ${mint.slice(0,6)}\nFehler: ${e.message}`);
+    await sendTelegram(`❌ <b>PANIK-MARKIERUNG FEHLGESCHLAGEN</b>\nToken: ${mint.slice(0,6)}\nFehler: ${e.message}`, {
+      dedupeKey: `panic-mark-failed:${mint}:${e.message}`,
+      cooldownMs: 300_000,
+      priority: true,
+    });
   }
 }
 

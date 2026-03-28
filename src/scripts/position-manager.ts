@@ -42,7 +42,11 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       console.log("Konnte active-trades.json nicht lesen.");
     }
 
-    await sendTelegram(`${emoji} <b>${reason} TRIGGER</b>\nToken: <code>${mint}</code>\nChange: ${changePct.toFixed(2)}%\nSelling: ${balance} Units`);
+    await sendTelegram(`${emoji} <b>${reason} TRIGGER</b>\nToken: <code>${mint}</code>\nChange: ${changePct.toFixed(2)}%\nSelling: ${balance} Units`, {
+      dedupeKey: `sell-trigger:${mint}:${reason}`,
+      cooldownMs: 120_000,
+      priority: true,
+    });
 
     // 1. Verkauf ausführen
     const { executeJupiter } = await import("./execute-trade.js");
@@ -113,10 +117,18 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         console.error("Konnte Historie nicht speichern:", histErr);
     }
 
-    await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...\nRealized PnL: ${realizedChangePct.toFixed(2)}%\nQuelle: ${priceSource}`);
+    await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...\nRealized PnL: ${realizedChangePct.toFixed(2)}%\nQuelle: ${priceSource}`, {
+      dedupeKey: `sell-success:${mint}`,
+      cooldownMs: 300_000,
+      priority: true,
+    });
   } catch (e: any) {
     console.error("❌ Auto-Sell failed:", e);
-    await sendTelegram(`❌ <b>SELL FAILED</b>\nToken: ${mint.slice(0,6)}\nError: ${e.message}`);
+    await sendTelegram(`❌ <b>SELL FAILED</b>\nToken: ${mint.slice(0,6)}\nError: ${e.message}`, {
+      dedupeKey: `sell-failed:${mint}:${e.message}`,
+      cooldownMs: 300_000,
+      priority: true,
+    });
   }
 }
 
@@ -184,7 +196,10 @@ async function monitorPositions() {
           if (!missingEntryWarnings.has(mint)) {
             missingEntryWarnings.add(mint);
             console.warn(`[MONITOR] ${mint.slice(0,6)} uebersprungen: entryPrice fehlt oder ist ungueltig.`);
-            await sendTelegram(`⚠️ <b>ENTRY PRICE FEHLT</b>\nToken: <code>${mint}</code>\nDer Trade wird nicht ueberwacht, bis ein gueltiger entryPrice gespeichert ist.`);
+            await sendTelegram(`⚠️ <b>ENTRY PRICE FEHLT</b>\nToken: <code>${mint}</code>\nDer Trade wird nicht ueberwacht, bis ein gueltiger entryPrice gespeichert ist.`, {
+              dedupeKey: `entry-price-missing:${mint}`,
+              cooldownMs: 6 * 60 * 60 * 1000,
+            });
           }
           continue;
         }
