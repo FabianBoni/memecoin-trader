@@ -12,6 +12,7 @@ import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
+import type { TokenSecurityScreen } from '../types/token.js';
 import { sendTelegram } from "./telegram-notifier.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
@@ -727,6 +728,16 @@ async function getPriceExtensionPct(params: {
   return null;
 }
 
+function isSoftPaperTokenScreenFailure(screen: TokenSecurityScreen): boolean {
+  if (!screen.mintAuthorityRevoked || !screen.freezeAuthorityRevoked) {
+    return false;
+  }
+
+  const reasons = screen.reasons.map((reason) => reason.toLowerCase());
+  return screen.liquidityCheckStatus === 'unknown'
+    && reasons.some((reason) => reason.includes('unable to determine lp mint address'));
+}
+
 async function evaluateEntryDecision(
   whale: WhaleRecord,
   mint: string,
@@ -743,22 +754,6 @@ async function evaluateEntryDecision(
 
   if (entryPrice === null || entryPrice <= 0) {
     rejectionReasons.push('Kein belastbarer Einstiegspreis verfuegbar.');
-  }
-
-  try {
-    const screen = await tokenScreenService.screenToken(mint);
-    if (!screen.passed) {
-      rejectionReasons.push(`Token-Screen fehlgeschlagen: ${(screen.reasons[0] ?? 'unbekannt').slice(0, 160)}`);
-    }
-    if (screen.warnings.length > 0) {
-      notes.push(screen.warnings[0]!);
-    }
-  } catch (error) {
-    if (whale.mode === 'paper' && isSolanaRpcRateLimitError(error)) {
-      notes.push('Token-Screen temporär rate-limited, Paper-Trade wird trotzdem bewertet.');
-    } else {
-      rejectionReasons.push(`Token-Screen Fehler: ${error instanceof Error ? error.message : String(error)}`);
-    }
   }
 
   if (!Number.isFinite(Number(liquidityUsd)) || Number(liquidityUsd) < env.MIN_ENTRY_LIQUIDITY_USD) {
@@ -790,6 +785,28 @@ async function evaluateEntryDecision(
 
   if (whaleBuySizeSol === null) {
     notes.push('Whale-Buy-Groesse konnte nicht belastbar in SOL abgeleitet werden.');
+  }
+
+  if (rejectionReasons.length === 0) {
+    try {
+      const screen = await tokenScreenService.screenToken(mint);
+      if (!screen.passed) {
+        if (whale.mode === 'paper' && isSoftPaperTokenScreenFailure(screen)) {
+          notes.push(`Token-Screen unvollstaendig: ${(screen.reasons[0] ?? 'unbekannt').slice(0, 160)} Paper-Trade wird trotzdem bewertet.`);
+        } else {
+          rejectionReasons.push(`Token-Screen fehlgeschlagen: ${(screen.reasons[0] ?? 'unbekannt').slice(0, 160)}`);
+        }
+      }
+      if (screen.warnings.length > 0) {
+        notes.push(screen.warnings[0]!);
+      }
+    } catch (error) {
+      if (whale.mode === 'paper' && isSolanaRpcRateLimitError(error)) {
+        notes.push('Token-Screen temporär rate-limited, Paper-Trade wird trotzdem bewertet.');
+      } else {
+        rejectionReasons.push(`Token-Screen Fehler: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   return {

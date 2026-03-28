@@ -11,6 +11,9 @@ export function isSolanaRpcRateLimitError(error: unknown): boolean {
 
   const message = error.message.toLowerCase();
   return message.includes('429 too many requests')
+    || message.includes('too many requests')
+    || message.includes('status 429')
+    || message.includes('status: 429')
     || message.includes('rate limited')
     || message.includes('code":-32429')
     || message.includes('error code: 429');
