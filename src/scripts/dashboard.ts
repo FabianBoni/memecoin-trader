@@ -44,6 +44,13 @@ function formatPct(value: unknown): string {
     return `${parsed > 0 ? '+' : ''}${parsed.toFixed(2)}%`;
 }
 
+function formatDateTime(value: unknown): string {
+    if (typeof value !== 'string' || value.trim().length === 0) return 'n/a';
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) return escapeHtml(value);
+    return new Date(parsed).toLocaleString('de-DE');
+}
+
 function escapeHtml(value: unknown): string {
     return String(value)
         .replace(/&/g, '&amp;')
@@ -56,7 +63,9 @@ function escapeHtml(value: unknown): string {
 app.get('/', (req, res) => {
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const activeTrades = safeReadJSON('active-trades.json', {});
+    const paperTrades = safeReadJSON('paper-trades.json', {});
     const performance = safeReadJSON('performance.json', {});
+    const paperPerformance = safeReadJSON('paper-performance.json', {});
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
     const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
     const liveWhales = whales.length - paperWhales;
@@ -82,6 +91,31 @@ app.get('/', (req, res) => {
 
     const totalTrades = totalWins + totalLosses;
     const globalWinRate = totalTrades > 0 ? Math.round((totalWins / totalTrades) * 100) : 0;
+    const paperWhaleStats = whales
+        .filter((whale) => whale.mode === 'paper')
+        .map((whale) => {
+            const tradeResults = Array.isArray(paperPerformance[whale.address])
+                ? paperPerformance[whale.address].filter((value: unknown) => typeof value === 'boolean')
+                : [];
+            const wins = tradeResults.filter(Boolean).length;
+            const losses = tradeResults.filter((value: boolean) => value === false).length;
+            const total = wins + losses;
+            return {
+                ...whale,
+                wins,
+                losses,
+                total,
+                streak: tradeResults.slice(-3).map((value: boolean) => value ? 'W' : 'L').join(' '),
+                winRate: total > 0 ? Math.round((wins / total) * 100) : null,
+            };
+        })
+        .sort((a, b) => {
+            if ((b.total ?? 0) !== (a.total ?? 0)) {
+                return (b.total ?? 0) - (a.total ?? 0);
+            }
+            return Date.parse(b.discoveredAt ?? '') - Date.parse(a.discoveredAt ?? '');
+        });
+    const paperTradeCount = Object.keys(paperTrades).length;
     const historyRows = Array.isArray(history) ? history : [];
     const realizedPnlValues = historyRows
         .map((trade: any) => Number(trade.pnl))
@@ -131,6 +165,42 @@ app.get('/', (req, res) => {
         </table>`;
     }
 
+    let paperTradesHTML = '<p class="text-slate-500 text-center py-8 italic">Keine offenen Paper-Trades.</p>';
+    if (paperTradeCount > 0) {
+        const rows = Object.values(paperTrades).map((trade: any) => {
+            const whaleAddress = typeof trade?.whale === 'string' ? trade.whale : 'Unknown';
+            const openedAt = typeof trade?.openedAt === 'string' ? trade.openedAt : null;
+            const paperEntry = Number(trade?.entryPrice);
+            const paperWhale = whales.find((whale) => whale.address === whaleAddress);
+            const statusBadge = trade?.panic
+                ? '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">panic</span>'
+                : '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">paper</span>';
+            return `
+            <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
+                <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${trade.mint}" target="_blank">${String(trade.mint).slice(0, 8)}...${String(trade.mint).slice(-4)}</a></td>
+                <td class="py-3 font-mono text-xs text-slate-400">${escapeHtml(whaleAddress.slice(0,8))}...</td>
+                <td class="py-3 text-xs text-slate-300">${formatUsd(paperEntry)}</td>
+                <td class="py-3 text-xs text-slate-400">${formatDateTime(openedAt)}</td>
+                <td class="py-3 text-xs text-slate-400">${paperWhale?.paperTrades ?? 0}/3</td>
+                <td class="py-3 text-right pr-2 text-xs">${statusBadge}</td>
+            </tr>`;
+        }).join('');
+        paperTradesHTML = `
+        <table class="w-full text-left">
+            <thead>
+                <tr class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-700/50">
+                    <th class="pb-3 pl-2">Token</th>
+                    <th class="pb-3">Wal</th>
+                    <th class="pb-3">Entry USD</th>
+                    <th class="pb-3">Opened</th>
+                    <th class="pb-3">Sample</th>
+                    <th class="pb-3 pr-2 text-right">Status</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+    }
+
     // Wal Leaderboard generieren
     let whaleStatsHTML = '<p class="text-slate-500 text-center py-8 italic">Keine Daten.</p>';
     if (whaleStats.length > 0) {
@@ -146,6 +216,28 @@ app.get('/', (req, res) => {
                     <span class="${stat.winRate >= 50 ? 'text-blue-400' : 'text-slate-500'} w-10 text-right">${stat.winRate}%</span>
                 </div>
             </div>`).join('');
+    }
+
+    let paperWhalesHTML = '<p class="text-slate-500 text-center py-8 italic">Keine Paper-Wale in Quarantäne.</p>';
+    if (paperWhaleStats.length > 0) {
+        paperWhalesHTML = paperWhaleStats.map((stat) => {
+            const readyForPromotion = stat.total >= 3 && (stat.winRate ?? 0) >= 60;
+            const statusBadge = readyForPromotion
+                ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">promotion ready</span>'
+                : `<span class="text-slate-300 bg-slate-700/40 px-2 py-1 rounded">${stat.total}/3 geprüft</span>`;
+            return `
+            <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
+                <div>
+                    <div class="font-mono text-sm text-slate-300">${escapeHtml(stat.address.slice(0,8))}...</div>
+                    <div class="text-[11px] text-slate-500">Discovery: ${formatDateTime(stat.discoveredAt)} · Streak: ${stat.streak || 'n/a'}</div>
+                </div>
+                <div class="text-right">
+                    <div class="text-xs font-bold text-amber-300">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`}</div>
+                    <div class="text-[11px] text-slate-500 mb-1">W ${stat.wins} / L ${stat.losses}</div>
+                    ${statusBadge}
+                </div>
+            </div>`;
+        }).join('');
     }
 
     // NEU: Trade Historie generieren
@@ -215,9 +307,10 @@ app.get('/', (req, res) => {
             <div class="flex items-center space-x-2 bg-emerald-900/30 text-emerald-400 px-4 py-2 rounded-full border border-emerald-800/50"><div class="w-2.5 h-2.5 bg-emerald-500 rounded-full pulse"></div><span class="text-sm font-semibold">LIVE</span></div>
         </div>
 
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
             <div class="glass-card border-t-4 border-t-blue-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Wale</h2><p class="text-3xl font-black">${whales.length}</p><p class="text-xs text-slate-500 mt-1">Live ${liveWhales} · Paper ${paperWhales}</p></div>
             <div class="glass-card border-t-4 border-t-yellow-400"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Positionen</h2><p class="text-3xl font-black text-yellow-400">${Object.keys(activeTrades).length}</p></div>
+            <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Trades</h2><p class="text-3xl font-black text-amber-300">${paperTradeCount}</p><p class="text-xs text-slate-500 mt-1">Quarantäne aktiv</p></div>
             <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Total Trades</h2><p class="text-3xl font-black">${totalTrades}</p></div>
             <div class="glass-card border-t-4 ${averageRealizedPnl >= 0 ? 'border-t-emerald-500' : 'border-t-red-500'}"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Avg Realized PnL</h2><p class="text-3xl font-black ${averageRealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(averageRealizedPnl)}</p><p class="text-xs text-slate-500 mt-1">Win-Rate ${globalWinRate}%</p></div>
         </div>
@@ -225,6 +318,11 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-yellow-500/20 p-2 rounded-lg mr-3 text-yellow-500">🎯</span> Live Positionen</h2><div class="overflow-x-auto">${activeTradesHTML}</div></div>
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-purple-500/20 p-2 rounded-lg mr-3 text-purple-400">🏆</span> Wal Leaderboard</h2><div class="max-h-[300px] overflow-y-auto custom-scrollbar pr-2">${whaleStatsHTML}</div></div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+            <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-amber-500/20 p-2 rounded-lg mr-3 text-amber-300">🧪</span> Paper Trades</h2><div class="overflow-x-auto">${paperTradesHTML}</div></div>
+            <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-cyan-500/20 p-2 rounded-lg mr-3 text-cyan-300">🛰️</span> Quarantäne-Wale</h2><div class="max-h-[300px] overflow-y-auto custom-scrollbar pr-2">${paperWhalesHTML}</div></div>
         </div>
 
         <div class="glass-card">
