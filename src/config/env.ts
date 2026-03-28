@@ -53,7 +53,7 @@ const envSchema = z.object({
   MAX_JUPITER_SELL_SLIPPAGE_BPS: z.coerce.number().int().positive().default(500),
   MAX_JUPITER_PRICE_IMPACT_PCT: z.coerce.number().nonnegative().default(15),
   MAX_JUPITER_ROUTE_HOPS: z.coerce.number().int().positive().default(2),
-  AUTO_BUY_AMOUNT_SOL: z.coerce.number().positive().default(0.1),
+  AUTO_BUY_AMOUNT_SOL: z.coerce.number().positive().default(0.3),
   DEFAULT_MAX_POSITION_SOL: z.coerce.number().positive().default(0.3),
   DEFAULT_MAX_OPEN_EXPOSURE_SOL: z.coerce.number().positive().default(0.5),
   DEFAULT_MAX_SLIPPAGE_BPS: z.coerce.number().int().positive().default(250),

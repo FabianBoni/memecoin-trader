@@ -2,6 +2,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import fs from 'fs';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { env } from "../config/env.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
@@ -20,9 +21,9 @@ const getWhales = (): string[] => {
 };
 
 function getPositionSizeProfile(whaleWallet: string) {
-  const defaultSize = Number(process.env.AUTO_BUY_AMOUNT_SOL || 0.1);
-  const eliteSize = Number(process.env.AUTO_BUY_ELITE_AMOUNT_SOL || 0.3);
-  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || 0.02);
+  const defaultSize = env.AUTO_BUY_AMOUNT_SOL;
+  const eliteSize = Number(process.env.AUTO_BUY_ELITE_AMOUNT_SOL || defaultSize);
+  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || defaultSize);
   const minimumSampleSize = 3;
 
   try {
@@ -103,13 +104,18 @@ async function logDecision(whaleWallet: string, mint: string) {
         dedupeKey: `entry-price-unknown:${mint}`,
         cooldownMs: 6 * 60 * 60 * 1000,
       });
-      return;
     }
 
-    const fillSource = executionReceipt?.priceSource ?? "fallback-quote";
+    const fillSource = entryPrice
+      ? (executionReceipt?.priceSource ?? "fallback-quote")
+      : "unavailable";
     const fillTxid = executionReceipt?.txid;
     const fillPriceSol = executionReceipt?.fillPriceSol;
-    console.log(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} gesichert: $${entryPrice} (${fillSource})`);
+    if (entryPrice) {
+      console.log(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} gesichert: $${entryPrice} (${fillSource})`);
+    } else {
+      console.warn(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} noch unbekannt. Trade wird trotzdem als aktiv gespeichert.`);
+    }
 
     const activeTradesPath = './src/data/active-trades.json';
     let activeTrades: any = readJsonFileSync(activeTradesPath, {});
@@ -117,13 +123,13 @@ async function logDecision(whaleWallet: string, mint: string) {
     // NEU: Wir speichern jetzt das Hybrid-Objekt inkl. Preis und Wal-Adresse!
     activeTrades[mint] = {
       whale: whaleWallet,
-      entryPrice,
+      entryPrice: entryPrice ?? null,
       openedAt: new Date().toISOString(),
       positionSol: positionProfile.positionSol,
       whaleWinRateAtEntry: positionProfile.winRate,
       entryPriceSource: fillSource,
       entryTxid: fillTxid,
-      entryPriceSol: fillPriceSol
+      entryPriceSol: fillPriceSol ?? null
     };
 
     writeJsonFileSync(activeTradesPath, activeTrades);

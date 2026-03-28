@@ -1,7 +1,8 @@
 import express from 'express';
-import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
+import { readJsonFileSync } from '../storage/json-file-sync.js';
 
 const app = express();
 
@@ -11,13 +12,13 @@ app.use(basicAuth({
 }));
 
 const PORT = 3000;
-const DATA_DIR = './src/data';
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const DATA_DIR = path.resolve(SCRIPT_DIR, '../data');
 
 function safeReadJSON(filename: string, defaultData: any) {
     try {
         const filePath = path.join(DATA_DIR, filename);
-        if (!fs.existsSync(filePath)) return defaultData;
-        return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        return readJsonFileSync(filePath, defaultData);
     } catch (e) {
         return defaultData;
     }
