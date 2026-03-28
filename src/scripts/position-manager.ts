@@ -7,10 +7,10 @@ import { discardPaperWhalePerformance, logPaperWhalePerformance, logWhalePerform
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
-import { env } from "../config/env.js";
+import { env, getReadOnlyRpcUrl } from "../config/env.js";
 import { sleep, withRpcRetry } from '../solana/rpc-guard.js';
 
-const RPC_URL = process.env.HELIUS_RPC_URL || "";
+const RPC_URL = getReadOnlyRpcUrl();
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
 const TAKE_PROFIT_SELL_FRACTION = env.DEFAULT_TAKE_PROFIT_SELL_FRACTION;
@@ -37,7 +37,10 @@ const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | nul
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 const RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 const FRACTION_SCALE = 10_000n;
-const connection = new Connection(RPC_URL);
+const connection = new Connection(RPC_URL, {
+  commitment: 'confirmed',
+  disableRetryOnRateLimit: true,
+});
 let monitorRunInProgress = false;
 
 type WalletTokenBalance = {

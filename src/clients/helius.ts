@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { env, getHeliusRpcUrl } from "../config/env.js";
+import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from "../config/env.js";
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from "../solana/rpc-guard.js";
 import type { RawAccountInfo, SplTokenMintAccountInfo, TokenAccountInfo } from "../types/token.js";
 
@@ -233,14 +233,14 @@ export class HeliusClient {
           writeRpcCache(cacheKey, result, cacheTtlMs);
           return result;
         } catch (error) {
+          const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl);
           if (
             rpcUrl === this.rpcUrl
-            && env.FALLBACK_MAINNET_RPC_URL
-            && env.FALLBACK_MAINNET_RPC_URL !== rpcUrl
+            && fallbackRpcUrl !== rpcUrl
             && isSolanaRpcRateLimitError(error)
           ) {
             console.warn(`Helius RPC rate limited for ${method}. Retrying via fallback RPC.`);
-            return this.doRpcRequest<T>(body, method, env.FALLBACK_MAINNET_RPC_URL);
+            return this.doRpcRequest<T>(body, method, fallbackRpcUrl);
           }
 
           throw error;
@@ -267,12 +267,14 @@ export class HeliusClient {
       [tokenAddress, { encoding: "jsonParsed" }],
     );
 
-    if (result.value === null && env.FALLBACK_MAINNET_RPC_URL) {
+    const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl);
+
+    if (result.value === null && fallbackRpcUrl !== this.rpcUrl) {
       result = await this.rpcRequest<GetAccountInfoResult<SplTokenMintAccountInfo>>(
         `mint-fallback-${tokenAddress}`,
         "getAccountInfo",
         [tokenAddress, { encoding: "jsonParsed" }],
-        env.FALLBACK_MAINNET_RPC_URL,
+        fallbackRpcUrl,
       );
     }
 

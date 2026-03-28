@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { DexscreenerClient } from '../clients/dexscreener.js';
-import { env } from "../config/env.js";
+import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from "../config/env.js";
 import { riskConfig } from '../config/risk.js';
 import { TokenScreenService } from '../services/token-screen.js';
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
@@ -12,12 +12,22 @@ import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
+import type { DexPairSummary } from '../types/market.js';
 import type { TokenSecurityScreen } from '../types/token.js';
 import { sendTelegram } from "./telegram-notifier.js";
 
-const RPC_URL = process.env.HELIUS_RPC_URL || "";
-const WS_URL = RPC_URL.replace("https://", "wss://");
-const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
+const PRIMARY_RPC_URL = getHeliusRpcUrl();
+const READ_RPC_URL = getReadOnlyRpcUrl(PRIMARY_RPC_URL);
+const WS_URL = PRIMARY_RPC_URL.replace("https://", "wss://");
+const connection = new Connection(PRIMARY_RPC_URL, {
+  wsEndpoint: WS_URL,
+  commitment: 'confirmed',
+  disableRetryOnRateLimit: true,
+});
+const readConnection = new Connection(READ_RPC_URL, {
+  commitment: 'confirmed',
+  disableRetryOnRateLimit: true,
+});
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
@@ -32,12 +42,15 @@ const TRACKER_RPC_CONCURRENCY = 2;
 const TRACKER_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 const MIN_SOL_RESERVE = Number(process.env.MIN_SOL_RESERVE || '0.05');
 const MIN_RELIABLE_WHALE_SOL_DELTA = 0.01;
+type MarketEntryPriceSource = Extract<PaperTradeRecord['entryPriceSource'], 'market-snapshot' | 'dexscreener-snapshot'>;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const executionWallet = loadExecutionWallet();
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || executionWallet.publicKey.toBase58();
 const tokenScreenService = new TokenScreenService();
 const dexscreenerClient = new DexscreenerClient();
+const dexPairCache = new Map<string, { fetchedAt: number; pairs: DexPairSummary[] }>();
+const inFlightDexPairRequests = new Map<string, Promise<DexPairSummary[]>>();
 
 function formatSolAmount(value: unknown): string {
   const parsed = Number(value);
@@ -153,7 +166,7 @@ type PaperTradeRecord = {
   mint: string;
   entryPrice: number;
   openedAt: string;
-  entryPriceSource: 'market-snapshot' | 'wallet-receipt' | 'wallet-receipt-sol-only';
+  entryPriceSource: 'market-snapshot' | 'dexscreener-snapshot' | 'wallet-receipt' | 'wallet-receipt-sol-only';
   whaleWinRateAtEntry: number | null;
   entryPriceSol?: number | null;
   entryTxid?: string;
@@ -184,7 +197,7 @@ const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
 const inFlightSignatures = new Set<string>();
 const recentWhaleSignals = new Map<string, number>();
-const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
+const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null; source: MarketEntryPriceSource }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 let activePriceRequests = 0;
 const priceRequestWaiters: Array<() => void> = [];
@@ -263,6 +276,54 @@ async function fetchSolUsdPrice(): Promise<number | null> {
       return null;
     }
   });
+}
+
+async function fetchDexscreenerPairs(mint: string): Promise<DexPairSummary[]> {
+  const cached = dexPairCache.get(mint);
+  if (cached && (Date.now() - cached.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+    return cached.pairs;
+  }
+
+  const inFlight = inFlightDexPairRequests.get(mint);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = withPriceRequestSlot(async () => {
+    const rechecked = dexPairCache.get(mint);
+    if (rechecked && (Date.now() - rechecked.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+      return rechecked.pairs;
+    }
+
+    try {
+      const pairs = (await dexscreenerClient.searchTokenPairs(mint))
+        .filter((pair) => pair.chainId === 'solana');
+      dexPairCache.set(mint, { fetchedAt: Date.now(), pairs });
+      return pairs;
+    } catch (error) {
+      console.warn(`[SCREEN] Konnte Dexscreener-Paare fuer ${mint.slice(0,6)} nicht laden:`, error);
+      dexPairCache.set(mint, { fetchedAt: Date.now(), pairs: [] });
+      return [];
+    }
+  }).finally(() => {
+    inFlightDexPairRequests.delete(mint);
+  });
+
+  inFlightDexPairRequests.set(mint, request);
+  return request;
+}
+
+function getBestDexPriceUsd(pairs: DexPairSummary[]): number | null {
+  const bestPair = [...pairs]
+    .filter((pair) => Number.isFinite(Number(pair.priceUsd)) && Number(pair.priceUsd) > 0)
+    .sort((left, right) => Number(right.liquidity?.usd ?? 0) - Number(left.liquidity?.usd ?? 0))[0];
+
+  if (!bestPair) {
+    return null;
+  }
+
+  const priceUsd = Number(bestPair.priceUsd);
+  return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
 }
 
 function getAccountKeyString(accountKey: unknown): string | undefined {
@@ -365,7 +426,12 @@ async function inferEntryPriceFromWhaleTransaction(params: {
     return null;
   }
 
-  const entryPriceSol = Math.abs(nativeSolDelta) / tokenDeltaUi;
+  const deployedSol = Math.abs(nativeSolDelta);
+  if (deployedSol < MIN_RELIABLE_WHALE_SOL_DELTA) {
+    return null;
+  }
+
+  const entryPriceSol = deployedSol / tokenDeltaUi;
   const solUsdPrice = await fetchSolUsdPrice();
   if (!solUsdPrice) {
     return {
@@ -415,7 +481,7 @@ async function getParsedTransactionQueued(signature: string): Promise<Awaited<Re
   }
 
   const request = limitTrackerRpc(async () => withRpcRetry(
-    () => connection.getParsedTransaction(signature, {
+    () => readConnection.getParsedTransaction(signature, {
       maxSupportedTransactionVersion: 0,
       commitment: 'confirmed',
     }),
@@ -687,19 +753,13 @@ async function calculatePositionSize(): Promise<PositionSizingDecision> {
 }
 
 async function getLiquidityUsd(mint: string): Promise<number | null> {
-  try {
-    const pairs = await dexscreenerClient.searchTokenPairs(mint);
-    const bestLiquidity = pairs
-      .filter((pair) => pair.chainId === 'solana')
-      .map((pair) => Number(pair.liquidity?.usd))
-      .filter((value) => Number.isFinite(value) && value > 0)
-      .sort((left, right) => right - left)[0];
+  const pairs = await fetchDexscreenerPairs(mint);
+  const bestLiquidity = pairs
+    .map((pair) => Number(pair.liquidity?.usd))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((left, right) => right - left)[0];
 
-    return bestLiquidity !== undefined && Number.isFinite(bestLiquidity) ? bestLiquidity : null;
-  } catch (error) {
-    console.warn(`[SCREEN] Konnte Dexscreener-Liquiditaet fuer ${mint.slice(0,6)} nicht laden:`, error);
-    return null;
-  }
+  return bestLiquidity !== undefined && Number.isFinite(bestLiquidity) ? bestLiquidity : null;
 }
 
 async function getPriceExtensionPct(params: {
@@ -745,10 +805,11 @@ async function evaluateEntryDecision(
 ): Promise<EntryDecision> {
   const rejectionReasons: string[] = [];
   const notes: string[] = [];
-  const marketEntryPriceUsd = await fetchEntryPriceUsd(mint);
+  const marketEntry = await fetchEntryPriceUsd(mint);
+  const marketEntryPriceUsd = marketEntry.price;
   const whaleEntry = await inferEntryPriceFromWhaleTransaction({ ...(parsedTx !== undefined ? { parsedTx } : {}), whaleAddress: whale.address, mint });
   const entryPrice = marketEntryPriceUsd ?? whaleEntry?.entryPrice ?? null;
-  const entryPriceSource = marketEntryPriceUsd ? 'market-snapshot' : (whaleEntry?.source ?? 'market-snapshot');
+  const entryPriceSource = marketEntryPriceUsd ? marketEntry.source : (whaleEntry?.source ?? 'market-snapshot');
   const liquidityUsd = await getLiquidityUsd(mint);
   const whaleBuySizeSol = getReliableWhaleBuySizeSol(parsedTx, whale.address);
 
@@ -828,30 +889,33 @@ async function evaluateEntryDecision(
   };
 }
 
-async function fetchEntryPriceUsd(mint: string): Promise<number | null> {
+async function fetchEntryPriceUsd(mint: string): Promise<{ price: number | null; source: MarketEntryPriceSource }> {
   const cached = tokenPriceCache.get(mint);
   if (cached && (Date.now() - cached.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
-    return cached.price;
+    return { price: cached.price, source: cached.source };
   }
 
   return withPriceRequestSlot(async () => {
     const rechecked = tokenPriceCache.get(mint);
     if (rechecked && (Date.now() - rechecked.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
-      return rechecked.price;
+      return { price: rechecked.price, source: rechecked.source };
     }
 
     try {
       const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
       const data = await res.json();
       const price = Number(data?.data?.[mint]?.price);
-      const resolvedPrice = Number.isFinite(price) && price > 0 ? price : null;
-      tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: resolvedPrice });
-      return resolvedPrice;
+      if (Number.isFinite(price) && price > 0) {
+        tokenPriceCache.set(mint, { fetchedAt: Date.now(), price, source: 'market-snapshot' });
+        return { price, source: 'market-snapshot' };
+      }
     } catch (error) {
       console.error(`Konnte Einstiegspreis fuer ${mint.slice(0,6)} nicht laden:`, error);
-      tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
-      return null;
     }
+
+    const dexPriceUsd = getBestDexPriceUsd(await fetchDexscreenerPairs(mint));
+    tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: dexPriceUsd, source: 'dexscreener-snapshot' });
+    return { price: dexPriceUsd, source: 'dexscreener-snapshot' };
   });
 }
 

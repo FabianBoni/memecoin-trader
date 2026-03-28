@@ -2,12 +2,13 @@ import fs from 'fs';
 import path from 'path';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { fileURLToPath } from 'url';
+import { getReadOnlyRpcUrl } from '../config/env.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { normalizeWhales } from '../storage/whales.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 
-const RPC_URL = process.env.HELIUS_RPC_URL || "";
+const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const FAST_SCOUT_INTERVAL_MS = 15 * 60 * 1000;
@@ -54,7 +55,10 @@ async function scout() {
     state: 'running',
   });
   try {
-    const connection = new Connection(RPC_URL);
+    const connection = new Connection(RPC_URL, {
+      commitment: 'confirmed',
+      disableRetryOnRateLimit: true,
+    });
     
     const res = await fetch('https://api.dexscreener.com/token-boosts/latest/v1');
     const tokens: any = await res.json();

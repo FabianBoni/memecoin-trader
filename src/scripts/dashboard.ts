@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { env, getHeliusRpcUrl } from '../config/env.js';
+import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from '../config/env.js';
 import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.js';
 import {
     buildWhaleModeSummary,
@@ -25,7 +25,10 @@ app.use(express.urlencoded({ extended: false }));
 const PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(SCRIPT_DIR, '../data');
-const dashboardConnection = new Connection(getHeliusRpcUrl());
+const dashboardConnection = new Connection(getReadOnlyRpcUrl(getHeliusRpcUrl()), {
+    commitment: 'confirmed',
+    disableRetryOnRateLimit: true,
+});
 const WHALE_DETAIL_CACHE_MS = 60 * 1000;
 const WHALE_DETAIL_PAGE_LIMIT = 3;
 const WHALE_DETAIL_SIGNATURES_PER_PAGE = 15;
@@ -161,6 +164,25 @@ function formatSolPrice(value: unknown): string {
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) return 'n/a';
     return `${parsed.toExponential(4)} SOL`;
+}
+
+function formatEntrySourceLabel(value: unknown): string {
+    if (typeof value !== 'string' || value.length === 0) {
+        return 'unbekannt';
+    }
+
+    switch (value) {
+        case 'market-snapshot':
+            return 'Jupiter';
+        case 'dexscreener-snapshot':
+            return 'Dexscreener';
+        case 'wallet-receipt':
+            return 'Wallet-Receipt';
+        case 'wallet-receipt-sol-only':
+            return 'SOL-only Receipt';
+        default:
+            return value;
+    }
 }
 
 function formatPct(value: unknown): string {
@@ -748,6 +770,10 @@ app.get('/', (req, res) => {
             const whaleAddress = typeof trade?.whale === 'string' ? trade.whale : 'Unknown';
             const openedAt = typeof trade?.openedAt === 'string' ? trade.openedAt : null;
             const paperEntry = Number(trade?.entryPrice);
+            const entrySource = typeof trade?.entryPriceSource === 'string' ? trade.entryPriceSource : 'legacy';
+            const paperEntryDisplay = entrySource === 'wallet-receipt-sol-only'
+                ? formatSolPrice(Number.isFinite(Number(trade?.entryPriceSol)) ? trade.entryPriceSol : trade?.entryPrice)
+                : formatUsd(paperEntry);
             const paperSummary = summaryByAddress.get(whaleAddress)?.paper ?? createEmptySummary();
             const remainingFraction = getRemainingPositionFraction(trade);
             const realizedPnlPct = getRealizedPnlPctValue(trade);
@@ -764,7 +790,7 @@ app.get('/', (req, res) => {
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
                 <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${trade.mint}" target="_blank">${String(trade.mint).slice(0, 8)}...${String(trade.mint).slice(-4)}</a></td>
                 <td class="py-3 font-mono text-xs text-slate-400">${escapeHtml(whaleAddress.slice(0,8))}...</td>
-                <td class="py-3 text-xs text-slate-300">${formatUsd(paperEntry)}</td>
+                <td class="py-3 text-xs text-slate-300">${paperEntryDisplay}<div class="text-[11px] text-slate-500">${escapeHtml(formatEntrySourceLabel(entrySource))}</div></td>
                 <td class="py-3 text-xs text-slate-400">${formatDateTime(openedAt)}<div class="text-[11px] text-slate-500">Offen ${formatFractionPct(remainingFraction)}</div></td>
                 <td class="py-3 text-xs text-slate-300">${formatPct(realizedPnlPct)}<div class="text-[11px] text-slate-500">${escapeHtml(lastActionReason ?? 'noch kein partial')} · ${lastActionAt}</div></td>
                 <td class="py-3 text-xs text-slate-400">${paperSummary.evaluatedTrades}/${env.PAPER_PROMOTION_MIN_TRADES} bewertet · ${paperSummary.noPriceDiscards} verworfen</td>
@@ -777,7 +803,7 @@ app.get('/', (req, res) => {
                 <tr class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-700/50">
                     <th class="pb-3 pl-2">Token</th>
                     <th class="pb-3">Wal</th>
-                    <th class="pb-3">Entry USD</th>
+                    <th class="pb-3">Entry</th>
                     <th class="pb-3">Opened</th>
                     <th class="pb-3">Realisiert</th>
                     <th class="pb-3">Sample</th>

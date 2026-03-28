@@ -146,3 +146,31 @@ export function getHeliusRpcUrl(): string {
 
   return rpcUrl;
 }
+
+export function getReadOnlyRpcUrl(primaryRpcUrl?: string): string {
+  const normalizedPrimary = primaryRpcUrl ? assertMainnetish(primaryRpcUrl, "PRIMARY_RPC_URL") : undefined;
+  const candidates: Array<{ key: string; value: string | undefined }> = [
+    { key: "FALLBACK_MAINNET_RPC_URL", value: env.FALLBACK_MAINNET_RPC_URL },
+    { key: "SOLANA_RPC_URL", value: env.SOLANA_RPC_URL },
+    { key: "HELIUS_RPC_URL", value: env.HELIUS_RPC_URL },
+    {
+      key: "HELIUS_API_KEY",
+      value: env.HELIUS_API_KEY && env.HELIUS_API_KEY.trim().length > 0
+        ? `https://mainnet.helius-rpc.com/?api-key=${env.HELIUS_API_KEY}`
+        : undefined,
+    },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.value || candidate.value.trim().length === 0) {
+      continue;
+    }
+
+    const normalizedCandidate = assertMainnetish(candidate.value, candidate.key);
+    if (!normalizedPrimary || normalizedCandidate !== normalizedPrimary) {
+      return normalizedCandidate;
+    }
+  }
+
+  return normalizedPrimary ?? getHeliusRpcUrl();
+}
