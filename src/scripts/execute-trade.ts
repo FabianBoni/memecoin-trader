@@ -118,6 +118,10 @@ async function getParsedTransactionWithRetry(connection: Connection, signature: 
   return null;
 }
 
+function isBlockheightExceededError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("block height exceeded");
+}
+
 function getAccountKeyString(accountKey: unknown): string | undefined {
   if (!accountKey) {
     return undefined;
@@ -379,14 +383,38 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
 
     try {
       const txid = await connection.sendRawTransaction(rawTx, { skipPreflight: true });
-      if (swap.lastValidBlockHeight !== undefined) {
-        await connection.confirmTransaction({
+      try {
+        if (swap.lastValidBlockHeight !== undefined) {
+          await connection.confirmTransaction({
+            signature: txid,
+            blockhash: transaction.message.recentBlockhash,
+            lastValidBlockHeight: swap.lastValidBlockHeight,
+          }, "confirmed");
+        } else {
+          await connection.confirmTransaction(txid, "confirmed");
+        }
+      } catch (confirmError) {
+        if (!isBlockheightExceededError(confirmError)) {
+          throw confirmError;
+        }
+
+        const landedReceipt = await buildExecutionReceipt({
+          connection,
           signature: txid,
-          blockhash: transaction.message.recentBlockhash,
-          lastValidBlockHeight: swap.lastValidBlockHeight,
-        }, "confirmed");
-      } else {
-        await connection.confirmTransaction(txid, "confirmed");
+          walletAddress: wallet.publicKey.toBase58(),
+          quote,
+          inputMint: quoteInputMint,
+          outputMint: quoteOutputMint,
+        });
+
+        if (landedReceipt.confirmed) {
+          console.warn(`Confirmation window expired for ${txid}, but the transaction was found on-chain.`);
+          console.log("🚀 Transaction sent! TXID:", txid);
+          console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
+          return landedReceipt;
+        }
+
+        throw confirmError;
       }
       console.log("🚀 Transaction sent! TXID:", txid);
       console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);

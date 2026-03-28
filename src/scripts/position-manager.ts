@@ -11,6 +11,41 @@ const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
 
+function readActiveTrades(): Record<string, any> {
+  if (!fs.existsSync('./src/data/active-trades.json')) {
+    return {};
+  }
+
+  return JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+}
+
+function writeActiveTrades(activeTrades: Record<string, any>) {
+  fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
+}
+
+function markTradeExitState(mint: string, patch: Record<string, unknown> | null): boolean {
+  const activeTrades = readActiveTrades();
+  const tradeData = activeTrades[mint];
+
+  if (!tradeData || typeof tradeData !== 'object') {
+    return false;
+  }
+
+  if (patch === null) {
+    delete tradeData.exiting;
+    delete tradeData.exitReason;
+    delete tradeData.exitStartedAt;
+    delete tradeData.lastExitError;
+    delete tradeData.lastExitErrorAt;
+  } else {
+    Object.assign(tradeData, patch);
+  }
+
+  activeTrades[mint] = tradeData;
+  writeActiveTrades(activeTrades);
+  return true;
+}
+
 function toFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
@@ -30,11 +65,21 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
     let entryPriceUsd: number | null = null;
     let entryPriceSol: number | null = null;
     try {
-      const activeTrades = JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+      const activeTrades = readActiveTrades();
       const tradeData = activeTrades[mint];
       // Hybrid-Logik: Unterstützt altes String-Format und neues Objekt-Format
       whaleAddress = typeof tradeData === 'string' ? tradeData : tradeData.whale;
       if (typeof tradeData === 'object' && tradeData !== null) {
+        if (tradeData.exiting) {
+          console.log(`[MONITOR] ${mint.slice(0,6)} wird bereits verkauft. Doppelten Exit uebersprungen.`);
+          return;
+        }
+
+        markTradeExitState(mint, {
+          exiting: true,
+          exitReason: reason,
+          exitStartedAt: new Date().toISOString(),
+        });
         entryPriceUsd = toFiniteNumber(tradeData.entryPrice);
         entryPriceSol = toFiniteNumber(tradeData.entryPriceSol);
       }
@@ -81,9 +126,9 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
 
     // 3. Aus aktiven Trades löschen & aufräumen (Immer!)
     try {
-        const activeTrades = JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+      const activeTrades = readActiveTrades();
         delete activeTrades[mint];
-        fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
+      writeActiveTrades(activeTrades);
         highWaterMarks.delete(mint);
         missingEntryWarnings.delete(mint);
     } catch (cleanupErr) {
@@ -124,6 +169,13 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
     });
   } catch (e: any) {
     console.error("❌ Auto-Sell failed:", e);
+    markTradeExitState(mint, {
+      exiting: false,
+      exitReason: undefined,
+      exitStartedAt: undefined,
+      lastExitError: e.message,
+      lastExitErrorAt: new Date().toISOString(),
+    });
     await sendTelegram(`❌ <b>SELL FAILED</b>\nToken: ${mint.slice(0,6)}\nError: ${e.message}`, {
       dedupeKey: `sell-failed:${mint}:${e.message}`,
       cooldownMs: 300_000,
@@ -172,7 +224,7 @@ async function monitorPositions() {
 
         if (balance === 0) {
           delete activeTrades[mint];
-          fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
+          writeActiveTrades(activeTrades);
           highWaterMarks.delete(mint);
           missingEntryWarnings.delete(mint);
           continue;
@@ -182,6 +234,10 @@ async function monitorPositions() {
         const hasStructuredTrade = typeof tradeData === 'object' && tradeData !== null;
         const baseline = hasStructuredTrade ? Number(tradeData.entryPrice) : Number.NaN;
         const hasValidEntryPrice = Number.isFinite(baseline) && baseline > 0;
+
+        if (hasStructuredTrade && tradeData.exiting) {
+          continue;
+        }
 
         if (hasStructuredTrade && tradeData.panic) {
           const currentPrice = await getCurrentPrice(mint);
