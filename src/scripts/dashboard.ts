@@ -3,7 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { readJsonFileSync } from '../storage/json-file-sync.js';
+import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.js';
 import { normalizeWhales } from '../storage/whales.js';
 import { getHeliusRpcUrl } from '../config/env.js';
 
@@ -13,6 +13,7 @@ app.use(basicAuth({
     users: { 'admin': 'SuperSecret123!' }, 
     challenge: true
 }));
+app.use(express.urlencoded({ extended: false }));
 
 const PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +23,9 @@ const WHALE_DETAIL_CACHE_MS = 60 * 1000;
 const WHALE_DETAIL_PAGE_LIMIT = 3;
 const WHALE_DETAIL_SIGNATURES_PER_PAGE = 15;
 const WHALE_DETAIL_PARSE_BATCH_SIZE = 5;
+const WHALES_FILE = path.join(DATA_DIR, 'whales.json');
+const PAPER_PERFORMANCE_FILE = path.join(DATA_DIR, 'paper-performance.json');
+const PAPER_TRADES_FILE = path.join(DATA_DIR, 'paper-trades.json');
 
 const whaleTransactionCache = new Map<string, { fetchedAt: number; data: WhaleTransactionSummary[] }>();
 
@@ -46,6 +50,41 @@ function safeReadJSON(filename: string, defaultData: any) {
     } catch (e) {
         return defaultData;
     }
+}
+
+function writeDataJSON(filename: string, data: unknown) {
+    writeJsonFileSync(path.join(DATA_DIR, filename), data);
+}
+
+function redirectWithMessage(res: express.Response, params: Record<string, string>) {
+    const searchParams = new URLSearchParams(params);
+    res.redirect(`/?${searchParams.toString()}`);
+}
+
+function resetPaperWhale(address: string) {
+    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
+    const updatedWhales = whales.map((whale) => whale.address === address ? { ...whale, paperTrades: 0 } : whale);
+
+    const paperPerformance = readJsonFileSync<Record<string, boolean[]>>(PAPER_PERFORMANCE_FILE, {});
+    delete paperPerformance[address];
+
+    const paperTrades = readJsonFileSync<Record<string, any>>(PAPER_TRADES_FILE, {});
+    const filteredPaperTrades = Object.fromEntries(
+        Object.entries(paperTrades).filter(([, trade]) => trade?.whale !== address),
+    );
+
+    writeJsonFileSync(WHALES_FILE, updatedWhales);
+    writeJsonFileSync(PAPER_PERFORMANCE_FILE, paperPerformance);
+    writeJsonFileSync(PAPER_TRADES_FILE, filteredPaperTrades);
+}
+
+function resetAllPaperWhales() {
+    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
+    const updatedWhales = whales.map((whale) => whale.mode === 'paper' ? { ...whale, paperTrades: 0 } : whale);
+
+    writeJsonFileSync(WHALES_FILE, updatedWhales);
+    writeDataJSON('paper-performance.json', {});
+    writeDataJSON('paper-trades.json', {});
 }
 
 function formatUsd(value: unknown): string {
@@ -215,6 +254,29 @@ async function fetchRecentWhaleTransactions(whaleAddress: string): Promise<Whale
     return parsedTransactions;
 }
 
+app.post('/actions/reset-paper-whale', (req, res) => {
+    const whaleAddress = String(req.body?.whaleAddress ?? '').trim();
+    if (!whaleAddress) {
+        redirectWithMessage(res, { error: 'Wal-Adresse fehlt fuer den Reset.' });
+        return;
+    }
+
+    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
+    const whale = whales.find((entry) => entry.address === whaleAddress);
+    if (!whale) {
+        redirectWithMessage(res, { error: `Wal ${whaleAddress.slice(0, 8)} wurde nicht gefunden.` });
+        return;
+    }
+
+    resetPaperWhale(whaleAddress);
+    redirectWithMessage(res, { message: `Paper-Daten fuer ${whaleAddress.slice(0, 8)} wurden zurueckgesetzt.` });
+});
+
+app.post('/actions/reset-paper-all', (_req, res) => {
+    resetAllPaperWhales();
+    redirectWithMessage(res, { message: 'Alle Paper-Scores und offenen Paper-Trades wurden zurueckgesetzt.' });
+});
+
 app.get('/whale/:address', async (req, res) => {
     const whaleAddress = String(req.params.address ?? '').trim();
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
@@ -349,6 +411,8 @@ app.get('/whale/:address', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
+    const actionMessage = typeof req.query.message === 'string' ? req.query.message : '';
+    const actionError = typeof req.query.error === 'string' ? req.query.error : '';
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const activeTrades = safeReadJSON('active-trades.json', {});
     const paperTrades = safeReadJSON('paper-trades.json', {});
@@ -416,6 +480,18 @@ app.get('/', (req, res) => {
     const scoutStatus = runtimeStatus.scout ?? {};
     const trackerStatus = runtimeStatus.tracker ?? {};
     const monitorStatus = runtimeStatus.positionManager ?? {};
+    const alertHTML = actionError
+        ? `<div class="glass-card border-t-4 border-t-red-500 mb-8"><p class="text-sm font-semibold text-red-300">${escapeHtml(actionError)}</p></div>`
+        : (actionMessage
+            ? `<div class="glass-card border-t-4 border-t-emerald-500 mb-8"><p class="text-sm font-semibold text-emerald-300">${escapeHtml(actionMessage)}</p></div>`
+            : '');
+    const paperResetActionsHTML = `
+        <div class="flex flex-wrap items-center gap-3">
+            <form method="POST" action="/actions/reset-paper-all" onsubmit="return confirm('Alle Paper-Scores und offenen Paper-Trades wirklich zuruecksetzen?');">
+                <button type="submit" class="px-3 py-2 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-bold uppercase tracking-wide hover:bg-red-500/20 transition-colors">Reset Alle Paper-Scores</button>
+            </form>
+            <span class="text-xs text-slate-500">Loescht Paper-Performance und offene Paper-Trades der Quarantaene.</span>
+        </div>`;
 
     const statusCardsHTML = `
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
@@ -499,7 +575,7 @@ app.get('/', (req, res) => {
                 <td class="py-3 font-mono text-xs text-slate-400">${escapeHtml(whaleAddress.slice(0,8))}...</td>
                 <td class="py-3 text-xs text-slate-300">${formatUsd(paperEntry)}</td>
                 <td class="py-3 text-xs text-slate-400">${formatDateTime(openedAt)}</td>
-                <td class="py-3 text-xs text-slate-400">${paperWhale?.paperTrades ?? 0}/3</td>
+                <td class="py-3 text-xs text-slate-400">${paperWhale?.paperTrades ?? 0}/3 bewertet</td>
                 <td class="py-3 text-right pr-2 text-xs">${statusBadge}</td>
             </tr>`;
         }).join('');
@@ -542,7 +618,12 @@ app.get('/', (req, res) => {
             const readyForPromotion = stat.total >= 3 && (stat.winRate ?? 0) >= 60;
             const statusBadge = readyForPromotion
                 ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">promotion ready</span>'
-                : `<span class="text-slate-300 bg-slate-700/40 px-2 py-1 rounded">${stat.total}/3 geprüft</span>`;
+                : `<span class="text-slate-300 bg-slate-700/40 px-2 py-1 rounded">${stat.total}/3 bewertet</span>`;
+            const resetAction = `
+                <form method="POST" action="/actions/reset-paper-whale" onsubmit="return confirm('Paper-Daten fuer ${escapeHtml(stat.address.slice(0, 8))} wirklich resetten?');" class="mt-2">
+                    <input type="hidden" name="whaleAddress" value="${escapeHtml(stat.address)}">
+                    <button type="submit" class="px-2 py-1 rounded border border-red-500/40 bg-red-500/10 text-red-300 text-[10px] font-bold uppercase tracking-wide hover:bg-red-500/20 transition-colors">Reset</button>
+                </form>`;
             return `
             <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
                 <div>
@@ -553,6 +634,7 @@ app.get('/', (req, res) => {
                     <div class="text-xs font-bold text-amber-300">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`}</div>
                     <div class="text-[11px] text-slate-500 mb-1">W ${stat.wins} / L ${stat.losses}</div>
                     ${statusBadge}
+                    ${resetAction}
                 </div>
             </div>`;
         }).join('');
@@ -676,6 +758,7 @@ app.get('/', (req, res) => {
             <div class="glass-card border-t-4 ${averageRealizedPnl >= 0 ? 'border-t-emerald-500' : 'border-t-red-500'}"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Avg Realized PnL</h2><p class="text-3xl font-black ${averageRealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(averageRealizedPnl)}</p><p class="text-xs text-slate-500 mt-1">Win-Rate ${globalWinRate}%</p></div>
         </div>
 
+        ${alertHTML}
         ${statusCardsHTML}
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
@@ -685,7 +768,7 @@ app.get('/', (req, res) => {
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-amber-500/20 p-2 rounded-lg mr-3 text-amber-300">🧪</span> Paper Trades</h2><div class="overflow-x-auto">${paperTradesHTML}</div></div>
-            <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-cyan-500/20 p-2 rounded-lg mr-3 text-cyan-300">🛰️</span> Quarantäne-Wale</h2><div class="max-h-[300px] overflow-y-auto custom-scrollbar pr-2">${paperWhalesHTML}</div></div>
+            <div class="glass-card"><div class="flex flex-col gap-4 mb-4"><h2 class="text-xl font-bold flex items-center"><span class="bg-cyan-500/20 p-2 rounded-lg mr-3 text-cyan-300">🛰️</span> Quarantäne-Wale</h2>${paperResetActionsHTML}</div><div class="max-h-[300px] overflow-y-auto custom-scrollbar pr-2">${paperWhalesHTML}</div></div>
         </div>
 
         <div class="glass-card mb-8">

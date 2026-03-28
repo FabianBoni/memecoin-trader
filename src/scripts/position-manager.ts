@@ -604,6 +604,7 @@ function getTradeAgeMs(trade: Record<string, any>): number | null {
 async function monitorPaperTrades() {
   const paperTrades = readPaperTrades();
   const paperTradeIds = Object.keys(paperTrades);
+  let paperTradesChanged = false;
 
   for (const tradeId of paperTradeIds) {
     const trade = paperTrades[tradeId];
@@ -619,11 +620,19 @@ async function monitorPaperTrades() {
     const currentPrice = await getCurrentPrice(mint);
     if (!currentPrice) {
       if (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_NO_PRICE_TIMEOUT_MS) {
-        await logPaperWhalePerformance(whale, false);
+        const lastObservedChangePct = toFiniteNumber(trade.lastObservedChangePct);
+        const hadReliableObservation = trade.hasSeenPrice === true && lastObservedChangePct !== null;
+
+        if (hadReliableObservation) {
+          await logPaperWhalePerformance(whale, lastObservedChangePct > 0);
+          console.log(`[PAPER] NO-PRICE EXIT ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit letztem beobachteten ${lastObservedChangePct.toFixed(2)}% geschlossen.`);
+        } else {
+          console.log(`[PAPER] NO-PRICE DISCARD ${mint.slice(0,6)} fuer ${whale.slice(0,8)} nach ${Math.round(tradeAgeMs / 60000)}m unbewertet verworfen.`);
+        }
+
         delete paperTrades[tradeId];
-        writePaperTrades(paperTrades);
+        paperTradesChanged = true;
         paperHighWaterMarks.delete(tradeId);
-        console.log(`[PAPER] NO-PRICE EXIT ${mint.slice(0,6)} fuer ${whale.slice(0,8)} nach ${Math.round(tradeAgeMs / 60000)}m als Loss geschlossen.`);
       }
       continue;
     }
@@ -631,6 +640,18 @@ async function monitorPaperTrades() {
     const changePct = await getPaperTradeChangePct(trade, currentPrice);
     if (changePct === null) {
       continue;
+    }
+
+    const nextObservedAt = new Date().toISOString();
+    if (trade.hasSeenPrice !== true
+      || toFiniteNumber(trade.lastObservedPrice) !== currentPrice
+      || toFiniteNumber(trade.lastObservedChangePct) !== changePct) {
+      trade.hasSeenPrice = true;
+      trade.lastObservedAt = nextObservedAt;
+      trade.lastObservedPrice = currentPrice;
+      trade.lastObservedChangePct = changePct;
+      paperTrades[tradeId] = trade;
+      paperTradesChanged = true;
     }
 
     const currentHigh = paperHighWaterMarks.get(tradeId) || 0;
@@ -655,7 +676,7 @@ async function monitorPaperTrades() {
     const isWin = changePct > 0;
     await logPaperWhalePerformance(whale, isWin);
     delete paperTrades[tradeId];
-    writePaperTrades(paperTrades);
+    paperTradesChanged = true;
     paperHighWaterMarks.delete(tradeId);
     const exitReason = trade.panic
       ? 'PANIC'
@@ -663,6 +684,10 @@ async function monitorPaperTrades() {
         ? 'TIME EXIT'
         : 'EXIT';
     console.log(`[PAPER] ${exitReason} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${changePct.toFixed(2)}% geschlossen.`);
+  }
+
+  if (paperTradesChanged) {
+    writePaperTrades(paperTrades);
   }
 }
 

@@ -148,6 +148,10 @@ type PaperTradeRecord = {
   whaleWinRateAtEntry: number | null;
   entryPriceSol?: number | null;
   entryTxid?: string;
+  hasSeenPrice?: boolean;
+  lastObservedAt?: string;
+  lastObservedPrice?: number;
+  lastObservedChangePct?: number;
   panic?: boolean;
   panicMarkedAt?: string;
 };
