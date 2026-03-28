@@ -9,6 +9,9 @@ import { normalizeWhales } from '../storage/whales.js';
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
+const FAST_SCOUT_INTERVAL_MS = 15 * 60 * 1000;
+const DEFAULT_SCOUT_INTERVAL_MS = 60 * 60 * 1000;
+const FAST_SCOUT_WHALE_TARGET = 100;
 
 // Hilfsfunktion für Pausen
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -29,6 +32,18 @@ function isLikelySolanaMintAddress(value: unknown): value is string {
   } catch {
     return false;
   }
+}
+
+function getScoutIntervalMs(): number {
+  const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
+  return whaleCount < FAST_SCOUT_WHALE_TARGET ? FAST_SCOUT_INTERVAL_MS : DEFAULT_SCOUT_INTERVAL_MS;
+}
+
+function logNextScoutRun() {
+  const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
+  const intervalMs = whaleCount < FAST_SCOUT_WHALE_TARGET ? FAST_SCOUT_INTERVAL_MS : DEFAULT_SCOUT_INTERVAL_MS;
+  const intervalMinutes = Math.round(intervalMs / 60_000);
+  console.log(`[SCOUT] Naechster Lauf in ${intervalMinutes} Minuten (Whales: ${whaleCount}/${FAST_SCOUT_WHALE_TARGET}).`);
 }
 
 async function scout() {
@@ -112,5 +127,14 @@ async function scout() {
   }
 }
 
-setInterval(scout, 1000 * 60 * 60);
-scout();
+function scheduleNextScoutRun() {
+  logNextScoutRun();
+  setTimeout(runScoutLoop, getScoutIntervalMs());
+}
+
+async function runScoutLoop() {
+  await scout();
+  scheduleNextScoutRun();
+}
+
+runScoutLoop();
