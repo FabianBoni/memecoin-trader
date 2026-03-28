@@ -3,9 +3,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
 import { Connection, PublicKey } from '@solana/web3.js';
+import { env, getHeliusRpcUrl } from '../config/env.js';
 import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.js';
+import {
+    buildWhaleModeSummary,
+    readWhaleStats,
+    writeWhaleStats,
+    type WhaleModeSummary,
+    type WhaleStatsStore,
+} from '../storage/whale-stats.js';
 import { normalizeWhales } from '../storage/whales.js';
-import { getHeliusRpcUrl } from '../config/env.js';
 
 const app = express();
 
@@ -61,6 +68,60 @@ function redirectWithMessage(res: express.Response, params: Record<string, strin
     res.redirect(`/?${searchParams.toString()}`);
 }
 
+function createEmptySummary(): WhaleModeSummary {
+    return {
+        evaluatedTrades: 0,
+        wins: 0,
+        losses: 0,
+        winRatePct: null,
+        avgPnlPct: null,
+        medianPnlPct: null,
+        panicExitRatePct: null,
+        avgHoldMinutes: null,
+        positiveExcursionRatePct: null,
+        avgRoundTripCostBps: null,
+        noPriceDiscards: 0,
+        streak: '',
+    };
+}
+
+function getWhaleSummaries(store: WhaleStatsStore, address: string) {
+    return {
+        live: buildWhaleModeSummary(store, address, 'live'),
+        paper: buildWhaleModeSummary(store, address, 'paper'),
+    };
+}
+
+function isPromotionReady(summary: WhaleModeSummary): boolean {
+    return summary.evaluatedTrades >= env.PAPER_PROMOTION_MIN_TRADES
+        && (summary.winRatePct ?? 0) >= env.PAPER_PROMOTION_MIN_WIN_RATE_PCT
+        && (summary.avgPnlPct ?? Number.NEGATIVE_INFINITY) >= env.PAPER_PROMOTION_MIN_AVG_PNL_PCT
+        && (summary.medianPnlPct ?? Number.NEGATIVE_INFINITY) >= env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT;
+}
+
+function resetPaperStats(address?: string) {
+    const whaleStats = readWhaleStats();
+
+    if (!address) {
+        for (const stats of Object.values(whaleStats)) {
+            stats.paper = { trades: [], discards: [] };
+        }
+        writeWhaleStats(whaleStats);
+        return;
+    }
+
+    const existing = whaleStats[address];
+    if (!existing) {
+        return;
+    }
+
+    whaleStats[address] = {
+        live: existing.live,
+        paper: { trades: [], discards: [] },
+    };
+    writeWhaleStats(whaleStats);
+}
+
 function resetPaperWhale(address: string) {
     const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
     const updatedWhales = whales.map((whale) => whale.address === address ? { ...whale, paperTrades: 0 } : whale);
@@ -76,6 +137,7 @@ function resetPaperWhale(address: string) {
     writeJsonFileSync(WHALES_FILE, updatedWhales);
     writeJsonFileSync(PAPER_PERFORMANCE_FILE, paperPerformance);
     writeJsonFileSync(PAPER_TRADES_FILE, filteredPaperTrades);
+    resetPaperStats(address);
 }
 
 function resetAllPaperWhales() {
@@ -85,6 +147,7 @@ function resetAllPaperWhales() {
     writeJsonFileSync(WHALES_FILE, updatedWhales);
     writeDataJSON('paper-performance.json', {});
     writeDataJSON('paper-trades.json', {});
+    resetPaperStats();
 }
 
 function formatUsd(value: unknown): string {
@@ -104,6 +167,75 @@ function formatPct(value: unknown): string {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return 'n/a';
     return `${parsed > 0 ? '+' : ''}${parsed.toFixed(2)}%`;
+}
+
+function clampFraction(value: unknown, fallback = 0): number {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+        return fallback;
+    }
+
+    return Math.min(1, Math.max(0, parsed));
+}
+
+function formatFractionPct(value: unknown, fallback = 0): string {
+    return `${(clampFraction(value, fallback) * 100).toFixed(1)}%`;
+}
+
+function getRealizedSoldFraction(trade: unknown): number {
+    if (!trade || typeof trade !== 'object') {
+        return 0;
+    }
+
+    const candidate = trade as Record<string, unknown>;
+    if (Number.isFinite(Number(candidate.realizedSoldFraction))) {
+        return clampFraction(candidate.realizedSoldFraction);
+    }
+
+    if (Number.isFinite(Number(candidate.remainingPositionFraction))) {
+        return clampFraction(1 - Number(candidate.remainingPositionFraction));
+    }
+
+    return 0;
+}
+
+function getRemainingPositionFraction(trade: unknown): number {
+    if (!trade || typeof trade !== 'object') {
+        return 1;
+    }
+
+    const candidate = trade as Record<string, unknown>;
+    if (Number.isFinite(Number(candidate.remainingPositionFraction))) {
+        return clampFraction(candidate.remainingPositionFraction, 1);
+    }
+
+    return clampFraction(1 - getRealizedSoldFraction(trade), 1);
+}
+
+function getPendingWhaleTrimFraction(trade: unknown): number {
+    if (!trade || typeof trade !== 'object') {
+        return 0;
+    }
+
+    const candidate = trade as Record<string, unknown>;
+    const targetTrimFraction = clampFraction(
+        Number.isFinite(Number(candidate.whaleTrimFraction)) ? candidate.whaleTrimFraction : candidate.whaleSoldFraction,
+        0,
+    );
+    return Math.max(0, targetTrimFraction - getRealizedSoldFraction(trade));
+}
+
+function getRealizedPnlPctValue(trade: unknown): number | null {
+    if (!trade || typeof trade !== 'object') {
+        return null;
+    }
+
+    const parsed = Number((trade as Record<string, unknown>).realizedPnlPct);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function hasTakeProfitTakenFlag(trade: unknown): boolean {
+    return !!trade && typeof trade === 'object' && (trade as Record<string, unknown>).takeProfitTaken === true;
 }
 
 function formatSignedNumber(value: number, digits = 4): string {
@@ -274,15 +406,14 @@ app.post('/actions/reset-paper-whale', (req, res) => {
 
 app.post('/actions/reset-paper-all', (_req, res) => {
     resetAllPaperWhales();
-    redirectWithMessage(res, { message: 'Alle Paper-Scores und offenen Paper-Trades wurden zurueckgesetzt.' });
+    redirectWithMessage(res, { message: 'Alle Paper-Bewertungen, Discards und offenen Paper-Trades wurden zurueckgesetzt.' });
 });
 
 app.get('/whale/:address', async (req, res) => {
     const whaleAddress = String(req.params.address ?? '').trim();
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const whale = whales.find((entry) => entry.address === whaleAddress);
-    const performance = safeReadJSON('performance.json', {});
-    const paperPerformance = safeReadJSON('paper-performance.json', {});
+    const whaleStatsStore = readWhaleStats();
     const activity = Array.isArray(safeReadJSON('whale-activity.json', []))
         ? safeReadJSON('whale-activity.json', []).filter((entry: any) => entry?.whale === whaleAddress).slice(0, 20)
         : [];
@@ -294,8 +425,7 @@ app.get('/whale/:address', async (req, res) => {
 
     try {
         const txRows = await fetchRecentWhaleTransactions(whaleAddress);
-        const liveHistory = Array.isArray(performance[whaleAddress]) ? performance[whaleAddress] : [];
-        const paperHistory = Array.isArray(paperPerformance[whaleAddress]) ? paperPerformance[whaleAddress] : [];
+        const { live: liveSummary, paper: paperSummary } = getWhaleSummaries(whaleStatsStore, whaleAddress);
 
         const txTable = txRows.length === 0
             ? '<p class="text-slate-500 text-center py-8 italic">Keine Transaktionen in den letzten 12 Stunden gefunden.</p>'
@@ -384,10 +514,11 @@ app.get('/whale/:address', async (req, res) => {
                 </div>
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-8">
                 <div class="glass-card border-t-4 border-t-cyan-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">12h TX</h2><p class="text-3xl font-black">${txRows.length}</p></div>
-                <div class="glass-card border-t-4 border-t-emerald-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Live Score</h2><p class="text-3xl font-black text-emerald-400">${Array.isArray(liveHistory) ? liveHistory.filter(Boolean).length : 0}/${Array.isArray(liveHistory) ? liveHistory.length : 0}</p></div>
-                <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Score</h2><p class="text-3xl font-black text-amber-300">${Array.isArray(paperHistory) ? paperHistory.filter(Boolean).length : 0}/${Array.isArray(paperHistory) ? paperHistory.length : 0}</p></div>
+                <div class="glass-card border-t-4 border-t-emerald-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Live Bewertet</h2><p class="text-3xl font-black text-emerald-400">${liveSummary.evaluatedTrades}</p><p class="text-xs text-slate-500 mt-1">Win ${liveSummary.winRatePct === null ? 'n/a' : `${liveSummary.winRatePct.toFixed(0)}%`} · Avg ${formatPct(liveSummary.avgPnlPct)}</p></div>
+                <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Bewertet</h2><p class="text-3xl font-black text-amber-300">${paperSummary.evaluatedTrades}</p><p class="text-xs text-slate-500 mt-1">Win ${paperSummary.winRatePct === null ? 'n/a' : `${paperSummary.winRatePct.toFixed(0)}%`} · Avg ${formatPct(paperSummary.avgPnlPct)}</p></div>
+                <div class="glass-card border-t-4 border-t-rose-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Verworfen</h2><p class="text-3xl font-black text-rose-300">${paperSummary.noPriceDiscards}</p><p class="text-xs text-slate-500 mt-1">Streak ${paperSummary.streak || 'n/a'}</p></div>
                 <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Entdeckt</h2><p class="text-sm font-bold text-slate-200 mt-2">${formatDateTime(whale?.discoveredAt)}</p></div>
             </div>
 
@@ -416,67 +547,93 @@ app.get('/', (req, res) => {
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const activeTrades = safeReadJSON('active-trades.json', {});
     const paperTrades = safeReadJSON('paper-trades.json', {});
-    const performance = safeReadJSON('performance.json', {});
-    const paperPerformance = safeReadJSON('paper-performance.json', {});
+    const whaleStatsStore = readWhaleStats();
     const whaleActivity = safeReadJSON('whale-activity.json', []);
     const runtimeStatus = safeReadJSON('runtime-status.json', {});
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
     const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
     const liveWhales = whales.length - paperWhales;
+    const knownWhaleAddresses = Array.from(new Set([...whales.map((whale) => whale.address), ...Object.keys(whaleStatsStore)]));
+    const summaryByAddress = new Map(knownWhaleAddresses.map((address) => [address, getWhaleSummaries(whaleStatsStore, address)]));
 
-    let totalWins = 0;
-    let totalLosses = 0;
-    const whaleStats = Object.entries(performance).map(([address, data]: any) => {
-        const tradeResults = Array.isArray(data) ? data.filter((value: unknown) => typeof value === 'boolean') : [];
-        const wins = tradeResults.filter(Boolean).length;
-        const losses = tradeResults.filter((value: boolean) => value === false).length;
-        totalWins += wins;
-        totalLosses += losses;
-        const total = wins + losses;
-        return {
-            address,
-            wins,
-            losses,
-            total,
-            streak: tradeResults.slice(-3).map((value: boolean) => value ? 'W' : 'L').join(' '),
-            winRate: total > 0 ? Math.round((wins / total) * 100) : 0
-        };
-    }).sort((a, b) => b.winRate - a.winRate);
+    const liveLeaderboardStats = knownWhaleAddresses
+        .map((address) => {
+            const whale = whales.find((entry) => entry.address === address);
+            const liveSummary = summaryByAddress.get(address)?.live ?? createEmptySummary();
+            return {
+                address,
+                mode: whale?.mode ?? 'untracked',
+                wins: liveSummary.wins,
+                losses: liveSummary.losses,
+                total: liveSummary.evaluatedTrades,
+                streak: liveSummary.streak,
+                winRate: liveSummary.winRatePct === null ? null : Math.round(liveSummary.winRatePct),
+                avgPnlPct: liveSummary.avgPnlPct,
+                medianPnlPct: liveSummary.medianPnlPct,
+                panicExitRatePct: liveSummary.panicExitRatePct,
+            };
+        })
+        .filter((stat) => stat.total > 0)
+        .sort((left, right) => {
+            const avgDiff = (right.avgPnlPct ?? Number.NEGATIVE_INFINITY) - (left.avgPnlPct ?? Number.NEGATIVE_INFINITY);
+            if (avgDiff !== 0) {
+                return avgDiff;
+            }
 
-    const totalTrades = totalWins + totalLosses;
+            return (right.winRate ?? -1) - (left.winRate ?? -1);
+        });
+
+    const totalWins = liveLeaderboardStats.reduce((sum, stat) => sum + stat.wins, 0);
+    const totalLosses = liveLeaderboardStats.reduce((sum, stat) => sum + stat.losses, 0);
+    const totalTrades = liveLeaderboardStats.reduce((sum, stat) => sum + stat.total, 0);
     const globalWinRate = totalTrades > 0 ? Math.round((totalWins / totalTrades) * 100) : 0;
+    const totalPaperEvaluated = whales.reduce((sum, whale) => sum + (summaryByAddress.get(whale.address)?.paper.evaluatedTrades ?? 0), 0);
+    const totalPaperDiscards = whales.reduce((sum, whale) => sum + (summaryByAddress.get(whale.address)?.paper.noPriceDiscards ?? 0), 0);
+
     const paperWhaleStats = whales
         .filter((whale) => whale.mode === 'paper')
         .map((whale) => {
-            const tradeResults = Array.isArray(paperPerformance[whale.address])
-                ? paperPerformance[whale.address].filter((value: unknown) => typeof value === 'boolean')
-                : [];
-            const wins = tradeResults.filter(Boolean).length;
-            const losses = tradeResults.filter((value: boolean) => value === false).length;
-            const total = wins + losses;
+            const paperSummary = summaryByAddress.get(whale.address)?.paper ?? createEmptySummary();
             return {
                 ...whale,
-                wins,
-                losses,
-                total,
-                streak: tradeResults.slice(-3).map((value: boolean) => value ? 'W' : 'L').join(' '),
-                winRate: total > 0 ? Math.round((wins / total) * 100) : null,
+                wins: paperSummary.wins,
+                losses: paperSummary.losses,
+                total: paperSummary.evaluatedTrades,
+                streak: paperSummary.streak,
+                winRate: paperSummary.winRatePct === null ? null : Math.round(paperSummary.winRatePct),
+                avgPnlPct: paperSummary.avgPnlPct,
+                medianPnlPct: paperSummary.medianPnlPct,
+                noPriceDiscards: paperSummary.noPriceDiscards,
+                readyForPromotion: isPromotionReady(paperSummary),
             };
         })
         .sort((a, b) => {
+            const leftReady = a.readyForPromotion ? 1 : 0;
+            const rightReady = b.readyForPromotion ? 1 : 0;
+            if (rightReady !== leftReady) {
+                return rightReady - leftReady;
+            }
+
             if ((b.total ?? 0) !== (a.total ?? 0)) {
                 return (b.total ?? 0) - (a.total ?? 0);
             }
+
             return Date.parse(b.discoveredAt ?? '') - Date.parse(a.discoveredAt ?? '');
         });
     const paperTradeCount = Object.keys(paperTrades).length;
     const historyRows = Array.isArray(history) ? history : [];
-    const realizedPnlValues = historyRows
-        .map((trade: any) => Number(trade.pnl))
+    const finalizedHistoryRows = historyRows.filter((trade: any) => trade?.partial !== true);
+    const partialHistoryCount = historyRows.filter((trade: any) => trade?.partial === true).length;
+    const realizedPnlValues = finalizedHistoryRows
+        .map((trade: any) => Number(trade.combinedPnlPct ?? trade.pnl))
         .filter((value: number) => Number.isFinite(value));
     const averageRealizedPnl = realizedPnlValues.length > 0
         ? realizedPnlValues.reduce((sum: number, value: number) => sum + value, 0) / realizedPnlValues.length
         : 0;
+    const activeTradeRows = Object.values(activeTrades);
+    const openRunnerCount = activeTradeRows.filter((trade: any) => hasTakeProfitTakenFlag(trade)).length;
+    const openPartialCount = activeTradeRows.filter((trade: any) => getRealizedSoldFraction(trade) > 0).length;
+    const trimPendingCount = activeTradeRows.filter((trade: any) => getPendingWhaleTrimFraction(trade) > 0).length;
     const scoutStatus = runtimeStatus.scout ?? {};
     const trackerStatus = runtimeStatus.tracker ?? {};
     const monitorStatus = runtimeStatus.positionManager ?? {};
@@ -487,10 +644,10 @@ app.get('/', (req, res) => {
             : '');
     const paperResetActionsHTML = `
         <div class="flex flex-wrap items-center gap-3">
-            <form method="POST" action="/actions/reset-paper-all" onsubmit="return confirm('Alle Paper-Scores und offenen Paper-Trades wirklich zuruecksetzen?');">
-                <button type="submit" class="px-3 py-2 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-bold uppercase tracking-wide hover:bg-red-500/20 transition-colors">Reset Alle Paper-Scores</button>
+            <form method="POST" action="/actions/reset-paper-all" onsubmit="return confirm('Alle Paper-Bewertungen, Discards und offenen Paper-Trades wirklich zuruecksetzen?');">
+                <button type="submit" class="px-3 py-2 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-bold uppercase tracking-wide hover:bg-red-500/20 transition-colors">Reset Alle Paper-Bewertungen</button>
             </form>
-            <span class="text-xs text-slate-500">Loescht Paper-Performance und offene Paper-Trades der Quarantaene.</span>
+            <span class="text-xs text-slate-500">Loescht Paper-Metriken, Discards und offene Paper-Trades der Quarantaene.</span>
         </div>`;
 
     const statusCardsHTML = `
@@ -526,21 +683,45 @@ app.get('/', (req, res) => {
             const entryPrice = typeof tData === 'object' ? formatUsd(tData.entryPrice) : 'n/a';
             const entrySource = typeof tData === 'object' ? (tData.entryPriceSource || 'legacy') : 'legacy';
             const positionSol = typeof tData === 'object' && Number.isFinite(Number(tData.positionSol)) ? `${Number(tData.positionSol).toFixed(2)} SOL` : 'n/a';
-            const statusBadge = typeof tData === 'object' && tData.panic
-                ? '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">panic</span>'
-                : (typeof tData === 'object' && tData.recoveredFromWallet
-                    ? '<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">wallet</span>'
-                : (entryPrice === 'n/a'
+            const remainingFraction = typeof tData === 'object' ? getRemainingPositionFraction(tData) : 1;
+            const realizedSoldFraction = typeof tData === 'object' ? getRealizedSoldFraction(tData) : 0;
+            const realizedPnlPct = typeof tData === 'object' ? getRealizedPnlPctValue(tData) : null;
+            const pendingTrimFraction = typeof tData === 'object' ? getPendingWhaleTrimFraction(tData) : 0;
+            const lastActionReason = typeof tData === 'object' && typeof tData.lastPartialExitReason === 'string' ? tData.lastPartialExitReason : null;
+            const lastActionAt = typeof tData === 'object' ? formatDateTime(tData.lastPartialExitAt ?? tData.openedAt) : 'n/a';
+            const statusBadges: string[] = [];
+
+            if (typeof tData === 'object' && tData.panic) {
+                statusBadges.push('<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">panic</span>');
+            }
+            if (typeof tData === 'object' && tData.recoveredFromWallet) {
+                statusBadges.push('<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">wallet</span>');
+            }
+            if (typeof tData === 'object' && hasTakeProfitTakenFlag(tData)) {
+                statusBadges.push(`<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">runner ${formatFractionPct(remainingFraction)}</span>`);
+            }
+            if (realizedSoldFraction > 0 && !hasTakeProfitTakenFlag(tData)) {
+                statusBadges.push(`<span class="text-cyan-300 bg-cyan-500/10 px-2 py-1 rounded">partial ${formatFractionPct(realizedSoldFraction)}</span>`);
+            }
+            if (pendingTrimFraction > 0) {
+                statusBadges.push(`<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">trim offen ${formatFractionPct(pendingTrimFraction)}</span>`);
+            }
+            if (statusBadges.length === 0) {
+                statusBadges.push(entryPrice === 'n/a'
                     ? '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">entry fehlt</span>'
-                    : '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">tracked</span>'));
+                    : '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">tracked</span>');
+            }
+
             return `
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
                 <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${mint}" target="_blank">${mint.slice(0, 8)}...${mint.slice(-4)}</a></td>
                 <td class="py-3 font-mono text-xs text-slate-400">${renderWhaleLink(whaleStr, `${whaleStr.slice(0,6)}...`)}</td>
                 <td class="py-3 text-xs text-slate-300">${entryPrice}</td>
                 <td class="py-3 text-xs text-slate-400">${escapeHtml(entrySource)}</td>
-                <td class="py-3 text-xs text-slate-300">${positionSol}</td>
-                <td class="py-3 text-right pr-2 text-xs">${statusBadge}</td>
+                <td class="py-3 text-xs text-slate-300">${positionSol}<div class="text-[11px] text-slate-500">Offen ${formatFractionPct(remainingFraction)} · Verkauft ${formatFractionPct(realizedSoldFraction)}</div></td>
+                <td class="py-3 text-xs text-slate-300">${formatPct(realizedPnlPct)}<div class="text-[11px] text-slate-500">realisiert</div></td>
+                <td class="py-3 text-xs text-slate-400">${escapeHtml(lastActionReason ?? 'Entry')}<div class="text-[11px] text-slate-500">${lastActionAt}</div></td>
+                <td class="py-3 text-right pr-2 text-xs">${statusBadges.join(' ')}</td>
             </tr>`;
         }).join('');
         activeTradesHTML = `
@@ -552,6 +733,8 @@ app.get('/', (req, res) => {
                     <th class="pb-3">Entry USD</th>
                     <th class="pb-3">Quelle</th>
                     <th class="pb-3">Size</th>
+                    <th class="pb-3">Realisiert</th>
+                    <th class="pb-3">Letzte Aktion</th>
                     <th class="pb-3 pr-2 text-right">Status</th>
                 </tr>
             </thead>
@@ -565,17 +748,26 @@ app.get('/', (req, res) => {
             const whaleAddress = typeof trade?.whale === 'string' ? trade.whale : 'Unknown';
             const openedAt = typeof trade?.openedAt === 'string' ? trade.openedAt : null;
             const paperEntry = Number(trade?.entryPrice);
-            const paperWhale = whales.find((whale) => whale.address === whaleAddress);
+            const paperSummary = summaryByAddress.get(whaleAddress)?.paper ?? createEmptySummary();
+            const remainingFraction = getRemainingPositionFraction(trade);
+            const realizedPnlPct = getRealizedPnlPctValue(trade);
+            const lastActionReason = typeof trade?.lastPartialExitReason === 'string' ? trade.lastPartialExitReason : null;
+            const lastActionAt = formatDateTime(trade?.lastPartialExitAt ?? openedAt);
             const statusBadge = trade?.panic
                 ? '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">panic</span>'
+                : hasTakeProfitTakenFlag(trade)
+                    ? `<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">runner ${formatFractionPct(remainingFraction)}</span>`
+                : Number.isFinite(Number(trade?.whaleSoldFraction)) && Number(trade?.whaleSoldFraction) > 0
+                    ? `<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">trim ${(Number(trade.whaleSoldFraction) * 100).toFixed(0)}%</span>`
                 : '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">paper</span>';
             return `
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
                 <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${trade.mint}" target="_blank">${String(trade.mint).slice(0, 8)}...${String(trade.mint).slice(-4)}</a></td>
                 <td class="py-3 font-mono text-xs text-slate-400">${escapeHtml(whaleAddress.slice(0,8))}...</td>
                 <td class="py-3 text-xs text-slate-300">${formatUsd(paperEntry)}</td>
-                <td class="py-3 text-xs text-slate-400">${formatDateTime(openedAt)}</td>
-                <td class="py-3 text-xs text-slate-400">${paperWhale?.paperTrades ?? 0}/3 bewertet</td>
+                <td class="py-3 text-xs text-slate-400">${formatDateTime(openedAt)}<div class="text-[11px] text-slate-500">Offen ${formatFractionPct(remainingFraction)}</div></td>
+                <td class="py-3 text-xs text-slate-300">${formatPct(realizedPnlPct)}<div class="text-[11px] text-slate-500">${escapeHtml(lastActionReason ?? 'noch kein partial')} · ${lastActionAt}</div></td>
+                <td class="py-3 text-xs text-slate-400">${paperSummary.evaluatedTrades}/${env.PAPER_PROMOTION_MIN_TRADES} bewertet · ${paperSummary.noPriceDiscards} verworfen</td>
                 <td class="py-3 text-right pr-2 text-xs">${statusBadge}</td>
             </tr>`;
         }).join('');
@@ -587,6 +779,7 @@ app.get('/', (req, res) => {
                     <th class="pb-3">Wal</th>
                     <th class="pb-3">Entry USD</th>
                     <th class="pb-3">Opened</th>
+                    <th class="pb-3">Realisiert</th>
                     <th class="pb-3">Sample</th>
                     <th class="pb-3 pr-2 text-right">Status</th>
                 </tr>
@@ -597,17 +790,18 @@ app.get('/', (req, res) => {
 
     // Wal Leaderboard generieren
     let whaleStatsHTML = '<p class="text-slate-500 text-center py-8 italic">Keine Daten.</p>';
-    if (whaleStats.length > 0) {
-        whaleStatsHTML = whaleStats.map(stat => `
+    if (liveLeaderboardStats.length > 0) {
+        whaleStatsHTML = liveLeaderboardStats.map(stat => `
             <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
                 <div>
                     <div class="font-mono text-sm text-slate-300">${renderWhaleLink(stat.address, `${stat.address.slice(0,8)}...`)}</div>
-                    <div class="text-[11px] text-slate-500">Streak: ${stat.streak || 'n/a'} · Trades: ${stat.total}</div>
+                    <div class="text-[11px] text-slate-500">Streak: ${stat.streak || 'n/a'} · Trades: ${stat.total} · Median ${formatPct(stat.medianPnlPct)}</div>
                 </div>
                 <div class="flex space-x-3 text-xs font-bold">
                     <span class="text-emerald-400 bg-emerald-400/10 px-2 py-1 rounded">W: ${stat.wins}</span>
                     <span class="text-red-400 bg-red-400/10 px-2 py-1 rounded">L: ${stat.losses}</span>
-                    <span class="${stat.winRate >= 50 ? 'text-blue-400' : 'text-slate-500'} w-10 text-right">${stat.winRate}%</span>
+                    <span class="${(stat.avgPnlPct ?? 0) >= 0 ? 'text-blue-400' : 'text-red-300'} min-w-[72px] text-right">${formatPct(stat.avgPnlPct)}</span>
+                    <span class="${(stat.winRate ?? 0) >= 50 ? 'text-blue-400' : 'text-slate-500'} w-10 text-right">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`}</span>
                 </div>
             </div>`).join('');
     }
@@ -615,10 +809,9 @@ app.get('/', (req, res) => {
     let paperWhalesHTML = '<p class="text-slate-500 text-center py-8 italic">Keine Paper-Wale in Quarantäne.</p>';
     if (paperWhaleStats.length > 0) {
         paperWhalesHTML = paperWhaleStats.map((stat) => {
-            const readyForPromotion = stat.total >= 3 && (stat.winRate ?? 0) >= 60;
-            const statusBadge = readyForPromotion
+            const statusBadge = stat.readyForPromotion
                 ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">promotion ready</span>'
-                : `<span class="text-slate-300 bg-slate-700/40 px-2 py-1 rounded">${stat.total}/3 bewertet</span>`;
+                : `<span class="text-slate-300 bg-slate-700/40 px-2 py-1 rounded">${stat.total}/${env.PAPER_PROMOTION_MIN_TRADES} bewertet</span>`;
             const resetAction = `
                 <form method="POST" action="/actions/reset-paper-whale" onsubmit="return confirm('Paper-Daten fuer ${escapeHtml(stat.address.slice(0, 8))} wirklich resetten?');" class="mt-2">
                     <input type="hidden" name="whaleAddress" value="${escapeHtml(stat.address)}">
@@ -628,11 +821,11 @@ app.get('/', (req, res) => {
             <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
                 <div>
                     <div class="font-mono text-sm text-slate-300">${renderWhaleLink(stat.address, `${stat.address.slice(0,8)}...`)}</div>
-                    <div class="text-[11px] text-slate-500">Discovery: ${formatDateTime(stat.discoveredAt)} · Streak: ${stat.streak || 'n/a'}</div>
+                    <div class="text-[11px] text-slate-500">Discovery: ${formatDateTime(stat.discoveredAt)} · Streak: ${stat.streak || 'n/a'} · Discards: ${stat.noPriceDiscards}</div>
                 </div>
                 <div class="text-right">
-                    <div class="text-xs font-bold text-amber-300">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`}</div>
-                    <div class="text-[11px] text-slate-500 mb-1">W ${stat.wins} / L ${stat.losses}</div>
+                    <div class="text-xs font-bold text-amber-300">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`} · Avg ${formatPct(stat.avgPnlPct)}</div>
+                    <div class="text-[11px] text-slate-500 mb-1">W ${stat.wins} / L ${stat.losses} · Median ${formatPct(stat.medianPnlPct)}</div>
                     ${statusBadge}
                     ${resetAction}
                 </div>
@@ -690,18 +883,26 @@ app.get('/', (req, res) => {
             const isProfit = Number(trade.pnl) > 0;
             const pnlColor = isProfit ? 'text-emerald-400' : 'text-red-400';
             const bgBadge = isProfit ? 'bg-emerald-400/10' : 'bg-red-400/10';
+            const isPartial = trade?.partial === true;
             const sourceBadge = trade.priceSource === 'receipt'
                 ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">receipt</span>'
                 : '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">fallback</span>';
+            const typeBadge = isPartial
+                ? '<span class="text-cyan-300 bg-cyan-500/10 px-2 py-1 rounded">partial</span>'
+                : '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">final</span>';
+            const soldFractionPct = Number.isFinite(Number(trade?.soldFractionPct)) ? `${Number(trade.soldFractionPct).toFixed(1)}%` : 'n/a';
+            const remainingFractionPct = Number.isFinite(Number(trade?.remainingFractionPct)) ? `${Number(trade.remainingFractionPct).toFixed(1)}%` : '0.0%';
+            const combinedPnl = Number.isFinite(Number(trade?.combinedPnlPct)) ? formatPct(trade.combinedPnlPct) : formatPct(trade?.pnl);
             return `
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
                 <td class="py-3 pl-2 text-xs text-slate-400">${trade.date}</td>
                 <td class="py-3 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${trade.mint}" target="_blank">${trade.mint.slice(0, 6)}...</a></td>
-                <td class="py-3 text-xs text-slate-400">${trade.reason}</td>
+                <td class="py-3 text-xs">${typeBadge}<div class="text-[11px] text-slate-500 mt-1">${trade.reason}</div></td>
+                <td class="py-3 text-xs text-slate-400">${soldFractionPct}<div class="text-[11px] text-slate-500">Rest ${remainingFractionPct}</div></td>
                 <td class="py-3 text-xs text-slate-300">${formatUsd(trade.entryPriceUsd)} → ${formatUsd(trade.exitPriceUsd)}</td>
                 <td class="py-3 text-xs text-slate-400">${formatSolPrice(trade.entryPriceSol)} → ${formatSolPrice(trade.exitPriceSol)}</td>
                 <td class="py-3 text-xs">${sourceBadge}</td>
-                <td class="py-3 text-right pr-2 font-bold ${pnlColor}"><span class="${bgBadge} px-2 py-1 rounded">${Number(trade.pnl) > 0 ? '+' : ''}${trade.pnl}%</span></td>
+                <td class="py-3 text-right pr-2 font-bold ${pnlColor}"><span class="${bgBadge} px-2 py-1 rounded">${formatPct(trade.pnl)}</span><div class="text-[11px] text-slate-500 mt-1">cum ${combinedPnl}</div></td>
             </tr>`;
         }).join('');
         
@@ -712,11 +913,12 @@ app.get('/', (req, res) => {
                     <tr class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-700/50">
                         <th class="pb-3 pl-2">Datum</th>
                         <th class="pb-3">Token</th>
-                        <th class="pb-3">Exit Grund</th>
+                        <th class="pb-3">Typ</th>
+                        <th class="pb-3">Anteil</th>
                         <th class="pb-3">USD Fill</th>
                         <th class="pb-3">SOL/Token</th>
                         <th class="pb-3">Quelle</th>
-                        <th class="pb-3 text-right pr-2">PnL %</th>
+                        <th class="pb-3 text-right pr-2">PnL</th>
                     </tr>
                 </thead>
                 <tbody>${rows}</tbody>
@@ -752,9 +954,9 @@ app.get('/', (req, res) => {
 
         <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
             <div class="glass-card border-t-4 border-t-blue-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Wale</h2><p class="text-3xl font-black">${whales.length}</p><p class="text-xs text-slate-500 mt-1">Live ${liveWhales} · Paper ${paperWhales}</p></div>
-            <div class="glass-card border-t-4 border-t-yellow-400"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Positionen</h2><p class="text-3xl font-black text-yellow-400">${Object.keys(activeTrades).length}</p></div>
-            <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Trades</h2><p class="text-3xl font-black text-amber-300">${paperTradeCount}</p><p class="text-xs text-slate-500 mt-1">Quarantäne aktiv</p></div>
-            <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Total Trades</h2><p class="text-3xl font-black">${totalTrades}</p></div>
+            <div class="glass-card border-t-4 border-t-yellow-400"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Positionen</h2><p class="text-3xl font-black text-yellow-400">${Object.keys(activeTrades).length}</p><p class="text-xs text-slate-500 mt-1">Runner ${openRunnerCount} · Partial ${openPartialCount} · Trim ${trimPendingCount}</p></div>
+            <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Offen</h2><p class="text-3xl font-black text-amber-300">${paperTradeCount}</p><p class="text-xs text-slate-500 mt-1">Bewertet ${totalPaperEvaluated} · Verworfen ${totalPaperDiscards}</p></div>
+            <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Live Bewertet</h2><p class="text-3xl font-black">${totalTrades}</p><p class="text-xs text-slate-500 mt-1">Final ${finalizedHistoryRows.length} · Partial ${partialHistoryCount}</p></div>
             <div class="glass-card border-t-4 ${averageRealizedPnl >= 0 ? 'border-t-emerald-500' : 'border-t-red-500'}"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Avg Realized PnL</h2><p class="text-3xl font-black ${averageRealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(averageRealizedPnl)}</p><p class="text-xs text-slate-500 mt-1">Win-Rate ${globalWinRate}%</p></div>
         </div>
 
@@ -780,7 +982,7 @@ app.get('/', (req, res) => {
 
         <div class="glass-card">
             <h2 class="text-xl font-bold mb-6 flex items-center">
-                <span class="bg-blue-500/20 p-2 rounded-lg mr-3 text-blue-400">🧾</span> Letzte Verkäufe (Historie)
+                <span class="bg-blue-500/20 p-2 rounded-lg mr-3 text-blue-400">🧾</span> Letzte Exits (inkl. Partial)
             </h2>
             ${historyHTML}
         </div>

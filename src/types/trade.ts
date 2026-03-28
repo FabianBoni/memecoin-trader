@@ -5,6 +5,11 @@ export interface RiskConfig {
   stopLossPct: number;
   takeProfitPct: number;
   takeProfitSellFraction: number;
+  minLiveTradeSizeSol: number;
+  riskPerTradePct: number;
+  maxCapitalAtRiskPct: number;
+  estimatedRoundTripCostBps: number;
+  runnerStopFloorPct: number;
   requireExplicitGo: boolean;
   dryRun: boolean;
 }

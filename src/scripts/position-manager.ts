@@ -3,7 +3,7 @@ import path from 'path';
 import { Connection, PublicKey } from "@solana/web3.js";
 import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
-import { logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
+import { discardPaperWhalePerformance, logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
@@ -13,13 +13,16 @@ import { sleep, withRpcRetry } from '../solana/rpc-guard.js';
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
+const TAKE_PROFIT_SELL_FRACTION = env.DEFAULT_TAKE_PROFIT_SELL_FRACTION;
 const TRAILING_ARM_PCT = env.TRAILING_ARM_PCT;
 const TRAILING_DISTANCE_PCT = env.TRAILING_DISTANCE_PCT;
+const RUNNER_STOP_FLOOR_PCT = env.RUNNER_STOP_FLOOR_PCT;
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
 const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
+const TRADE_HISTORY_PATH = path.resolve(SCRIPT_DIR, '../data/trade-history.json');
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
@@ -33,6 +36,7 @@ const PAPER_TRADE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 const RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+const FRACTION_SCALE = 10_000n;
 const connection = new Connection(RPC_URL);
 let monitorRunInProgress = false;
 
@@ -83,6 +87,129 @@ function markTradeExitState(mint: string, patch: Record<string, unknown> | null)
 function toFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function clampFraction(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  return Math.min(1, Math.max(0, parsed));
+}
+
+function hasTakeProfitTaken(tradeData: Record<string, any>): boolean {
+  return tradeData.takeProfitTaken === true;
+}
+
+function getRealizedSoldFraction(tradeData: Record<string, any>): number {
+  const directValue = toFiniteNumber(tradeData.realizedSoldFraction);
+  if (directValue !== null) {
+    return clampFraction(directValue);
+  }
+
+  const remaining = toFiniteNumber(tradeData.remainingPositionFraction);
+  if (remaining !== null) {
+    return clampFraction(1 - remaining);
+  }
+
+  return 0;
+}
+
+function getRemainingPositionFraction(tradeData: Record<string, any>): number {
+  const remaining = toFiniteNumber(tradeData.remainingPositionFraction);
+  if (remaining !== null) {
+    return clampFraction(remaining, 1);
+  }
+
+  return clampFraction(1 - getRealizedSoldFraction(tradeData), 1);
+}
+
+function getRealizedPnlPct(tradeData: Record<string, any>): number {
+  return toFiniteNumber(tradeData.realizedPnlPct) ?? 0;
+}
+
+function getCombinedPnlPct(tradeData: Record<string, any>, openLegPnlPct: number): number {
+  return getRealizedPnlPct(tradeData) + (getRemainingPositionFraction(tradeData) * openLegPnlPct);
+}
+
+function getTradeHoldMinutes(tradeData: Record<string, any>): number {
+  const ageMs = getTradeAgeMs(tradeData);
+  if (ageMs === null) {
+    return 0;
+  }
+
+  return ageMs / 60_000;
+}
+
+function getDynamicStopLoss(maxSeen: number, takeProfitTaken: boolean): number {
+  let dynamicStopLoss = STOP_LOSS;
+
+  if (maxSeen >= TRAILING_ARM_PCT) {
+    dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
+  }
+
+  if (takeProfitTaken) {
+    dynamicStopLoss = Math.max(dynamicStopLoss, RUNNER_STOP_FLOOR_PCT);
+  }
+
+  return dynamicStopLoss;
+}
+
+function buildSellExecutionPlan(params: {
+  rawAmount: string;
+  balance: number;
+  currentRemainingFraction: number;
+  sellFractionCurrent: number;
+}) {
+  const desiredSellFraction = clampFraction(params.sellFractionCurrent, 1);
+  if (desiredSellFraction <= 0) {
+    return null;
+  }
+
+  const rawAmount = BigInt(params.rawAmount);
+  if (rawAmount <= 0n) {
+    return null;
+  }
+
+  let sellRawAmount = rawAmount;
+  if (desiredSellFraction < 0.9999) {
+    const scaledFraction = BigInt(Math.max(1, Math.min(Number(FRACTION_SCALE), Math.round(desiredSellFraction * Number(FRACTION_SCALE)))));
+    sellRawAmount = (rawAmount * scaledFraction) / FRACTION_SCALE;
+    if (sellRawAmount <= 0n) {
+      sellRawAmount = 1n;
+    }
+  }
+
+  if (sellRawAmount > rawAmount) {
+    sellRawAmount = rawAmount;
+  }
+
+  const rawAsNumber = Number(rawAmount);
+  const sellRawAsNumber = Number(sellRawAmount);
+  const actualSellFractionCurrent = sellRawAmount >= rawAmount
+    ? 1
+    : (Number.isFinite(rawAsNumber) && rawAsNumber > 0 && Number.isFinite(sellRawAsNumber)
+      ? Math.min(1, sellRawAsNumber / rawAsNumber)
+      : desiredSellFraction);
+  const soldOriginalFraction = Math.min(params.currentRemainingFraction, params.currentRemainingFraction * actualSellFractionCurrent);
+
+  return {
+    sellRawAmount: sellRawAmount.toString(),
+    sellBalance: Number.isFinite(params.balance) ? params.balance * actualSellFractionCurrent : params.balance,
+    actualSellFractionCurrent,
+    soldOriginalFraction,
+    remainingFractionAfterSell: Math.max(0, params.currentRemainingFraction - soldOriginalFraction),
+  };
+}
+
+function appendTradeHistory(entry: Record<string, unknown>) {
+  let history = readJsonFileSync<Record<string, unknown>[]>(TRADE_HISTORY_PATH, []);
+  history.unshift(entry);
+  if (history.length > 50) {
+    history = history.slice(0, 50);
+  }
+  writeJsonFileSync(TRADE_HISTORY_PATH, history);
 }
 
 async function fetchSolUsdPrice(): Promise<number | null> {
@@ -400,29 +527,72 @@ async function fetchWalletTokenBalances(walletPubKey: PublicKey): Promise<Map<st
   return balances;
 }
 
-async function logExitSignal(mint: string, balance: number, changePct: number, rawAmount: string, customReason?: string) {
+async function logExitSignal(
+  mint: string,
+  balance: number,
+  changePct: number,
+  rawAmount: string,
+  customReason?: string,
+  options?: {
+    sellFractionCurrent?: number;
+    finalExit?: boolean;
+    currentHigh?: number;
+  },
+) {
   let isWin = changePct > 0;
   let realizedChangePct = changePct;
+  let legChangePct = changePct;
   let realizedExitPriceUsd: number | null = null;
   let realizedExitPriceSol: number | null = null;
   let priceSource = "market-snapshot";
   const reason = customReason || (isWin ? "TAKE PROFIT" : "STOP LOSS");
   const isPanicExit = reason === "PANIC EXIT";
+  const desiredSellFraction = clampFraction(options?.sellFractionCurrent, 1);
+  let finalExit = options?.finalExit ?? desiredSellFraction >= 0.9999;
   let emoji = isWin ? "💰" : "📉";
 
   try {
-    let whaleAddress = null;
+    let whaleAddress: string | null = null;
     let entryPriceUsd: number | null = null;
     let entryPriceSol: number | null = null;
+    let tradeDataSnapshot: Record<string, any> | null = null;
+    let currentRemainingFraction = 1;
+    let realizedSoFarPct = 0;
+    let sellPlan = buildSellExecutionPlan({
+      rawAmount,
+      balance,
+      currentRemainingFraction: 1,
+      sellFractionCurrent: desiredSellFraction,
+    });
+
     try {
       const activeTrades = readActiveTrades();
       const tradeData = activeTrades[mint];
-      // Hybrid-Logik: Unterstützt altes String-Format und neues Objekt-Format
-      whaleAddress = typeof tradeData === 'string' ? tradeData : tradeData.whale;
+      whaleAddress = typeof tradeData === 'string' ? tradeData : (tradeData?.whale ?? null);
+
       if (typeof tradeData === 'object' && tradeData !== null) {
         if (tradeData.exiting) {
           console.log(`[MONITOR] ${mint.slice(0,6)} wird bereits verkauft. Doppelten Exit uebersprungen.`);
           return;
+        }
+
+        tradeDataSnapshot = tradeData;
+        currentRemainingFraction = getRemainingPositionFraction(tradeData);
+        realizedSoFarPct = getRealizedPnlPct(tradeData);
+        sellPlan = buildSellExecutionPlan({
+          rawAmount,
+          balance,
+          currentRemainingFraction,
+          sellFractionCurrent: desiredSellFraction,
+        });
+
+        if (!sellPlan) {
+          console.warn(`[MONITOR] ${mint.slice(0,6)} konnte nicht verkauft werden: ungueltiger Teilverkauf.`);
+          return;
+        }
+
+        if (sellPlan.remainingFractionAfterSell <= 0.0001) {
+          finalExit = true;
         }
 
         markTradeExitState(mint, {
@@ -433,24 +603,27 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         entryPriceUsd = toFiniteNumber(tradeData.entryPrice);
         entryPriceSol = toFiniteNumber(tradeData.entryPriceSol);
       }
-    } catch (err) {
+    } catch {
       console.log("Konnte active-trades.json nicht lesen.");
     }
 
-    await sendTelegram(`${emoji} <b>${reason} TRIGGER</b>\nToken: <code>${mint}</code>\nChange: ${changePct.toFixed(2)}%\nSelling: ${balance} Units`, {
-      dedupeKey: `sell-trigger:${mint}:${reason}`,
+    if (!sellPlan) {
+      return;
+    }
+
+    await sendTelegram(`${emoji} <b>${reason} TRIGGER</b>\nToken: <code>${mint}</code>\nChange: ${changePct.toFixed(2)}%\nSelling: ${sellPlan.sellBalance.toFixed(4)} Units${finalExit ? '' : `\nRest danach: ${(sellPlan.remainingFractionAfterSell * 100).toFixed(1)}%`}`, {
+      dedupeKey: `sell-trigger:${mint}:${reason}:${finalExit ? 'full' : 'partial'}`,
       cooldownMs: 120_000,
       priority: true,
     });
 
     if (isPanicExit) {
-      console.warn(`[PANIC SELL] START mint=${mint} balance=${balance} rawAmount=${rawAmount}`);
+      console.warn(`[PANIC SELL] START mint=${mint} balance=${sellPlan.sellBalance} rawAmount=${sellPlan.sellRawAmount}`);
     }
 
-    // 1. Verkauf ausführen
     const executionReceipt = await executeSellWithRetry({
       mint,
-      rawAmount,
+      rawAmount: sellPlan.sellRawAmount,
     });
 
     if (isPanicExit) {
@@ -462,62 +635,105 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
     priceSource = executionReceipt?.priceSource ?? priceSource;
 
     if (entryPriceUsd && realizedExitPriceUsd) {
-      realizedChangePct = ((realizedExitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100;
+      legChangePct = ((realizedExitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100;
     } else if (entryPriceSol && realizedExitPriceSol) {
-      realizedChangePct = ((realizedExitPriceSol - entryPriceSol) / entryPriceSol) * 100;
+      legChangePct = ((realizedExitPriceSol - entryPriceSol) / entryPriceSol) * 100;
     }
 
-    isWin = realizedChangePct > 0;
+    const combinedChangePct = realizedSoFarPct + (sellPlan.soldOriginalFraction * legChangePct);
+    realizedChangePct = finalExit ? combinedChangePct : legChangePct;
+    isWin = finalExit ? combinedChangePct > 0 : legChangePct > 0;
     emoji = isWin ? "💰" : "📉";
 
-    // 2. Performance tracken (falls Wal bekannt)
-    if (whaleAddress) {
-      await logWhalePerformance(whaleAddress, isWin);
+    if (finalExit && whaleAddress && whaleAddress !== 'Recovered') {
+      const positiveExcursion = (options?.currentHigh ?? highWaterMarks.get(mint) ?? changePct) > 0
+        || (tradeDataSnapshot ? hasTakeProfitTaken(tradeDataSnapshot) : false);
+      await logWhalePerformance(whaleAddress, {
+        mint,
+        pnlPct: combinedChangePct,
+        holdMinutes: tradeDataSnapshot ? getTradeHoldMinutes(tradeDataSnapshot) : 0,
+        exitReason: reason,
+        panicExit: isPanicExit,
+        hadPositiveExcursion: positiveExcursion,
+        roundTripCostBps: env.ESTIMATED_ROUND_TRIP_COST_BPS,
+      });
     }
 
-    // 3. Aus aktiven Trades löschen & aufräumen (Immer!)
     try {
       const activeTrades = readActiveTrades();
+
+      if (finalExit) {
         delete activeTrades[mint];
-      writeActiveTrades(activeTrades);
+        writeActiveTrades(activeTrades);
         highWaterMarks.delete(mint);
         missingEntryWarnings.delete(mint);
+      } else {
+        const liveTrade = activeTrades[mint];
+        if (liveTrade && typeof liveTrade === 'object') {
+          liveTrade.remainingPositionFraction = sellPlan.remainingFractionAfterSell;
+          liveTrade.realizedSoldFraction = clampFraction(getRealizedSoldFraction(liveTrade) + sellPlan.soldOriginalFraction);
+          liveTrade.realizedPnlPct = getRealizedPnlPct(liveTrade) + (sellPlan.soldOriginalFraction * legChangePct);
+          liveTrade.lastPartialExitAt = new Date().toISOString();
+          liveTrade.lastPartialExitReason = reason;
+          liveTrade.lastPartialExitTxid = executionReceipt?.txid;
+          liveTrade.lastPartialExitPriceUsd = realizedExitPriceUsd;
+          liveTrade.lastPartialExitPriceSol = realizedExitPriceSol;
+          if (reason.startsWith('TAKE PROFIT')) {
+            liveTrade.takeProfitTaken = true;
+            liveTrade.takeProfitTakenAt = new Date().toISOString();
+          }
+
+          delete liveTrade.exiting;
+          delete liveTrade.exitReason;
+          delete liveTrade.exitStartedAt;
+          delete liveTrade.lastExitError;
+          delete liveTrade.lastExitErrorAt;
+          activeTrades[mint] = liveTrade;
+          writeActiveTrades(activeTrades);
+        }
+      }
     } catch (cleanupErr) {
-        console.error("Fehler beim Aufräumen der aktiven Trades:", cleanupErr);
+      console.error("Fehler beim Aktualisieren der aktiven Trades:", cleanupErr);
     }
 
-    // 4. NEU: In Historie (Kassenbuch) eintragen
     try {
-        const historyPath = './src/data/trade-history.json';
-        let history = readJsonFileSync<any[]>(historyPath, []);
-        history.unshift({
-            mint: mint,
-            whale: whaleAddress || "Unknown",
-          pnl: realizedChangePct.toFixed(2),
-            reason: reason,
-          date: new Date().toLocaleString('de-DE'),
-          entryPriceUsd: entryPriceUsd,
-          exitPriceUsd: realizedExitPriceUsd,
-          entryPriceSol: entryPriceSol,
-          exitPriceSol: realizedExitPriceSol,
-          exitTxid: executionReceipt?.txid,
-          priceSource
-        });
-        // Maximal 50 Einträge behalten, damit das Dashboard schnell bleibt
-        if (history.length > 50) history = history.slice(0, 50);
-        writeJsonFileSync(historyPath, history);
+      appendTradeHistory({
+        mint,
+        whale: whaleAddress || "Unknown",
+        pnl: realizedChangePct.toFixed(2),
+        combinedPnlPct: combinedChangePct.toFixed(2),
+        reason: finalExit ? reason : `${reason} (PARTIAL ${(sellPlan.soldOriginalFraction * 100).toFixed(1)}%)`,
+        date: new Date().toLocaleString('de-DE'),
+        partial: !finalExit,
+        entryPriceUsd,
+        exitPriceUsd: realizedExitPriceUsd,
+        entryPriceSol,
+        exitPriceSol: realizedExitPriceSol,
+        soldFractionPct: Number((sellPlan.soldOriginalFraction * 100).toFixed(2)),
+        remainingFractionPct: Number((sellPlan.remainingFractionAfterSell * 100).toFixed(2)),
+        exitTxid: executionReceipt?.txid,
+        priceSource,
+      });
     } catch (histErr) {
-        console.error("Konnte Historie nicht speichern:", histErr);
+      console.error("Konnte Historie nicht speichern:", histErr);
     }
 
-    await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...\nRealized PnL: ${realizedChangePct.toFixed(2)}%\nQuelle: ${priceSource}`, {
-      dedupeKey: `sell-success:${mint}`,
-      cooldownMs: 300_000,
-      priority: true,
-    });
+    if (finalExit) {
+      await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...\nRealized PnL: ${combinedChangePct.toFixed(2)}%\nQuelle: ${priceSource}`, {
+        dedupeKey: `sell-success:${mint}`,
+        cooldownMs: 300_000,
+        priority: true,
+      });
+    } else {
+      await sendTelegram(`✂️ <b>PARTIAL EXIT</b>\nToken: ${mint.slice(0,6)}...\nLeg PnL: ${legChangePct.toFixed(2)}%\nRealized so far: ${combinedChangePct.toFixed(2)}%\nRest offen: ${(sellPlan.remainingFractionAfterSell * 100).toFixed(1)}%\nQuelle: ${priceSource}`, {
+        dedupeKey: `sell-partial:${mint}:${reason}`,
+        cooldownMs: 180_000,
+        priority: true,
+      });
+    }
 
     if (isPanicExit) {
-      console.warn(`[PANIC SELL] CONFIRMED mint=${mint} txid=${executionReceipt?.txid ?? 'unknown'} realizedPnl=${realizedChangePct.toFixed(2)} source=${priceSource}`);
+      console.warn(`[PANIC SELL] CONFIRMED mint=${mint} txid=${executionReceipt?.txid ?? 'unknown'} realizedPnl=${(finalExit ? combinedChangePct : legChangePct).toFixed(2)} source=${priceSource}`);
     }
   } catch (e: any) {
     console.error("❌ Auto-Sell failed:", e);
@@ -601,6 +817,35 @@ function getTradeAgeMs(trade: Record<string, any>): number | null {
   return Math.max(0, Date.now() - openedAtMs);
 }
 
+function getPendingWhaleTrimOriginalFraction(tradeData: Record<string, any>): number {
+  const targetSoldFraction = clampFraction(
+    toFiniteNumber(tradeData.whaleTrimFraction) ?? toFiniteNumber(tradeData.whaleSoldFraction) ?? 0,
+    0,
+  );
+  const realizedSoldFraction = getRealizedSoldFraction(tradeData);
+  const remainingPositionFraction = getRemainingPositionFraction(tradeData);
+  return Math.min(remainingPositionFraction, Math.max(0, targetSoldFraction - realizedSoldFraction));
+}
+
+function applyPaperPartialExit(trade: Record<string, any>, soldOriginalFraction: number, changePct: number, reason: string) {
+  if (soldOriginalFraction <= 0) {
+    return false;
+  }
+
+  trade.remainingPositionFraction = Math.max(0, getRemainingPositionFraction(trade) - soldOriginalFraction);
+  trade.realizedSoldFraction = clampFraction(getRealizedSoldFraction(trade) + soldOriginalFraction);
+  trade.realizedPnlPct = getRealizedPnlPct(trade) + (soldOriginalFraction * changePct);
+  trade.lastPartialExitAt = new Date().toISOString();
+  trade.lastPartialExitReason = reason;
+
+  if (reason.startsWith('TAKE PROFIT')) {
+    trade.takeProfitTaken = true;
+    trade.takeProfitTakenAt = new Date().toISOString();
+  }
+
+  return true;
+}
+
 async function monitorPaperTrades() {
   const paperTrades = readPaperTrades();
   const paperTradeIds = Object.keys(paperTrades);
@@ -624,9 +869,20 @@ async function monitorPaperTrades() {
         const hadReliableObservation = trade.hasSeenPrice === true && lastObservedChangePct !== null;
 
         if (hadReliableObservation) {
-          await logPaperWhalePerformance(whale, lastObservedChangePct > 0);
+          const maxSeen = paperHighWaterMarks.get(tradeId) || lastObservedChangePct;
+          const combinedChangePct = getCombinedPnlPct(trade, lastObservedChangePct);
+          await logPaperWhalePerformance(whale, {
+            mint,
+            pnlPct: combinedChangePct,
+            holdMinutes: getTradeHoldMinutes(trade),
+            exitReason: 'NO-PRICE EXIT',
+            panicExit: trade.panic === true,
+            hadPositiveExcursion: maxSeen > 0 || hasTakeProfitTaken(trade),
+            roundTripCostBps: env.ESTIMATED_ROUND_TRIP_COST_BPS,
+          });
           console.log(`[PAPER] NO-PRICE EXIT ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit letztem beobachteten ${lastObservedChangePct.toFixed(2)}% geschlossen.`);
         } else {
+          discardPaperWhalePerformance(whale, 'no-price', mint);
           console.log(`[PAPER] NO-PRICE DISCARD ${mint.slice(0,6)} fuer ${whale.slice(0,8)} nach ${Math.round(tradeAgeMs / 60000)}m unbewertet verworfen.`);
         }
 
@@ -660,30 +916,59 @@ async function monitorPaperTrades() {
     }
 
     const maxSeen = paperHighWaterMarks.get(tradeId) || changePct;
-    let dynamicStopLoss = STOP_LOSS;
-    if (maxSeen >= TRAILING_ARM_PCT) {
-      dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
-    }
+    const takeProfitTaken = hasTakeProfitTaken(trade);
+    const dynamicStopLoss = getDynamicStopLoss(maxSeen, takeProfitTaken);
 
     const shouldClose = trade.panic
       || changePct <= dynamicStopLoss
       || changePct >= 1000
       || (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_MAX_AGE_MS);
-    if (!shouldClose) {
+    if (shouldClose) {
+      const combinedChangePct = getCombinedPnlPct(trade, changePct);
+      const exitReason = trade.panic
+        ? 'PANIC'
+        : (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_MAX_AGE_MS)
+          ? 'TIME EXIT'
+          : changePct >= 1000
+            ? 'MOONSHOT SECURED'
+            : takeProfitTaken
+              ? 'RUNNER STOP'
+              : (maxSeen >= TRAILING_ARM_PCT ? 'TRAILING STOP' : 'STOP LOSS');
+
+      await logPaperWhalePerformance(whale, {
+        mint,
+        pnlPct: combinedChangePct,
+        holdMinutes: getTradeHoldMinutes(trade),
+        exitReason,
+        panicExit: trade.panic === true,
+        hadPositiveExcursion: maxSeen > 0 || takeProfitTaken,
+        roundTripCostBps: env.ESTIMATED_ROUND_TRIP_COST_BPS,
+      });
+      delete paperTrades[tradeId];
+      paperTradesChanged = true;
+      paperHighWaterMarks.delete(tradeId);
+      console.log(`[PAPER] ${exitReason} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${combinedChangePct.toFixed(2)}% geschlossen.`);
       continue;
     }
 
-    const isWin = changePct > 0;
-    await logPaperWhalePerformance(whale, isWin);
-    delete paperTrades[tradeId];
-    paperTradesChanged = true;
-    paperHighWaterMarks.delete(tradeId);
-    const exitReason = trade.panic
-      ? 'PANIC'
-      : (tradeAgeMs !== null && tradeAgeMs >= PAPER_TRADE_MAX_AGE_MS)
-        ? 'TIME EXIT'
-        : 'EXIT';
-    console.log(`[PAPER] ${exitReason} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${changePct.toFixed(2)}% geschlossen.`);
+    if (!takeProfitTaken && changePct >= TAKE_PROFIT) {
+      const soldOriginalFraction = getRemainingPositionFraction(trade) * TAKE_PROFIT_SELL_FRACTION;
+      if (applyPaperPartialExit(trade, soldOriginalFraction, changePct, 'TAKE PROFIT')) {
+        paperTrades[tradeId] = trade;
+        paperTradesChanged = true;
+        console.log(`[PAPER] TAKE PROFIT PARTIAL ${mint.slice(0,6)} fuer ${whale.slice(0,8)} bei ${changePct.toFixed(2)}%. Rest ${(getRemainingPositionFraction(trade) * 100).toFixed(1)}%.`);
+        continue;
+      }
+    }
+
+    const pendingWhaleTrimOriginalFraction = getPendingWhaleTrimOriginalFraction(trade);
+    if (pendingWhaleTrimOriginalFraction > 0) {
+      if (applyPaperPartialExit(trade, pendingWhaleTrimOriginalFraction, changePct, 'WHALE TRIM')) {
+        paperTrades[tradeId] = trade;
+        paperTradesChanged = true;
+        console.log(`[PAPER] WHALE TRIM ${mint.slice(0,6)} fuer ${whale.slice(0,8)} gespiegelt. Rest ${(getRemainingPositionFraction(trade) * 100).toFixed(1)}%.`);
+      }
+    }
   }
 
   if (paperTradesChanged) {
@@ -813,22 +1098,37 @@ async function monitorPositions() {
         }
 
         const maxSeen = highWaterMarks.get(mint) || changePct;
-        let dynamicStopLoss = STOP_LOSS;
-
-        if (maxSeen >= TRAILING_ARM_PCT) {
-          dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
-        }
+        const takeProfitTaken = hasStructuredTrade ? hasTakeProfitTaken(tradeData) : false;
+        const dynamicStopLoss = getDynamicStopLoss(maxSeen, takeProfitTaken);
 
         console.log(`[MONITOR] ${mint.slice(0,6)} | PnL: ${changePct.toFixed(1)}% | Max: ${maxSeen.toFixed(1)}% | SL: ${dynamicStopLoss.toFixed(1)}%`);
 
         if (changePct <= dynamicStopLoss) {
-          if (maxSeen >= TRAILING_ARM_PCT) {
-            await logExitSignal(mint, balance, changePct, rawAmount, "TRAILING STOP (Gewinn gesichert!)");
+          if (takeProfitTaken) {
+            await logExitSignal(mint, balance, changePct, rawAmount, "RUNNER STOP", { currentHigh: maxSeen });
+          } else if (maxSeen >= TRAILING_ARM_PCT) {
+            await logExitSignal(mint, balance, changePct, rawAmount, "TRAILING STOP (Gewinn gesichert!)", { currentHigh: maxSeen });
           } else {
-            await logExitSignal(mint, balance, changePct, rawAmount, "STOP LOSS");
+            await logExitSignal(mint, balance, changePct, rawAmount, "STOP LOSS", { currentHigh: maxSeen });
           }
         } else if (changePct >= 1000) {
-          await logExitSignal(mint, balance, changePct, rawAmount, "MOONSHOT SECURED");
+          await logExitSignal(mint, balance, changePct, rawAmount, "MOONSHOT SECURED", { currentHigh: maxSeen });
+        } else if (hasStructuredTrade && !takeProfitTaken && changePct >= TAKE_PROFIT) {
+          await logExitSignal(mint, balance, changePct, rawAmount, "TAKE PROFIT", {
+            sellFractionCurrent: TAKE_PROFIT_SELL_FRACTION,
+            finalExit: false,
+            currentHigh: maxSeen,
+          });
+        } else if (hasStructuredTrade) {
+          const pendingWhaleTrimOriginalFraction = getPendingWhaleTrimOriginalFraction(tradeData);
+          const remainingPositionFraction = getRemainingPositionFraction(tradeData);
+          if (pendingWhaleTrimOriginalFraction > 0 && remainingPositionFraction > 0) {
+            await logExitSignal(mint, balance, changePct, rawAmount, "WHALE TRIM", {
+              sellFractionCurrent: Math.min(1, pendingWhaleTrimOriginalFraction / remainingPositionFraction),
+              finalExit: false,
+              currentHigh: maxSeen,
+            });
+          }
         }
 
       } catch (err: any) {

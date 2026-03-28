@@ -1,13 +1,34 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { sendTelegram } from "./telegram-notifier.js";
-import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { env } from '../config/env.js';
+import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.js';
+import {
+  appendWhaleTradeDiscard,
+  appendWhaleTradeMetric,
+  readWhaleStats,
+  type WhaleTradeMetricInput,
+  type WhaleTradeMode,
+} from '../storage/whale-stats.js';
 import { normalizeWhales } from '../storage/whales.js';
+import { sendTelegram } from './telegram-notifier.js';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PERF_FILE = path.resolve(SCRIPT_DIR, '../data/performance.json');
 const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const PAPER_PERF_FILE = path.resolve(SCRIPT_DIR, '../data/paper-performance.json');
+const LEGACY_HISTORY_LIMIT = Math.max(env.PAPER_PROMOTION_MIN_TRADES, env.LIVE_ELIMINATION_MIN_TRADES, 12);
+
+export interface WhalePerformanceInput extends WhaleTradeMetricInput {
+  discardReason?: string | null;
+}
+
+function readLegacyPerformance(filePath: string) {
+  return readJsonFileSync<Record<string, boolean[]>>(filePath, {});
+}
+
+function writeLegacyPerformance(filePath: string, data: Record<string, boolean[]>) {
+  writeJsonFileSync(filePath, data);
+}
 
 function updateWhaleTradeCounts(address: string, field: 'paperTrades' | 'liveTrades', value: number) {
   const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
@@ -15,74 +36,215 @@ function updateWhaleTradeCounts(address: string, field: 'paperTrades' | 'liveTra
   writeJsonFileSync(WHALE_FILE, updatedWhales);
 }
 
-export async function logWhalePerformance(whaleAddress: string, isWin: boolean) {
-  try {
-    const data = readJsonFileSync<Record<string, boolean[]>>(PERF_FILE, {});
-    
-    if (!data[whaleAddress]) data[whaleAddress] = [];
-    
-    // Ergebnis hinzufügen (true = Win, false = Loss)
-    data[whaleAddress].push(isWin);
-    
-    // Nur die letzten 3 Trades behalten
-    if (data[whaleAddress].length > 3) data[whaleAddress].shift();
-    updateWhaleTradeCounts(whaleAddress, 'liveTrades', data[whaleAddress].length);
-
-    // Check: 3 Verluste in Folge?
-    const losses = data[whaleAddress].filter((v: boolean) => v === false).length;
-    
-    if (data[whaleAddress].length === 3 && losses === 3) {
-      // Wal eliminieren
-      const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
-      const newWhales = whales.filter((w) => w.address !== whaleAddress);
-      
-      writeJsonFileSync(WHALE_FILE, newWhales);
-      delete data[whaleAddress]; // Performance-Daten zurücksetzen
-      
-      await sendTelegram(`🚫 <b>WAL ELIMINIERT</b>\nAdresse: <code>${whaleAddress.slice(0,8)}...</code>\nGrund: 3 Verluste in Folge. Liste bereinigt!`);
-      console.log(`[CLEANUP] Wal ${whaleAddress} entfernt.`);
-    }
-
-    writeJsonFileSync(PERF_FILE, data);
-  } catch (e) {
-    console.error("Performance Tracker Error:", e);
+function normalizePerformanceInput(input: boolean | WhalePerformanceInput): WhalePerformanceInput {
+  if (typeof input === 'boolean') {
+    return {
+      pnlPct: input ? 1 : -1,
+      exitReason: input ? 'legacy-win' : 'legacy-loss',
+      holdMinutes: 0,
+      panicExit: false,
+      hadPositiveExcursion: input,
+      roundTripCostBps: env.ESTIMATED_ROUND_TRIP_COST_BPS,
+    };
   }
+
+  return {
+    ...input,
+    holdMinutes: Number.isFinite(Number(input.holdMinutes)) ? Number(input.holdMinutes) : 0,
+    exitReason: input.exitReason ?? 'unknown',
+    panicExit: input.panicExit === true,
+    hadPositiveExcursion: input.hadPositiveExcursion === true || input.pnlPct > 0,
+    roundTripCostBps: input.roundTripCostBps ?? env.ESTIMATED_ROUND_TRIP_COST_BPS,
+  };
 }
 
-export async function logPaperWhalePerformance(whaleAddress: string, isWin: boolean) {
-  try {
-    const data = readJsonFileSync<Record<string, boolean[]>>(PAPER_PERF_FILE, {});
-    if (!data[whaleAddress]) data[whaleAddress] = [];
+function syncLegacyOutcome(filePath: string, whaleAddress: string, isWin: boolean) {
+  const data = readLegacyPerformance(filePath);
+  const history = Array.isArray(data[whaleAddress])
+    ? data[whaleAddress].filter((value): value is boolean => typeof value === 'boolean')
+    : [];
 
-    data[whaleAddress].push(isWin);
-    if (data[whaleAddress].length > 3) data[whaleAddress].shift();
-    writeJsonFileSync(PAPER_PERF_FILE, data);
+  history.push(isWin);
+  if (history.length > LEGACY_HISTORY_LIMIT) {
+    history.splice(0, history.length - LEGACY_HISTORY_LIMIT);
+  }
 
-    updateWhaleTradeCounts(whaleAddress, 'paperTrades', data[whaleAddress].length);
+  data[whaleAddress] = history;
+  writeLegacyPerformance(filePath, data);
+  return history;
+}
 
-    const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
-    const whale = whales.find((item) => item.address === whaleAddress);
-    if (!whale || whale.mode !== 'paper' || data[whaleAddress].length < 3) {
-      return;
+function getRecentLossStreak(pnlHistory: number[]) {
+  let streak = 0;
+  for (let index = pnlHistory.length - 1; index >= 0; index -= 1) {
+    const pnl = pnlHistory[index];
+    if (pnl === undefined) {
+      continue;
     }
 
-    const wins = data[whaleAddress].filter(Boolean).length;
-    const winRate = (wins / data[whaleAddress].length) * 100;
-    if (winRate < 60) {
-      return;
+    if (pnl > 0) {
+      break;
     }
 
-    const promotedWhales = whales.map((item) => item.address === whaleAddress
-      ? { ...item, mode: 'live' as const, promotedAt: new Date().toISOString() }
-      : item);
-    writeJsonFileSync(WHALE_FILE, promotedWhales);
+    streak += 1;
+  }
 
-    await sendTelegram(`🏆 <b>WAL PROMOTED</b>\nAdresse: <code>${whaleAddress.slice(0,8)}...</code>\nPaper Win-Rate: <b>${winRate.toFixed(0)}%</b>\nAb dem naechsten Trade wird live gehandelt.`, {
+  return streak;
+}
+
+function getModeMetrics(address: string, mode: WhaleTradeMode) {
+  const store = readWhaleStats();
+  const trades = store[address]?.[mode]?.trades ?? [];
+  const discards = store[address]?.[mode]?.discards ?? [];
+  const pnlHistory = trades.map((trade) => trade.pnlPct);
+  const wins = pnlHistory.filter((value) => value > 0).length;
+  const avgPnlPct = pnlHistory.length > 0
+    ? pnlHistory.reduce((sum, value) => sum + value, 0) / pnlHistory.length
+    : null;
+  const sortedPnl = [...pnlHistory].sort((left, right) => left - right);
+  const medianPnlPct = sortedPnl.length === 0
+    ? null
+    : sortedPnl.length % 2 === 0
+      ? (((sortedPnl[(sortedPnl.length / 2) - 1] ?? 0) + (sortedPnl[sortedPnl.length / 2] ?? 0)) / 2)
+      : (sortedPnl[Math.floor(sortedPnl.length / 2)] ?? null);
+
+  return {
+    trades,
+    discards,
+    evaluatedTrades: trades.length,
+    wins,
+    winRatePct: trades.length > 0 ? (wins / trades.length) * 100 : null,
+    avgPnlPct,
+    medianPnlPct,
+    lossStreak: getRecentLossStreak(pnlHistory),
+  };
+}
+
+function syncWhaleTradeCounts(address: string) {
+  const paper = getModeMetrics(address, 'paper');
+  const live = getModeMetrics(address, 'live');
+  updateWhaleTradeCounts(address, 'paperTrades', paper.evaluatedTrades);
+  updateWhaleTradeCounts(address, 'liveTrades', live.evaluatedTrades);
+}
+
+async function maybePromotePaperWhale(whaleAddress: string) {
+  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
+  const whale = whales.find((item) => item.address === whaleAddress);
+  if (!whale || whale.mode !== 'paper') {
+    return;
+  }
+
+  const summary = getModeMetrics(whaleAddress, 'paper');
+  if (summary.evaluatedTrades < env.PAPER_PROMOTION_MIN_TRADES) {
+    return;
+  }
+
+  if ((summary.winRatePct ?? 0) < env.PAPER_PROMOTION_MIN_WIN_RATE_PCT) {
+    return;
+  }
+
+  if ((summary.avgPnlPct ?? Number.NEGATIVE_INFINITY) < env.PAPER_PROMOTION_MIN_AVG_PNL_PCT) {
+    return;
+  }
+
+  if ((summary.medianPnlPct ?? Number.NEGATIVE_INFINITY) < env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT) {
+    return;
+  }
+
+  const promotedWhales = whales.map((item) => item.address === whaleAddress
+    ? { ...item, mode: 'live' as const, promotedAt: new Date().toISOString() }
+    : item);
+  writeJsonFileSync(WHALE_FILE, promotedWhales);
+
+  await sendTelegram(
+    `🏆 <b>WAL PROMOTED</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>`,
+    {
       dedupeKey: `whale-promoted:${whaleAddress}`,
       cooldownMs: 24 * 60 * 60 * 1000,
       priority: true,
+    },
+  );
+}
+
+async function maybeEliminateLiveWhale(whaleAddress: string) {
+  const summary = getModeMetrics(whaleAddress, 'live');
+  if (summary.evaluatedTrades < env.LIVE_ELIMINATION_MIN_TRADES) {
+    return;
+  }
+
+  const shouldEliminateByStreak = summary.lossStreak >= env.LIVE_ELIMINATION_MAX_LOSS_STREAK;
+  const shouldEliminateByAverage = (summary.avgPnlPct ?? Number.POSITIVE_INFINITY) <= env.LIVE_ELIMINATION_MAX_AVG_PNL_PCT;
+
+  if (!shouldEliminateByStreak && !shouldEliminateByAverage) {
+    return;
+  }
+
+  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
+  const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
+  writeJsonFileSync(WHALE_FILE, remainingWhales);
+
+  const liveData = readLegacyPerformance(PERF_FILE);
+  delete liveData[whaleAddress];
+  writeLegacyPerformance(PERF_FILE, liveData);
+
+  await sendTelegram(
+    `🚫 <b>WAL ELIMINIERT</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nLoss-Streak: <b>${summary.lossStreak}</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>`,
+    {
+      dedupeKey: `whale-eliminated:${whaleAddress}`,
+      cooldownMs: 6 * 60 * 60 * 1000,
+      priority: true,
+    },
+  );
+  console.log(`[CLEANUP] Wal ${whaleAddress} entfernt.`);
+}
+
+async function logModePerformance(mode: WhaleTradeMode, legacyFile: string, whaleAddress: string, input: boolean | WhalePerformanceInput) {
+  const metric = normalizePerformanceInput(input);
+  if (metric.discardReason) {
+    appendWhaleTradeDiscard(whaleAddress, mode, {
+      reason: metric.discardReason,
+      ...(metric.mint ? { mint: metric.mint } : {}),
     });
-  } catch (e) {
-    console.error('Paper Performance Tracker Error:', e);
+    syncWhaleTradeCounts(whaleAddress);
+    return;
+  }
+
+  appendWhaleTradeMetric(whaleAddress, mode, metric);
+  syncLegacyOutcome(legacyFile, whaleAddress, metric.pnlPct > 0);
+  syncWhaleTradeCounts(whaleAddress);
+
+  if (mode === 'paper') {
+    await maybePromotePaperWhale(whaleAddress);
+    return;
+  }
+
+  await maybeEliminateLiveWhale(whaleAddress);
+}
+
+export async function logWhalePerformance(whaleAddress: string, input: boolean | WhalePerformanceInput) {
+  try {
+    await logModePerformance('live', PERF_FILE, whaleAddress, input);
+  } catch (error) {
+    console.error('Performance Tracker Error:', error);
+  }
+}
+
+export async function logPaperWhalePerformance(whaleAddress: string, input: boolean | WhalePerformanceInput) {
+  try {
+    await logModePerformance('paper', PAPER_PERF_FILE, whaleAddress, input);
+  } catch (error) {
+    console.error('Paper Performance Tracker Error:', error);
+  }
+}
+
+export function discardPaperWhalePerformance(whaleAddress: string, reason: string, mint?: string) {
+  try {
+    appendWhaleTradeDiscard(whaleAddress, 'paper', {
+      reason,
+      ...(mint ? { mint } : {}),
+    });
+    syncWhaleTradeCounts(whaleAddress);
+  } catch (error) {
+    console.error('Paper Performance Discard Error:', error);
   }
 }
