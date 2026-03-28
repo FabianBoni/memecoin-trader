@@ -137,8 +137,10 @@ type PaperTradeRecord = {
   mint: string;
   entryPrice: number;
   openedAt: string;
-  entryPriceSource: 'market-snapshot';
+  entryPriceSource: 'market-snapshot' | 'wallet-receipt' | 'wallet-receipt-sol-only';
   whaleWinRateAtEntry: number | null;
+  entryPriceSol?: number | null;
+  entryTxid?: string;
   panic?: boolean;
   panicMarkedAt?: string;
 };
@@ -175,6 +177,113 @@ function appendWhaleActivity(entry: WhaleActivityRecord) {
   const activity = readJsonFileSync<WhaleActivityRecord[]>(WHALE_ACTIVITY_PATH, []);
   activity.unshift(entry);
   writeJsonFileSync(WHALE_ACTIVITY_PATH, activity.slice(0, 100));
+}
+
+async function fetchSolUsdPrice(): Promise<number | null> {
+  try {
+    const res = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
+    const data = await res.json();
+    const price = Number(data?.data?.[SOL_MINT]?.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+function getAccountKeyString(accountKey: unknown): string | undefined {
+  if (!accountKey) {
+    return undefined;
+  }
+
+  if (typeof accountKey === 'string') {
+    return accountKey;
+  }
+
+  if (typeof accountKey === 'object' && accountKey !== null) {
+    const maybePubkey = 'pubkey' in accountKey ? (accountKey as { pubkey?: unknown }).pubkey : accountKey;
+    if (typeof maybePubkey === 'string') {
+      return maybePubkey;
+    }
+
+    if (typeof maybePubkey === 'object' && maybePubkey !== null && 'toBase58' in maybePubkey) {
+      const toBase58 = (maybePubkey as { toBase58?: () => string }).toBase58;
+      if (typeof toBase58 === 'function') {
+        return toBase58.call(maybePubkey);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function getWalletNativeSolDelta(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string): number | undefined {
+  const accountKeys = (parsedTx?.transaction.message as { accountKeys?: unknown[] } | undefined)?.accountKeys;
+  const walletIndex = accountKeys?.findIndex((accountKey) => getAccountKeyString(accountKey) === walletAddress) ?? -1;
+
+  if (walletIndex < 0) {
+    return undefined;
+  }
+
+  const preBalance = parsedTx?.meta?.preBalances?.[walletIndex];
+  const postBalance = parsedTx?.meta?.postBalances?.[walletIndex];
+  if (preBalance === undefined || postBalance === undefined) {
+    return undefined;
+  }
+
+  return (postBalance - preBalance) / 1_000_000_000;
+}
+
+function getTokenDeltaUi(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string, mint: string): number | undefined {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+
+  if (deltaRaw === 0n) {
+    return undefined;
+  }
+
+  return Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+}
+
+async function inferEntryPriceFromWhaleTransaction(params: {
+  parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null;
+  whaleAddress: string;
+  mint: string;
+}): Promise<{ entryPrice: number; entryPriceSol: number | null; source: PaperTradeRecord['entryPriceSource'] } | null> {
+  if (!params.parsedTx) {
+    return null;
+  }
+
+  const nativeSolDelta = getWalletNativeSolDelta(params.parsedTx, params.whaleAddress);
+  const tokenDeltaUi = getTokenDeltaUi(params.parsedTx, params.whaleAddress, params.mint);
+
+  if (nativeSolDelta === undefined || nativeSolDelta >= 0 || !tokenDeltaUi || tokenDeltaUi <= 0) {
+    return null;
+  }
+
+  const entryPriceSol = Math.abs(nativeSolDelta) / tokenDeltaUi;
+  const solUsdPrice = await fetchSolUsdPrice();
+  if (!solUsdPrice) {
+    return {
+      entryPrice: entryPriceSol,
+      entryPriceSol,
+      source: 'wallet-receipt-sol-only',
+    };
+  }
+
+  return {
+    entryPrice: entryPriceSol * solUsdPrice,
+    entryPriceSol,
+    source: 'wallet-receipt',
+  };
 }
 
 function pruneProcessedSignatures() {
@@ -267,8 +376,19 @@ async function fetchEntryPriceUsd(mint: string): Promise<number | null> {
 }
 
 // --- KAUF LOGIK (Mit Kassenzettel-System!) ---
-async function openPaperTrade(whale: WhaleRecord, mint: string, positionProfile: ReturnType<typeof getPositionSizeProfile>) {
-  const entryPrice = await fetchEntryPriceUsd(mint);
+async function openPaperTrade(
+  whale: WhaleRecord,
+  mint: string,
+  positionProfile: ReturnType<typeof getPositionSizeProfile>,
+  parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null,
+  signature?: string,
+) {
+  const marketEntryPrice = await fetchEntryPriceUsd(mint);
+  const receiptEntry = !marketEntryPrice
+    ? await inferEntryPriceFromWhaleTransaction({ ...(parsedTx !== undefined ? { parsedTx } : {}), whaleAddress: whale.address, mint })
+    : null;
+  const entryPrice = marketEntryPrice ?? receiptEntry?.entryPrice ?? null;
+
   if (!entryPrice) {
     console.warn(`[PAPER] ${mint.slice(0,6)} fuer ${whale.address.slice(0,8)} konnte ohne Einstiegspreis nicht als Paper-Trade angelegt werden.`);
     return;
@@ -280,20 +400,31 @@ async function openPaperTrade(whale: WhaleRecord, mint: string, positionProfile:
     return;
   }
 
-  paperTrades[tradeId] = {
+  const paperTradeRecord: PaperTradeRecord = {
     id: tradeId,
     whale: whale.address,
     mint,
     entryPrice,
     openedAt: new Date().toISOString(),
-    entryPriceSource: 'market-snapshot',
+    entryPriceSource: marketEntryPrice ? 'market-snapshot' : (receiptEntry?.source ?? 'market-snapshot'),
     whaleWinRateAtEntry: positionProfile.winRate,
+    entryPriceSol: receiptEntry?.entryPriceSol ?? null,
   };
+  if (signature) {
+    paperTradeRecord.entryTxid = signature;
+  }
+
+  paperTrades[tradeId] = paperTradeRecord;
   writePaperTrades(paperTrades);
-  console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert.`);
+  console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert (${paperTradeRecord.entryPriceSource}).`);
 }
 
-async function logDecision(whale: WhaleRecord, mint: string) {
+async function logDecision(
+  whale: WhaleRecord,
+  mint: string,
+  parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null,
+  signature?: string,
+) {
   const positionProfile = getPositionSizeProfile(whale.address);
 
   const winRateLabel = positionProfile.winRate === null
@@ -303,7 +434,7 @@ async function logDecision(whale: WhaleRecord, mint: string) {
   console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} size=${positionProfile.positionSol} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'}`);
 
   if (whale.mode === 'paper') {
-    await openPaperTrade(whale, mint, positionProfile);
+    await openPaperTrade(whale, mint, positionProfile, parsedTx, signature);
     return;
   }
 
@@ -502,7 +633,7 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
     signature,
     botMode: whale.mode,
   });
-  await logDecision(whale, tokenChange.mint);
+  await logDecision(whale, tokenChange.mint, tx, signature);
 }
 
 async function refreshWhaleSubscriptions() {
