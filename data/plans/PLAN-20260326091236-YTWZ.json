@@ -1,0 +1,77 @@
+{
+  "screen": {
+    "tokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "mintAuthorityRevoked": true,
+    "freezeAuthorityRevoked": true,
+    "liquidityCheckPassed": false,
+    "liquidityCheckStatus": "unknown",
+    "passed": false,
+    "warnings": [
+      "LP mint address could not be resolved for the discovered pool."
+    ],
+    "reasons": [
+      "Unable to determine LP mint address for discovered pool."
+    ],
+    "source": {
+      "heliusRpcUrl": "https://mainnet.helius-rpc.com/?api-key=5a2cdf41-6ece-447b-8c84-cfacca255efc"
+    },
+    "liquidity": {
+      "passed": false,
+      "status": "unknown",
+      "pool": {
+        "pairAddress": "6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp",
+        "dexId": "meteora",
+        "chainId": "solana",
+        "url": "https://dexscreener.com/solana/6ofwm7kplfxnwmb3z5xwboxnspp3jjyirapqpsivcnsp",
+        "baseTokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+        "quoteTokenAddress": "So11111111111111111111111111111111111111112"
+      },
+      "pumpFun": {
+        "detected": false,
+        "canonicalPoolAddress": "G6UNBdCk8Q8zpTuGajM9chTaXqKfCwSvczTWtnTreqYe",
+        "canonicalPoolDetected": false,
+        "status": "not-pump",
+        "reasons": [],
+        "evidence": [
+          "Bonding curve candidate HYdTodMngpgXxJAMxqiN5E8p1SMzTy24eNM2Y3yWpuj2 owner 11111111111111111111111111111111 did not match Pump program."
+        ]
+      },
+      "reasons": [
+        "Unable to determine LP mint address for discovered pool."
+      ],
+      "warnings": [
+        "LP mint address could not be resolved for the discovered pool."
+      ],
+      "evidence": [
+        "Bonding curve candidate HYdTodMngpgXxJAMxqiN5E8p1SMzTy24eNM2Y3yWpuj2 owner 11111111111111111111111111111111 did not match Pump program.",
+        "Pool owner LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo is not a recognized Raydium AMM v4 program."
+      ]
+    }
+  },
+  "plan": {
+    "planId": "PLAN-20260326091236-YTWZ",
+    "createdAt": "2026-03-26T09:12:36.623Z",
+    "tokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "executionMode": "jupiter",
+    "requestedPositionSol": 0.005,
+    "allowedPositionSol": 0.3,
+    "currentOpenExposureSol": 0,
+    "projectedOpenExposureSol": 0.005,
+    "remainingExposureCapacitySol": 0.5,
+    "finalPositionSol": 0.005,
+    "maxSlippageBps": 1000,
+    "stopLossPct": 30,
+    "takeProfitPct": 100,
+    "takeProfitSellFraction": 0.5,
+    "dryRun": false,
+    "requiresGo": true,
+    "screenPassed": false,
+    "executable": false,
+    "blockingReasons": [
+      "Unable to determine LP mint address for discovered pool."
+    ],
+    "notes": [],
+    "poolAddress": "6oFWm7KPLfxnwMb3z5xwBoXNSPP3JJyirAPqPSiVcnsp",
+    "dexId": "meteora"
+  }
+}

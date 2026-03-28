@@ -1,0 +1,20 @@
+{
+  "6DMaiMfBtXokiUTc1FB8pffDzbiGefGwB3HmhcERUW6j": {
+    "whale": "CkUZV387xnoGpF7wC2moMa6mPmAgCvTT4pWgzq4M9fCD",
+    "entryPrice": 0
+  },
+  "76r29NpnRW8PAxpnSnVBFcZPUcukgvno1Kkiysg8pump": {
+    "whale": "BoaNRN33T6ApQ5hpGEWB7zQySC3Zzq4AkzoanA3kYGLR",
+    "entryPrice": 1000000,
+    "panic": true
+  },
+  "Bx1Q5Z795PUUoN5T1iH8n4Wggsc1AagFx1eVuNWi7brv": {
+    "whale": "CkUZV387xnoGpF7wC2moMa6mPmAgCvTT4pWgzq4M9fCD",
+    "entryPrice": 1000000,
+    "panic": true
+  },
+  "9MgodXy84cD6XXrw75BDrfWanooQAZok7GdiXJeDpump": {
+    "whale": "CkUZV387xnoGpF7wC2moMa6mPmAgCvTT4pWgzq4M9fCD",
+    "entryPrice": 0
+  }
+}

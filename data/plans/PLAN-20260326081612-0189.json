@@ -1,0 +1,74 @@
+{
+  "screen": {
+    "tokenAddress": "E822Fhx8UrYTshH6Bqm3sXiFtqX7zyXiaeWDYNXXbonk",
+    "mintAuthorityRevoked": true,
+    "freezeAuthorityRevoked": true,
+    "liquidityCheckPassed": false,
+    "liquidityCheckStatus": "unknown",
+    "passed": false,
+    "warnings": [
+      "LP mint address could not be resolved for the discovered pool."
+    ],
+    "reasons": [
+      "Unable to determine LP mint address for discovered pool."
+    ],
+    "source": {
+      "heliusRpcUrl": "https://mainnet.helius-rpc.com/?api-key=5a2cdf41-6ece-447b-8c84-cfacca255efc"
+    },
+    "liquidity": {
+      "passed": false,
+      "status": "unknown",
+      "pool": {
+        "pairAddress": "7m9GKC5579S7cmvB99Q67poJ3NfhrpQnHcxWYuMUTZJx",
+        "dexId": "launchlab",
+        "chainId": "solana",
+        "url": "https://dexscreener.com/solana/7m9gkc5579s7cmvb99q67poj3nfhrpqnhcxwyumutzjx",
+        "baseTokenAddress": "E822Fhx8UrYTshH6Bqm3sXiFtqX7zyXiaeWDYNXXbonk",
+        "quoteTokenAddress": "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+      },
+      "pumpFun": {
+        "detected": false,
+        "canonicalPoolAddress": "YWLLi9VQ1Yx1UmGBFSUumz283JqDq5N8seQgHEaHKPN",
+        "canonicalPoolDetected": false,
+        "status": "not-pump",
+        "reasons": [],
+        "evidence": []
+      },
+      "reasons": [
+        "Unable to determine LP mint address for discovered pool."
+      ],
+      "warnings": [
+        "LP mint address could not be resolved for the discovered pool."
+      ],
+      "evidence": [
+        "Pool owner LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj is not a recognized Raydium AMM v4 program."
+      ]
+    }
+  },
+  "plan": {
+    "planId": "PLAN-20260326081612-0189",
+    "createdAt": "2026-03-26T08:16:12.068Z",
+    "tokenAddress": "E822Fhx8UrYTshH6Bqm3sXiFtqX7zyXiaeWDYNXXbonk",
+    "executionMode": "jupiter",
+    "requestedPositionSol": 0.1,
+    "allowedPositionSol": 0.3,
+    "currentOpenExposureSol": 0,
+    "projectedOpenExposureSol": 0.1,
+    "remainingExposureCapacitySol": 0.5,
+    "finalPositionSol": 0.1,
+    "maxSlippageBps": 1000,
+    "stopLossPct": 30,
+    "takeProfitPct": 100,
+    "takeProfitSellFraction": 0.5,
+    "dryRun": true,
+    "requiresGo": true,
+    "screenPassed": false,
+    "executable": false,
+    "blockingReasons": [
+      "Unable to determine LP mint address for discovered pool."
+    ],
+    "notes": [],
+    "poolAddress": "7m9GKC5579S7cmvB99Q67poJ3NfhrpQnHcxWYuMUTZJx",
+    "dexId": "launchlab"
+  }
+}
