@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import { env, getHeliusRpcUrl } from "../config/env.js";
+import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from "../solana/rpc-guard.js";
 import type { RawAccountInfo, SplTokenMintAccountInfo, TokenAccountInfo } from "../types/token.js";
 
 interface RpcResponse<T> {
@@ -58,6 +59,62 @@ interface HeliusPriorityFeeResponse {
   };
 }
 
+const HELIUS_RPC_CONCURRENCY = 2;
+const HELIUS_RPC_RETRY_DELAYS_MS = [500, 1000, 2000, 4000];
+const ACCOUNT_INFO_CACHE_TTL_MS = 5 * 60 * 1000;
+const TOKEN_ACCOUNTS_CACHE_TTL_MS = 60 * 1000;
+const PRIORITY_FEE_CACHE_TTL_MS = 15 * 1000;
+
+const limitHeliusRpc = createAsyncLimiter(HELIUS_RPC_CONCURRENCY);
+const inFlightRpcRequests = new Map<string, Promise<unknown>>();
+const rpcResponseCache = new Map<string, { expiresAt: number; value: unknown }>();
+
+function redactRpcUrl(url: string): string {
+  return url.replace(/([?&]api-key=)[^&]+/gi, "$1<redacted>");
+}
+
+function getRpcCacheKey(rpcUrl: string, method: string, params: unknown[]): string {
+  return JSON.stringify([rpcUrl, method, params]);
+}
+
+function readRpcCache<T>(cacheKey: string): T | undefined {
+  const cached = rpcResponseCache.get(cacheKey);
+  if (!cached) {
+    return undefined;
+  }
+
+  if (Date.now() > cached.expiresAt) {
+    rpcResponseCache.delete(cacheKey);
+    return undefined;
+  }
+
+  return cached.value as T;
+}
+
+function writeRpcCache(cacheKey: string, value: unknown, ttlMs: number) {
+  if (ttlMs <= 0) {
+    return;
+  }
+
+  rpcResponseCache.set(cacheKey, {
+    expiresAt: Date.now() + ttlMs,
+    value,
+  });
+}
+
+function getDefaultCacheTtlMs(method: string): number {
+  switch (method) {
+    case "getAccountInfo":
+      return ACCOUNT_INFO_CACHE_TTL_MS;
+    case "getTokenAccountsByOwner":
+      return TOKEN_ACCOUNTS_CACHE_TTL_MS;
+    case "getPriorityFeeEstimate":
+      return PRIORITY_FEE_CACHE_TTL_MS;
+    default:
+      return 0;
+  }
+}
+
 function makeRpcHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
@@ -92,20 +149,13 @@ export class HeliusClient {
     return this.rpcUrl;
   }
 
-  private async rpcRequest<T>(id: string, method: string, params: unknown[], rpcUrl = this.rpcUrl): Promise<T> {
-    const body = {
-      jsonrpc: "2.0",
-      id: 1,
-      method,
-      params,
-    };
-
+  private async doRpcRequest<T>(body: object, method: string, rpcUrl: string): Promise<T> {
     let rawText: string;
 
     if (env.RPC_DEBUG_USE_CURL) {
       rawText = execCurlJson(rpcUrl, body);
     } else {
-      console.log("Fetching:", rpcUrl);
+      console.log("Fetching:", redactRpcUrl(rpcUrl));
 
       try {
         const response = await fetch(rpcUrl, {
@@ -117,7 +167,7 @@ export class HeliusClient {
         if (!response.ok) {
           const bodyText = await response.text();
           console.error("Helius RPC non-OK response:", {
-            url: rpcUrl,
+            url: redactRpcUrl(rpcUrl),
             method,
             status: response.status,
             statusText: response.statusText,
@@ -130,7 +180,7 @@ export class HeliusClient {
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         console.error("Helius RPC fetch failed:", {
-          url: rpcUrl,
+          url: redactRpcUrl(rpcUrl),
           method,
           message,
           error,
@@ -150,6 +200,64 @@ export class HeliusClient {
     }
 
     return payload.result;
+  }
+
+  private async rpcRequest<T>(
+    id: string,
+    method: string,
+    params: unknown[],
+    rpcUrl = this.rpcUrl,
+    cacheTtlMs = getDefaultCacheTtlMs(method),
+  ): Promise<T> {
+    const body = {
+      jsonrpc: "2.0",
+      id: 1,
+      method,
+      params,
+    };
+    const cacheKey = getRpcCacheKey(rpcUrl, method, params);
+    const cached = readRpcCache<T>(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const inFlight = inFlightRpcRequests.get(cacheKey);
+    if (inFlight) {
+      return inFlight as Promise<T>;
+    }
+
+    const requestPromise = limitHeliusRpc(async () => withRpcRetry(
+      async () => {
+        try {
+          const result = await this.doRpcRequest<T>(body, method, rpcUrl);
+          writeRpcCache(cacheKey, result, cacheTtlMs);
+          return result;
+        } catch (error) {
+          if (
+            rpcUrl === this.rpcUrl
+            && env.FALLBACK_MAINNET_RPC_URL
+            && env.FALLBACK_MAINNET_RPC_URL !== rpcUrl
+            && isSolanaRpcRateLimitError(error)
+          ) {
+            console.warn(`Helius RPC rate limited for ${method}. Retrying via fallback RPC.`);
+            return this.doRpcRequest<T>(body, method, env.FALLBACK_MAINNET_RPC_URL);
+          }
+
+          throw error;
+        }
+      },
+      {
+        delaysMs: HELIUS_RPC_RETRY_DELAYS_MS,
+        onRetry: (delayMs, attempt) => {
+          console.warn(`Helius RPC rate limited for ${method}. Retry ${attempt}/${HELIUS_RPC_RETRY_DELAYS_MS.length} in ${delayMs}ms.`);
+        },
+      },
+    )).finally(() => {
+      inFlightRpcRequests.delete(cacheKey);
+    });
+
+    inFlightRpcRequests.set(cacheKey, requestPromise);
+    return requestPromise as Promise<T>;
   }
 
   async getParsedTokenMintInfo(tokenAddress: string): Promise<SplTokenMintAccountInfo> {
@@ -255,10 +363,15 @@ export class HeliusClient {
       method: "getPriorityFeeEstimate",
       params: [{ accountKeys, options: { recommended: true } }],
     };
+    const cacheKey = getRpcCacheKey(this.rpcUrl, "getPriorityFeeEstimate", body.params);
+    const cached = readRpcCache<number | undefined>(cacheKey);
+    if (cached !== undefined) {
+      return cached;
+    }
 
-    console.log("Fetching:", this.rpcUrl);
+    const result = await limitHeliusRpc(async () => withRpcRetry(async () => {
+      console.log("Fetching:", redactRpcUrl(this.rpcUrl));
 
-    try {
       const response = await fetch(this.rpcUrl, {
         method: "POST",
         headers: makeRpcHeaders(),
@@ -268,7 +381,7 @@ export class HeliusClient {
       if (!response.ok) {
         const bodyText = await response.text();
         console.error("Helius priority fee non-OK response:", {
-          url: this.rpcUrl,
+          url: redactRpcUrl(this.rpcUrl),
           status: response.status,
           statusText: response.statusText,
           body: bodyText,
@@ -279,7 +392,7 @@ export class HeliusClient {
       const payload = await response.json() as HeliusPriorityFeeResponse;
       if (payload.error) {
         console.error("Helius priority fee RPC error:", {
-          url: this.rpcUrl,
+          url: redactRpcUrl(this.rpcUrl),
           code: payload.error.code,
           message: payload.error.message,
         });
@@ -287,14 +400,14 @@ export class HeliusClient {
       }
 
       return payload.result?.priorityFeeEstimate;
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error("Helius priority fee fetch failed:", {
-        url: this.rpcUrl,
-        message,
-        error,
-      });
-      throw error;
-    }
+    }, {
+      delaysMs: HELIUS_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`Helius priority fee rate limited. Retry ${attempt}/${HELIUS_RPC_RETRY_DELAYS_MS.length} in ${delayMs}ms.`);
+      },
+    }));
+
+    writeRpcCache(cacheKey, result, PRIORITY_FEE_CACHE_TTL_MS);
+    return result;
   }
 }

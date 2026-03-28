@@ -11,7 +11,7 @@ import { getWhaleModeSummary } from '../storage/whale-stats.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
-import { createAsyncLimiter, withRpcRetry } from '../solana/rpc-guard.js';
+import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import { sendTelegram } from "./telegram-notifier.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
@@ -30,6 +30,7 @@ const TRACKER_PRICE_CONCURRENCY = 3;
 const TRACKER_RPC_CONCURRENCY = 2;
 const TRACKER_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 const MIN_SOL_RESERVE = Number(process.env.MIN_SOL_RESERVE || '0.05');
+const MIN_RELIABLE_WHALE_SOL_DELTA = 0.01;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const executionWallet = loadExecutionWallet();
@@ -304,6 +305,27 @@ function getWalletNativeSolDelta(parsedTx: Awaited<ReturnType<Connection['getPar
   }
 
   return (postBalance - preBalance) / 1_000_000_000;
+}
+
+function getReliableWhaleBuySizeSol(
+  parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>> | null | undefined,
+  walletAddress: string,
+): number | null {
+  if (!parsedTx) {
+    return null;
+  }
+
+  const nativeSolDelta = getWalletNativeSolDelta(parsedTx, walletAddress);
+  if (nativeSolDelta === undefined || nativeSolDelta >= 0) {
+    return null;
+  }
+
+  const deployedSol = Math.abs(nativeSolDelta);
+  if (deployedSol < MIN_RELIABLE_WHALE_SOL_DELTA) {
+    return null;
+  }
+
+  return deployedSol;
 }
 
 function getTokenDeltaUi(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string, mint: string): number | undefined {
@@ -717,10 +739,7 @@ async function evaluateEntryDecision(
   const entryPrice = marketEntryPriceUsd ?? whaleEntry?.entryPrice ?? null;
   const entryPriceSource = marketEntryPriceUsd ? 'market-snapshot' : (whaleEntry?.source ?? 'market-snapshot');
   const liquidityUsd = await getLiquidityUsd(mint);
-  const whaleBuySizeSol = parsedTx ? (() => {
-    const nativeSolDelta = getWalletNativeSolDelta(parsedTx, whale.address);
-    return nativeSolDelta !== undefined && nativeSolDelta < 0 ? Math.abs(nativeSolDelta) : null;
-  })() : null;
+  const whaleBuySizeSol = getReliableWhaleBuySizeSol(parsedTx, whale.address);
 
   if (entryPrice === null || entryPrice <= 0) {
     rejectionReasons.push('Kein belastbarer Einstiegspreis verfuegbar.');
@@ -735,7 +754,11 @@ async function evaluateEntryDecision(
       notes.push(screen.warnings[0]!);
     }
   } catch (error) {
-    rejectionReasons.push(`Token-Screen Fehler: ${error instanceof Error ? error.message : String(error)}`);
+    if (whale.mode === 'paper' && isSolanaRpcRateLimitError(error)) {
+      notes.push('Token-Screen temporär rate-limited, Paper-Trade wird trotzdem bewertet.');
+    } else {
+      rejectionReasons.push(`Token-Screen Fehler: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   if (!Number.isFinite(Number(liquidityUsd)) || Number(liquidityUsd) < env.MIN_ENTRY_LIQUIDITY_USD) {
@@ -766,7 +789,7 @@ async function evaluateEntryDecision(
   }
 
   if (whaleBuySizeSol === null) {
-    notes.push('Whale-Buy-Groesse konnte nicht sauber aus der TX abgeleitet werden.');
+    notes.push('Whale-Buy-Groesse konnte nicht belastbar in SOL abgeleitet werden.');
   }
 
   return {
