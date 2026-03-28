@@ -789,7 +789,9 @@ async function evaluateEntryDecision(
 
   if (rejectionReasons.length === 0) {
     try {
-      const screen = await tokenScreenService.screenToken(mint);
+      const screen = await tokenScreenService.screenToken(mint, {
+        skipLiquidityChecks: whale.mode === 'paper',
+      });
       if (!screen.passed) {
         if (whale.mode === 'paper' && isSoftPaperTokenScreenFailure(screen)) {
           notes.push(`Token-Screen unvollstaendig: ${(screen.reasons[0] ?? 'unbekannt').slice(0, 160)} Paper-Trade wird trotzdem bewertet.`);

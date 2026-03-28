@@ -3,6 +3,10 @@ import { LiquidityScreenService } from "./liquidity-screen.js";
 import { createAsyncLimiter, isSolanaRpcRateLimitError } from "../solana/rpc-guard.js";
 import type { TokenSecurityScreen, SplTokenMintAccountInfo } from "../types/token.js";
 
+export interface TokenScreenOptions {
+  skipLiquidityChecks?: boolean;
+}
+
 const TOKEN_SCREEN_CACHE_TTL_MS = 5 * 60 * 1000;
 const TOKEN_SCREEN_STALE_TTL_MS = 30 * 60 * 1000;
 const TOKEN_SCREEN_CONCURRENCY = 2;
@@ -10,6 +14,10 @@ const TOKEN_SCREEN_CONCURRENCY = 2;
 const tokenScreenCache = new Map<string, { fetchedAt: number; result: TokenSecurityScreen }>();
 const inFlightTokenScreens = new Map<string, Promise<TokenSecurityScreen>>();
 const limitTokenScreen = createAsyncLimiter(TOKEN_SCREEN_CONCURRENCY);
+
+function getTokenScreenCacheKey(tokenAddress: string, options?: TokenScreenOptions): string {
+  return JSON.stringify([tokenAddress, options?.skipLiquidityChecks === true]);
+}
 
 function isAuthorityRevoked(option?: number, authority?: string | null): boolean {
   if (option === 0) return true;
@@ -54,13 +62,13 @@ export class TokenScreenService {
     };
   }
 
-  private async buildScreenResult(tokenAddress: string): Promise<TokenSecurityScreen> {
+  private async buildScreenResult(tokenAddress: string, options?: TokenScreenOptions): Promise<TokenSecurityScreen> {
     const warnings: string[] = [];
     const reasons: string[] = [];
 
     const mintInfo = await this.heliusClient.getParsedTokenMintInfo(tokenAddress);
     const checks = buildAuthorityChecks(mintInfo);
-    const liquidity = await this.liquidityScreenService.screenLiquidity(tokenAddress);
+    const liquidity = options?.skipLiquidityChecks ? undefined : await this.liquidityScreenService.screenLiquidity(tokenAddress);
 
     if (!checks.mintAuthorityRevoked) {
       reasons.push("Mint Authority is still enabled.");
@@ -70,43 +78,46 @@ export class TokenScreenService {
       reasons.push("Freeze Authority is still enabled.");
     }
 
-    warnings.push(...liquidity.warnings);
-    reasons.push(...liquidity.reasons);
+    if (liquidity) {
+      warnings.push(...liquidity.warnings);
+      reasons.push(...liquidity.reasons);
+    }
 
     return {
       tokenAddress,
       mintAuthorityRevoked: checks.mintAuthorityRevoked,
       freezeAuthorityRevoked: checks.freezeAuthorityRevoked,
-      liquidityCheckPassed: liquidity.passed,
-      liquidityCheckStatus: liquidity.status,
-      passed: checks.mintAuthorityRevoked && checks.freezeAuthorityRevoked && liquidity.passed,
+      liquidityCheckPassed: liquidity?.passed ?? true,
+      liquidityCheckStatus: liquidity?.status ?? "not-implemented",
+      passed: checks.mintAuthorityRevoked && checks.freezeAuthorityRevoked && (liquidity?.passed ?? true),
       warnings,
       reasons,
       source: {
         heliusRpcUrl: this.heliusClient.getRpcUrl(),
       },
-      liquidity,
+      ...(liquidity ? { liquidity } : {}),
     };
   }
 
-  async screenToken(tokenAddress: string): Promise<TokenSecurityScreen> {
-    const cached = tokenScreenCache.get(tokenAddress);
+  async screenToken(tokenAddress: string, options?: TokenScreenOptions): Promise<TokenSecurityScreen> {
+    const cacheKey = getTokenScreenCacheKey(tokenAddress, options);
+    const cached = tokenScreenCache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < TOKEN_SCREEN_CACHE_TTL_MS) {
       return this.cloneScreenResult(cached.result);
     }
 
-    const inFlight = inFlightTokenScreens.get(tokenAddress);
+    const inFlight = inFlightTokenScreens.get(cacheKey);
     if (inFlight) {
       return inFlight;
     }
 
     const request = limitTokenScreen(async () => {
       try {
-        const result = await this.buildScreenResult(tokenAddress);
-        tokenScreenCache.set(tokenAddress, { fetchedAt: Date.now(), result });
+        const result = await this.buildScreenResult(tokenAddress, options);
+        tokenScreenCache.set(cacheKey, { fetchedAt: Date.now(), result });
         return this.cloneScreenResult(result);
       } catch (error) {
-        const stale = tokenScreenCache.get(tokenAddress);
+        const stale = tokenScreenCache.get(cacheKey);
         if (stale && isSolanaRpcRateLimitError(error) && Date.now() - stale.fetchedAt < TOKEN_SCREEN_STALE_TTL_MS) {
           const cachedResult = this.cloneScreenResult(stale.result);
           cachedResult.warnings.push("Token screen served from stale cache after RPC rate limit.");
@@ -116,10 +127,10 @@ export class TokenScreenService {
         throw error;
       }
     }).finally(() => {
-      inFlightTokenScreens.delete(tokenAddress);
+      inFlightTokenScreens.delete(cacheKey);
     });
 
-    inFlightTokenScreens.set(tokenAddress, request);
+    inFlightTokenScreens.set(cacheKey, request);
     return request;
   }
 }
