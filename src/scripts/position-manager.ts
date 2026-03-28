@@ -57,7 +57,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       inputMint: mint,
       outputMint: "So11111111111111111111111111111111111111112",
       amount: rawAmount,
-      maxSlippageBps: 1500,
+      maxSlippageBps: 500,
       dryRun: false
     } as any);
 

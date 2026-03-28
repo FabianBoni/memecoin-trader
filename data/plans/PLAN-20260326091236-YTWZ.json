@@ -59,7 +59,7 @@
     "projectedOpenExposureSol": 0.005,
     "remainingExposureCapacitySol": 0.5,
     "finalPositionSol": 0.005,
-    "maxSlippageBps": 1000,
+    "maxSlippageBps": 250,
     "stopLossPct": 30,
     "takeProfitPct": 100,
     "takeProfitSellFraction": 0.5,
