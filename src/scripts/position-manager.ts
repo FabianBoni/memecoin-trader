@@ -3,7 +3,7 @@ import path from 'path';
 import { Connection, PublicKey } from "@solana/web3.js";
 import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
-import { logWhalePerformance } from "./performance-tracker.js";
+import { logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { loadExecutionWallet } from "../wallet.js";
 import { env } from "../config/env.js";
@@ -17,12 +17,14 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
+const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
 const SELL_RETRY_ATTEMPTS = 5;
 const SELL_RETRY_DELAY_MS = 2_500;
 const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
+const paperHighWaterMarks = new Map<string, number>();
 
 function readActiveTrades(): Record<string, any> {
   return readJsonFileSync(ACTIVE_TRADES_PATH, {});
@@ -30,6 +32,14 @@ function readActiveTrades(): Record<string, any> {
 
 function writeActiveTrades(activeTrades: Record<string, any>) {
   writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
+}
+
+function readPaperTrades(): Record<string, any> {
+  return readJsonFileSync(PAPER_TRADES_PATH, {});
+}
+
+function writePaperTrades(paperTrades: Record<string, any>) {
+  writeJsonFileSync(PAPER_TRADES_PATH, paperTrades);
 }
 
 function markTradeExitState(mint: string, patch: Record<string, unknown> | null): boolean {
@@ -482,8 +492,55 @@ async function getCurrentPrice(mint: string): Promise<number | null> {
   }
 }
 
+async function monitorPaperTrades() {
+  const paperTrades = readPaperTrades();
+  const paperTradeIds = Object.keys(paperTrades);
+
+  for (const tradeId of paperTradeIds) {
+    const trade = paperTrades[tradeId];
+    const mint = typeof trade?.mint === 'string' ? trade.mint : undefined;
+    const whale = typeof trade?.whale === 'string' ? trade.whale : undefined;
+    const entryPrice = toFiniteNumber(trade?.entryPrice);
+
+    if (!mint || !whale || !entryPrice || entryPrice <= 0) {
+      continue;
+    }
+
+    const currentPrice = await getCurrentPrice(mint);
+    if (!currentPrice) {
+      continue;
+    }
+
+    const changePct = ((currentPrice - entryPrice) / entryPrice) * 100;
+    const currentHigh = paperHighWaterMarks.get(tradeId) || 0;
+    if (changePct > currentHigh) {
+      paperHighWaterMarks.set(tradeId, changePct);
+    }
+
+    const maxSeen = paperHighWaterMarks.get(tradeId) || changePct;
+    let dynamicStopLoss = STOP_LOSS;
+    if (maxSeen >= TRAILING_ARM_PCT) {
+      dynamicStopLoss = maxSeen - TRAILING_DISTANCE_PCT;
+    }
+
+    const shouldClose = trade.panic || changePct <= dynamicStopLoss || changePct >= 1000;
+    if (!shouldClose) {
+      continue;
+    }
+
+    const isWin = changePct > 0;
+    await logPaperWhalePerformance(whale, isWin);
+    delete paperTrades[tradeId];
+    writePaperTrades(paperTrades);
+    paperHighWaterMarks.delete(tradeId);
+    console.log(`[PAPER] ${trade.panic ? 'PANIC' : 'EXIT'} ${mint.slice(0,6)} fuer ${whale.slice(0,8)} mit ${changePct.toFixed(2)}% geschlossen.`);
+  }
+}
+
 async function monitorPositions() {
   try {
+    await monitorPaperTrades();
+
     if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
     const walletAddress = getTrackedWalletAddress();
     const walletPubKey = new PublicKey(walletAddress);

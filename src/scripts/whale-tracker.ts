@@ -6,6 +6,7 @@ import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { env } from "../config/env.js";
 import { loadExecutionWallet } from "../wallet.js";
+import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
@@ -13,6 +14,7 @@ const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
+const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
 const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 
@@ -127,13 +129,33 @@ async function executeBuyWithRetry(params: {
   throw lastError instanceof Error ? lastError : new Error(`Buy execution failed for ${params.mint}.`);
 }
 
-const getWhales = (): string[] => {
+type PaperTradeRecord = {
+  id: string;
+  whale: string;
+  mint: string;
+  entryPrice: number;
+  openedAt: string;
+  entryPriceSource: 'market-snapshot';
+  whaleWinRateAtEntry: number | null;
+  panic?: boolean;
+  panicMarkedAt?: string;
+};
+
+const getWhales = (): WhaleRecord[] => {
   try {
-    return readJsonFileSync(WHALES_PATH, []);
+    return normalizeWhales(readJsonFileSync(WHALES_PATH, []));
   } catch (e) {
     return [];
   }
 };
+
+function readPaperTrades(): Record<string, PaperTradeRecord> {
+  return readJsonFileSync(PAPER_TRADES_PATH, {});
+}
+
+function writePaperTrades(trades: Record<string, PaperTradeRecord>) {
+  writeJsonFileSync(PAPER_TRADES_PATH, trades);
+}
 
 function logSizingConfiguration() {
   const defaultSize = env.AUTO_BUY_AMOUNT_SOL;
@@ -206,14 +228,45 @@ async function fetchEntryPriceUsd(mint: string): Promise<number | null> {
 }
 
 // --- KAUF LOGIK (Mit Kassenzettel-System!) ---
-async function logDecision(whaleWallet: string, mint: string) {
-  const positionProfile = getPositionSizeProfile(whaleWallet);
+async function openPaperTrade(whale: WhaleRecord, mint: string, positionProfile: ReturnType<typeof getPositionSizeProfile>) {
+  const entryPrice = await fetchEntryPriceUsd(mint);
+  if (!entryPrice) {
+    console.warn(`[PAPER] ${mint.slice(0,6)} fuer ${whale.address.slice(0,8)} konnte ohne Einstiegspreis nicht als Paper-Trade angelegt werden.`);
+    return;
+  }
+
+  const paperTrades = readPaperTrades();
+  const tradeId = `${whale.address}:${mint}`;
+  if (paperTrades[tradeId]) {
+    return;
+  }
+
+  paperTrades[tradeId] = {
+    id: tradeId,
+    whale: whale.address,
+    mint,
+    entryPrice,
+    openedAt: new Date().toISOString(),
+    entryPriceSource: 'market-snapshot',
+    whaleWinRateAtEntry: positionProfile.winRate,
+  };
+  writePaperTrades(paperTrades);
+  console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert.`);
+}
+
+async function logDecision(whale: WhaleRecord, mint: string) {
+  const positionProfile = getPositionSizeProfile(whale.address);
 
   const winRateLabel = positionProfile.winRate === null
     ? `${positionProfile.sampleSize} Trades (Testphase)`
     : `${positionProfile.winRate.toFixed(0)}% aus ${positionProfile.sampleSize} Trades`;
 
-  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whaleWallet.slice(0,8)}... tier=${positionProfile.tier} size=${positionProfile.positionSol} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'}`);
+  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} size=${positionProfile.positionSol} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'}`);
+
+  if (whale.mode === 'paper') {
+    await openPaperTrade(whale, mint, positionProfile);
+    return;
+  }
 
   try {
     const { receipt: executionReceipt, maxSlippageBps, attempts } = await executeBuyWithRetry({
@@ -227,7 +280,7 @@ async function logDecision(whaleWallet: string, mint: string) {
     }
 
     if (!entryPrice) {
-      await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`, {
+      await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`, {
         dedupeKey: `entry-price-unknown:${mint}`,
         cooldownMs: 6 * 60 * 60 * 1000,
       });
@@ -248,7 +301,7 @@ async function logDecision(whaleWallet: string, mint: string) {
 
     // NEU: Wir speichern jetzt das Hybrid-Objekt inkl. Preis und Wal-Adresse!
     activeTrades[mint] = {
-      whale: whaleWallet,
+      whale: whale.address,
       entryPrice: entryPrice ?? null,
       openedAt: new Date().toISOString(),
       balanceCheckGraceUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
@@ -265,7 +318,7 @@ async function logDecision(whaleWallet: string, mint: string) {
     const activeCount = Object.keys(persistedTrades).length;
     const actualSizeSol = getExecutedBuySizeSol(executionReceipt, positionProfile.positionSol);
 
-    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
       cooldownMs: 300_000,
       priority: true,
@@ -288,27 +341,37 @@ async function logDecision(whaleWallet: string, mint: string) {
 }
 
 // --- VERKAUFS LOGIK (Panik-Exit / Wal-Verkauf) ---
-async function executePanicSell(whaleWallet: string, mint: string) {
-  console.log(`🚨 [PANIK] Wal ${whaleWallet.slice(0,6)} verkauft ${mint.slice(0,6)}! Notverkauf initiiert!`);
-  await sendTelegram(`🚨 <b>WAL EXIT ERKANNT!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBot triggert sofortigen Panik-Verkauf!`, {
-    dedupeKey: `panic-exit:${whaleWallet}:${mint}`,
-    cooldownMs: 60 * 60 * 1000,
-    priority: true,
-  });
+async function executePanicSell(whale: WhaleRecord, mint: string) {
+  console.log(`🚨 [PANIK] Wal ${whale.address.slice(0,6)} verkauft ${mint.slice(0,6)}! Notverkauf initiiert!`);
 
   try {
-    if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
-    
     const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     
     // Prüfen, ob wir den Token überhaupt noch haben
     if (!activeTrades[mint]) {
-         await sendTelegram(`ℹ <b>INFO</b>\nToken: ${mint.slice(0,6)}...\nWal hat verkauft, aber wir waren schon vorher draußen!`, {
-           dedupeKey: `already-out:${mint}`,
-           cooldownMs: 60 * 60 * 1000,
-         });
+         const paperTrades = readPaperTrades();
+         const paperTradeId = `${whale.address}:${mint}`;
+
+         if (!paperTrades[paperTradeId]) {
+           await sendTelegram(`ℹ <b>INFO</b>\nToken: ${mint.slice(0,6)}...\nWal hat verkauft, aber wir waren schon vorher draußen!`, {
+             dedupeKey: `already-out:${mint}`,
+             cooldownMs: 60 * 60 * 1000,
+           });
+           return;
+         }
+
+         paperTrades[paperTradeId].panic = true;
+         paperTrades[paperTradeId].panicMarkedAt = new Date().toISOString();
+         writePaperTrades(paperTrades);
+         console.log(`[PAPER] Token ${mint.slice(0,6)} fuer Schatten-Exit markiert.`);
          return;
     }
+
+    await sendTelegram(`🚨 <b>WAL EXIT ERKANNT!</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBot triggert sofortigen Panik-Verkauf!`, {
+      dedupeKey: `panic-exit:${whale.address}:${mint}`,
+      cooldownMs: 60 * 60 * 1000,
+      priority: true,
+    });
 
     activeTrades[mint].panic = true; // Markierung für den Manager
     activeTrades[mint].panicMarkedAt = new Date().toISOString();
@@ -334,7 +397,7 @@ async function start() {
 
   connection.onLogs("all", async (logs) => {
     const whales = getWhales();
-    const foundWhale = whales.find(w => logs.logs.some(l => l.includes(w)));
+    const foundWhale = whales.find((whale) => logs.logs.some((line) => line.includes(whale.address)));
 
     if (foundWhale) {
       const tx = await connection.getParsedTransaction(logs.signature, {
@@ -352,10 +415,10 @@ async function start() {
 
           if (activeMints.length > 0) {
             const tokenSold = tx.meta?.preTokenBalances?.find(pre => {
-              if(pre.owner !== foundWhale) return false;
+              if(pre.owner !== foundWhale.address) return false;
               if(!activeMints.includes(pre.mint)) return false; // Token gehört zu unseren!
 
-              const post = tx.meta?.postTokenBalances?.find(p => p.mint === pre.mint && p.owner === foundWhale);
+              const post = tx.meta?.postTokenBalances?.find(p => p.mint === pre.mint && p.owner === foundWhale.address);
               const preAmt = Number(pre.uiTokenAmount.uiAmount);
               const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
 
@@ -375,18 +438,18 @@ async function start() {
 
       // --- 2. PRÜFE AUF WAL-KAUF ---
       const tokenChange = tx.meta?.postTokenBalances?.find(b =>
-        b.owner === foundWhale &&
+        b.owner === foundWhale.address &&
         b.mint !== "So11111111111111111111111111111111111111112"
       );
 
       if (tokenChange) {
         // Wir prüfen zusätzlich, ob die Balance VORHER niedriger war (also ein echter Kauf)
-        const preBalance = tx.meta?.preTokenBalances?.find(b => b.owner === foundWhale && b.mint === tokenChange.mint);
+        const preBalance = tx.meta?.preTokenBalances?.find(b => b.owner === foundWhale.address && b.mint === tokenChange.mint);
         const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
         const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
 
         if (postAmt > preAmt) {
-          console.log(`[TREFFER] Wal ${foundWhale} hat Token gekauft: ${tokenChange.mint}`);
+          console.log(`[TREFFER] Wal ${foundWhale.address} hat Token gekauft: ${tokenChange.mint}`);
           await logDecision(foundWhale, tokenChange.mint);
         }
       }

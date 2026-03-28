@@ -1,10 +1,14 @@
 import fs from 'fs';
+import path from 'path';
 import { Connection, PublicKey } from '@solana/web3.js';
+import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { normalizeWhales } from '../storage/whales.js';
 
-const WHALE_FILE = './src/data/whales.json';
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 
 // Hilfsfunktion für Pausen
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -51,7 +55,7 @@ async function scout() {
     // Wir holen nur die letzten 5 Käufer, das reicht für die Elite!
     const signatures = await connection.getSignaturesForAddress(mintPubKey, { limit: 5 });
     
-    const currentWhales = readJsonFileSync<string[]>(WHALE_FILE, []);
+    const currentWhales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
     let addedCount = 0;
 
     // Wir rufen die Transaktionen einzeln ab, mit Pause dazwischen!
@@ -68,12 +72,19 @@ async function scout() {
         
         const walletAddress = signer.pubkey.toBase58();
 
-        if (!currentWhales.includes(walletAddress)) {
-           currentWhales.push(walletAddress);
+        if (!currentWhales.some((whale) => whale.address === walletAddress)) {
+           currentWhales.push({
+             address: walletAddress,
+             mode: 'paper',
+             discoveredAt: new Date().toISOString(),
+             promotedAt: null,
+             paperTrades: 0,
+             liveTrades: 0,
+           });
            addedCount++;
            
            console.log(`🎯 [SCOUT] Neuer Trader entdeckt: ${walletAddress}`);
-           await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN!</b>\nToken: <code>${mintAddress}</code>\nWallet: <code>${walletAddress}</code>`, {
+           await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nToken: <code>${mintAddress}</code>\nWallet: <code>${walletAddress}</code>\nStatus: <b>PAPER</b>`, {
              dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
              cooldownMs: 24 * 60 * 60 * 1000,
            });

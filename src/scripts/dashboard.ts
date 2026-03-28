@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
 import { readJsonFileSync } from '../storage/json-file-sync.js';
+import { normalizeWhales } from '../storage/whales.js';
 
 const app = express();
 
@@ -53,10 +54,12 @@ function escapeHtml(value: unknown): string {
 }
 
 app.get('/', (req, res) => {
-    const whales = safeReadJSON('whales.json', []);
+    const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const activeTrades = safeReadJSON('active-trades.json', {});
     const performance = safeReadJSON('performance.json', {});
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
+    const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
+    const liveWhales = whales.length - paperWhales;
 
     let totalWins = 0;
     let totalLosses = 0;
@@ -213,7 +216,7 @@ app.get('/', (req, res) => {
         </div>
 
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-            <div class="glass-card border-t-4 border-t-blue-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Wale</h2><p class="text-3xl font-black">${whales.length}</p></div>
+            <div class="glass-card border-t-4 border-t-blue-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Wale</h2><p class="text-3xl font-black">${whales.length}</p><p class="text-xs text-slate-500 mt-1">Live ${liveWhales} · Paper ${paperWhales}</p></div>
             <div class="glass-card border-t-4 border-t-yellow-400"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Positionen</h2><p class="text-3xl font-black text-yellow-400">${Object.keys(activeTrades).length}</p></div>
             <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Total Trades</h2><p class="text-3xl font-black">${totalTrades}</p></div>
             <div class="glass-card border-t-4 ${averageRealizedPnl >= 0 ? 'border-t-emerald-500' : 'border-t-red-500'}"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Avg Realized PnL</h2><p class="text-3xl font-black ${averageRealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(averageRealizedPnl)}</p><p class="text-xs text-slate-500 mt-1">Win-Rate ${globalWinRate}%</p></div>
