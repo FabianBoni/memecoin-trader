@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { normalizeWhales } from '../storage/whales.js';
+import { updateRuntimeStatus } from '../storage/runtime-status.js';
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -48,19 +49,40 @@ function logNextScoutRun() {
 
 async function scout() {
   console.log("🔎 [SCOUT] Starte Blockchain-Suche (Anti-Spam Modus)...");
+  updateRuntimeStatus('scout', {
+    lastRunAt: new Date().toISOString(),
+    state: 'running',
+  });
   try {
     const connection = new Connection(RPC_URL);
     
     const res = await fetch('https://api.dexscreener.com/token-boosts/latest/v1');
     const tokens: any = await res.json();
     
-    if (!tokens || tokens.length === 0) return;
+    if (!tokens || tokens.length === 0) {
+      updateRuntimeStatus('scout', {
+        state: 'idle',
+        lastSuccessAt: new Date().toISOString(),
+        lastAddedCount: 0,
+        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+      });
+      return;
+    }
 
     const topToken = tokens[0]; 
     const mintAddress = topToken.tokenAddress;
+    updateRuntimeStatus('scout', {
+      lastToken: mintAddress,
+    });
 
     if (topToken.chainId !== 'solana' || !isLikelySolanaMintAddress(mintAddress)) {
       console.log(`⏭ [SCOUT] Ueberspringe Nicht-Solana oder ungueltigen Token: ${String(mintAddress)}`);
+      updateRuntimeStatus('scout', {
+        state: 'idle',
+        lastSuccessAt: new Date().toISOString(),
+        lastAddedCount: 0,
+        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+      });
       return;
     }
 
@@ -122,14 +144,32 @@ async function scout() {
         console.log(`⏳ [SCOUT] Keine neuen Wale hinzugefügt.`);
     }
 
+    updateRuntimeStatus('scout', {
+      state: 'idle',
+      lastSuccessAt: new Date().toISOString(),
+      lastAddedCount: addedCount,
+      whaleCount: currentWhales.length,
+      lastToken: mintAddress,
+    });
+
   } catch (e: any) {
     console.error("❌ Scout Fehler:", e.message);
+    updateRuntimeStatus('scout', {
+      state: 'error',
+      lastErrorAt: new Date().toISOString(),
+      lastError: e.message,
+    });
   }
 }
 
 function scheduleNextScoutRun() {
   logNextScoutRun();
-  setTimeout(runScoutLoop, getScoutIntervalMs());
+  const nextIntervalMs = getScoutIntervalMs();
+  updateRuntimeStatus('scout', {
+    nextRunInMs: nextIntervalMs,
+    nextRunAt: new Date(Date.now() + nextIntervalMs).toISOString(),
+  });
+  setTimeout(runScoutLoop, nextIntervalMs);
 }
 
 async function runScoutLoop() {

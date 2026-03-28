@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { env } from "../config/env.js";
 
@@ -25,6 +26,9 @@ const SELL_RETRY_ATTEMPTS = 5;
 const SELL_RETRY_DELAY_MS = 2_500;
 const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
 const paperHighWaterMarks = new Map<string, number>();
+const PRICE_CACHE_TTL_MS = 15_000;
+const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
+const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 
 function readActiveTrades(): Record<string, any> {
   return readJsonFileSync(ACTIVE_TRADES_PATH, {});
@@ -71,12 +75,21 @@ function toFiniteNumber(value: unknown): number | null {
 }
 
 async function fetchSolUsdPrice(): Promise<number | null> {
+  if (solUsdPriceCache.fetchedAt > 0 && (Date.now() - solUsdPriceCache.fetchedAt) < PRICE_CACHE_TTL_MS) {
+    return solUsdPriceCache.price;
+  }
+
   try {
     const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
     const data = await response.json();
     const price = Number(data?.data?.[SOL_MINT]?.price);
-    return Number.isFinite(price) && price > 0 ? price : null;
+    const resolvedPrice = Number.isFinite(price) && price > 0 ? price : null;
+    solUsdPriceCache.fetchedAt = Date.now();
+    solUsdPriceCache.price = resolvedPrice;
+    return resolvedPrice;
   } catch {
+    solUsdPriceCache.fetchedAt = Date.now();
+    solUsdPriceCache.price = null;
     return null;
   }
 }
@@ -480,16 +493,51 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
 }
 
 async function getCurrentPrice(mint: string): Promise<number | null> {
+  const cached = tokenPriceCache.get(mint);
+  if (cached && (Date.now() - cached.fetchedAt) < PRICE_CACHE_TTL_MS) {
+    return cached.price;
+  }
+
   try {
     const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
     const data = await res.json();
     if (data.data[mint] && data.data[mint].price) {
-      return Number(data.data[mint].price);
+      const resolvedPrice = Number(data.data[mint].price);
+      tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: resolvedPrice });
+      return resolvedPrice;
     }
+    tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
     return null;
   } catch (e) {
+    tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
     return null;
   }
+}
+
+async function getPaperTradeChangePct(trade: Record<string, any>, currentPriceUsd: number): Promise<number | null> {
+  const entrySource = typeof trade.entryPriceSource === 'string' ? trade.entryPriceSource : 'market-snapshot';
+
+  if (entrySource === 'wallet-receipt-sol-only') {
+    const entryPriceSol = toFiniteNumber(trade.entryPriceSol) ?? toFiniteNumber(trade.entryPrice);
+    if (!entryPriceSol || entryPriceSol <= 0) {
+      return null;
+    }
+
+    const solUsdPrice = await fetchSolUsdPrice();
+    if (!solUsdPrice || solUsdPrice <= 0) {
+      return null;
+    }
+
+    const currentPriceSol = currentPriceUsd / solUsdPrice;
+    return ((currentPriceSol - entryPriceSol) / entryPriceSol) * 100;
+  }
+
+  const entryPriceUsd = toFiniteNumber(trade.entryPrice);
+  if (!entryPriceUsd || entryPriceUsd <= 0) {
+    return null;
+  }
+
+  return ((currentPriceUsd - entryPriceUsd) / entryPriceUsd) * 100;
 }
 
 async function monitorPaperTrades() {
@@ -500,9 +548,8 @@ async function monitorPaperTrades() {
     const trade = paperTrades[tradeId];
     const mint = typeof trade?.mint === 'string' ? trade.mint : undefined;
     const whale = typeof trade?.whale === 'string' ? trade.whale : undefined;
-    const entryPrice = toFiniteNumber(trade?.entryPrice);
 
-    if (!mint || !whale || !entryPrice || entryPrice <= 0) {
+    if (!mint || !whale) {
       continue;
     }
 
@@ -511,7 +558,11 @@ async function monitorPaperTrades() {
       continue;
     }
 
-    const changePct = ((currentPrice - entryPrice) / entryPrice) * 100;
+    const changePct = await getPaperTradeChangePct(trade, currentPrice);
+    if (changePct === null) {
+      continue;
+    }
+
     const currentHigh = paperHighWaterMarks.get(tradeId) || 0;
     if (changePct > currentHigh) {
       paperHighWaterMarks.set(tradeId, changePct);
@@ -540,6 +591,14 @@ async function monitorPaperTrades() {
 async function monitorPositions() {
   try {
     await monitorPaperTrades();
+
+    updateRuntimeStatus('positionManager', {
+      state: 'monitoring',
+      lastRunAt: new Date().toISOString(),
+      openPaperTrades: Object.keys(readPaperTrades()).length,
+      openLiveTrades: Object.keys(readActiveTrades()).length,
+      priceCacheEntries: tokenPriceCache.size,
+    });
 
     if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
     const walletAddress = getTrackedWalletAddress();
@@ -677,9 +736,22 @@ async function monitorPositions() {
     }
   } catch (error: any) {
     console.error("Monitor Error:", error.message);
+    updateRuntimeStatus('positionManager', {
+      state: 'error',
+      lastErrorAt: new Date().toISOString(),
+      lastError: error.message,
+      openPaperTrades: Object.keys(readPaperTrades()).length,
+      openLiveTrades: Object.keys(readActiveTrades()).length,
+    });
   }
 }
 
 setInterval(monitorPositions, 20000);
 console.log("🛡 Position Manager (Hybrid Trailing Stop + History) ONLINE");
+updateRuntimeStatus('positionManager', {
+  state: 'starting',
+  startedAt: new Date().toISOString(),
+  openPaperTrades: Object.keys(readPaperTrades()).length,
+  openLiveTrades: Object.keys(readActiveTrades()).length,
+});
 monitorPositions();

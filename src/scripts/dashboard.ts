@@ -355,6 +355,7 @@ app.get('/', (req, res) => {
     const performance = safeReadJSON('performance.json', {});
     const paperPerformance = safeReadJSON('paper-performance.json', {});
     const whaleActivity = safeReadJSON('whale-activity.json', []);
+    const runtimeStatus = safeReadJSON('runtime-status.json', {});
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
     const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
     const liveWhales = whales.length - paperWhales;
@@ -412,6 +413,34 @@ app.get('/', (req, res) => {
     const averageRealizedPnl = realizedPnlValues.length > 0
         ? realizedPnlValues.reduce((sum: number, value: number) => sum + value, 0) / realizedPnlValues.length
         : 0;
+    const scoutStatus = runtimeStatus.scout ?? {};
+    const trackerStatus = runtimeStatus.tracker ?? {};
+    const monitorStatus = runtimeStatus.positionManager ?? {};
+
+    const statusCardsHTML = `
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+            <div class="glass-card border-t-4 border-t-cyan-500">
+                <h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Scout</h2>
+                <p class="text-lg font-black text-cyan-300">${escapeHtml(String(scoutStatus.state ?? 'n/a'))}</p>
+                <p class="text-xs text-slate-500 mt-1">Letzter Lauf ${formatDateTime(scoutStatus.lastRunAt)}</p>
+                <p class="text-xs text-slate-500">Token ${escapeHtml(shortenAddress(String(scoutStatus.lastToken ?? 'n/a'), 8, 4))}</p>
+                <p class="text-xs text-slate-500">Next ${formatDateTime(scoutStatus.nextRunAt)}</p>
+            </div>
+            <div class="glass-card border-t-4 border-t-emerald-500">
+                <h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Tracker</h2>
+                <p class="text-lg font-black text-emerald-300">${escapeHtml(String(trackerStatus.activeSubscriptions ?? 0))} Subs</p>
+                <p class="text-xs text-slate-500 mt-1">Whales ${escapeHtml(String(trackerStatus.whaleCount ?? 0))}</p>
+                <p class="text-xs text-slate-500">Letztes Signal ${formatDateTime(trackerStatus.lastSignalAt)}</p>
+                <p class="text-xs text-slate-500">${escapeHtml(String(trackerStatus.lastSignalSide ?? 'n/a'))} ${escapeHtml(shortenAddress(String(trackerStatus.lastSignalMint ?? 'n/a'), 8, 4))}</p>
+            </div>
+            <div class="glass-card border-t-4 border-t-amber-500">
+                <h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Monitor</h2>
+                <p class="text-lg font-black text-amber-300">${escapeHtml(String(monitorStatus.state ?? 'n/a'))}</p>
+                <p class="text-xs text-slate-500 mt-1">Paper ${escapeHtml(String(monitorStatus.openPaperTrades ?? 0))} · Live ${escapeHtml(String(monitorStatus.openLiveTrades ?? 0))}</p>
+                <p class="text-xs text-slate-500">Cache ${escapeHtml(String(monitorStatus.priceCacheEntries ?? 0))}</p>
+                <p class="text-xs text-slate-500">Letzter Lauf ${formatDateTime(monitorStatus.lastRunAt)}</p>
+            </div>
+        </div>`;
 
     // Aktive Trades generieren
     let activeTradesHTML = '<p class="text-slate-500 text-center py-8 italic">Keine aktiven Trades.</p>';
@@ -646,6 +675,8 @@ app.get('/', (req, res) => {
             <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Total Trades</h2><p class="text-3xl font-black">${totalTrades}</p></div>
             <div class="glass-card border-t-4 ${averageRealizedPnl >= 0 ? 'border-t-emerald-500' : 'border-t-red-500'}"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Avg Realized PnL</h2><p class="text-3xl font-black ${averageRealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}">${formatPct(averageRealizedPnl)}</p><p class="text-xs text-slate-500 mt-1">Win-Rate ${globalWinRate}%</p></div>
         </div>
+
+        ${statusCardsHTML}
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-yellow-500/20 p-2 rounded-lg mr-3 text-yellow-500">🎯</span> Live Positionen</h2><div class="overflow-x-auto">${activeTradesHTML}</div></div>

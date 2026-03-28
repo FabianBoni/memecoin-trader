@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { env } from "../config/env.js";
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
@@ -19,6 +20,7 @@ const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
 const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const WHALE_ACTIVITY_PATH = path.resolve(SCRIPT_DIR, '../data/whale-activity.json');
 const WHALE_SUBSCRIPTION_REFRESH_MS = 60 * 1000;
+const WHALE_SIGNAL_COOLDOWN_MS = 90 * 1000;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -156,6 +158,7 @@ type WhaleActivityRecord = {
 
 const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
+const recentWhaleSignals = new Map<string, number>();
 
 const getWhales = (): WhaleRecord[] => {
   try {
@@ -177,6 +180,13 @@ function appendWhaleActivity(entry: WhaleActivityRecord) {
   const activity = readJsonFileSync<WhaleActivityRecord[]>(WHALE_ACTIVITY_PATH, []);
   activity.unshift(entry);
   writeJsonFileSync(WHALE_ACTIVITY_PATH, activity.slice(0, 100));
+  updateRuntimeStatus('tracker', {
+    lastSignalAt: entry.detectedAt,
+    lastSignalWhale: entry.whale,
+    lastSignalMint: entry.mint,
+    lastSignalSide: entry.side,
+    lastSignalMode: entry.botMode,
+  });
 }
 
 async function fetchSolUsdPrice(): Promise<number | null> {
@@ -302,6 +312,26 @@ function markSignatureProcessed(signature: string): boolean {
   }
 
   processedSignatures.set(signature, Date.now());
+  return true;
+}
+
+function pruneRecentWhaleSignals() {
+  const cutoff = Date.now() - WHALE_SIGNAL_COOLDOWN_MS;
+  for (const [signalKey, seenAt] of recentWhaleSignals.entries()) {
+    if (seenAt < cutoff) {
+      recentWhaleSignals.delete(signalKey);
+    }
+  }
+}
+
+function markWhaleSignalProcessed(whaleAddress: string, mint: string, side: 'buy' | 'sell'): boolean {
+  pruneRecentWhaleSignals();
+  const signalKey = `${whaleAddress}:${mint}:${side}`;
+  if (recentWhaleSignals.has(signalKey)) {
+    return false;
+  }
+
+  recentWhaleSignals.set(signalKey, Date.now());
   return true;
 }
 
@@ -591,6 +621,11 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
         });
 
         if (tokenSold) {
+          if (!markWhaleSignalProcessed(whale.address, tokenSold.mint, 'sell')) {
+            console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${whale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
+            return;
+          }
+
           appendWhaleActivity({
             whale: whale.address,
             mint: tokenSold.mint,
@@ -621,6 +656,11 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
   const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
 
   if (postAmt <= preAmt) {
+    return;
+  }
+
+  if (!markWhaleSignalProcessed(whale.address, tokenChange.mint, 'buy')) {
+    console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${whale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
     return;
   }
 
@@ -666,16 +706,33 @@ async function refreshWhaleSubscriptions() {
     whaleLogSubscriptions.set(whale.address, subscriptionId);
     console.log(`[TRACKER] Subscription aktiv fuer ${whale.address.slice(0,8)} (${whale.mode}).`);
   }
+
+  updateRuntimeStatus('tracker', {
+    state: 'tracking',
+    whaleCount: whales.length,
+    activeSubscriptions: whaleLogSubscriptions.size,
+    lastRefreshAt: new Date().toISOString(),
+  });
 }
 
 // --- HAUPTSCHLEIFE ---
 async function start() {
   console.log("🏹 Jäger-Bot ONLINE (Präzisions-Modus inkl. Panik-Schild & Kassenzettel)");
   logSizingConfiguration();
+  updateRuntimeStatus('tracker', {
+    state: 'starting',
+    startedAt: new Date().toISOString(),
+    activeSubscriptions: 0,
+  });
   await refreshWhaleSubscriptions();
   setInterval(() => {
     refreshWhaleSubscriptions().catch((error) => {
       console.error('[TRACKER] Subscription-Refresh fehlgeschlagen:', error);
+      updateRuntimeStatus('tracker', {
+        state: 'error',
+        lastErrorAt: new Date().toISOString(),
+        lastError: error instanceof Error ? error.message : String(error),
+      });
     });
   }, WHALE_SUBSCRIPTION_REFRESH_MS);
 }
