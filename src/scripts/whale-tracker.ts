@@ -3,14 +3,15 @@ import fs from 'fs';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { env } from "../config/env.js";
+import { loadExecutionWallet } from "../wallet.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
 const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
 const PERFORMANCE_PATH = './src/data/performance.json';
 
-// DEINE WALLET ADRESSE HIER (wichtig für den Panik-Verkauf)
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "26L5sdD2t88KZiQXSvQUtiY26XEM1DggdY5kv1wm8RNc";
+// Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
+const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
 
 const getWhales = (): string[] => {
   try {

@@ -3,11 +3,13 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { sendTelegram } from "./telegram-notifier.js";
 import { logWhalePerformance } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
+import { loadExecutionWallet } from "../wallet.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
-const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "26L5sdD2t88KZiQXSvQUtiY26XEM1DggdY5kv1wm8RNc";
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
@@ -46,6 +48,51 @@ function markTradeExitState(mint: string, patch: Record<string, unknown> | null)
 function toFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getTrackedWalletAddress(): string {
+  if (process.env.WALLET_ADDRESS && process.env.WALLET_ADDRESS.trim().length > 0) {
+    return process.env.WALLET_ADDRESS.trim();
+  }
+
+  return loadExecutionWallet().publicKey.toBase58();
+}
+
+async function reconcileWalletPositions(connection: Connection, walletPubKey: PublicKey) {
+  const activeTrades = readActiveTrades();
+  const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID });
+  let recoveredCount = 0;
+
+  for (const accountInfo of tokenAccounts.value) {
+    const parsedInfo = accountInfo.account.data.parsed.info;
+    const mint = parsedInfo.mint as string | undefined;
+    const tokenAmount = parsedInfo.tokenAmount;
+    const balance = Number(tokenAmount?.uiAmount ?? 0);
+
+    if (!mint || mint === SOL_MINT || !Number.isFinite(balance) || balance <= 0) {
+      continue;
+    }
+
+    if (activeTrades[mint]) {
+      continue;
+    }
+
+    activeTrades[mint] = {
+      whale: 'Recovered',
+      entryPrice: null,
+      entryPriceSol: null,
+      positionSol: null,
+      openedAt: new Date().toISOString(),
+      entryPriceSource: 'wallet-recovered',
+      recoveredFromWallet: true,
+    };
+    recoveredCount += 1;
+  }
+
+  if (recoveredCount > 0) {
+    writeActiveTrades(activeTrades);
+    console.log(`[MONITOR] ${recoveredCount} aktive Wallet-Positionen in active-trades gespiegelt.`);
+  }
 }
 
 async function logExitSignal(mint: string, balance: number, changePct: number, rawAmount: string, customReason?: string) {
@@ -194,13 +241,16 @@ async function getCurrentPrice(mint: string): Promise<number | null> {
 async function monitorPositions() {
   try {
     if (!fs.existsSync('./src/data/active-trades.json')) return;
+    const walletAddress = getTrackedWalletAddress();
+    const walletPubKey = new PublicKey(walletAddress);
+    const connection = new Connection(RPC_URL);
+
+    await reconcileWalletPositions(connection, walletPubKey);
+
     const activeTrades = readActiveTrades();
     const mints = Object.keys(activeTrades);
 
     if (mints.length === 0) return;
-
-    const connection = new Connection(RPC_URL);
-    const walletPubKey = new PublicKey(WALLET_ADDRESS);
 
     for (const mint of mints) {
       try {

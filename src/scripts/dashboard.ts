@@ -97,9 +97,11 @@ app.get('/', (req, res) => {
             const positionSol = typeof tData === 'object' && Number.isFinite(Number(tData.positionSol)) ? `${Number(tData.positionSol).toFixed(2)} SOL` : 'n/a';
             const statusBadge = typeof tData === 'object' && tData.panic
                 ? '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">panic</span>'
+                : (typeof tData === 'object' && tData.recoveredFromWallet
+                    ? '<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">wallet</span>'
                 : (entryPrice === 'n/a'
                     ? '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">entry fehlt</span>'
-                    : '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">tracked</span>');
+                    : '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">tracked</span>'));
             return `
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
                 <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${mint}" target="_blank">${mint.slice(0, 8)}...${mint.slice(-4)}</a></td>
