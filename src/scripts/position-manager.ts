@@ -17,7 +17,7 @@ const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json'
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
-const SELL_RETRY_ATTEMPTS = 3;
+const SELL_RETRY_ATTEMPTS = 5;
 const SELL_RETRY_DELAY_MS = 2_500;
 const NEW_POSITION_BALANCE_GRACE_MS = 5 * 60 * 1000;
 
@@ -140,7 +140,12 @@ async function tryBackfillEntryPrice(params: {
   activeTrades: Record<string, any>;
 }): Promise<boolean> {
   const existingEntryPrice = toFiniteNumber(params.tradeData.entryPrice);
+  const existingEntryPriceSol = toFiniteNumber(params.tradeData.entryPriceSol);
   if (existingEntryPrice && existingEntryPrice > 0) {
+    return false;
+  }
+
+  if (existingEntryPriceSol && existingEntryPriceSol > 0) {
     return false;
   }
 
@@ -177,6 +182,38 @@ async function tryBackfillEntryPrice(params: {
   writeActiveTrades(params.activeTrades);
 
   console.log(`[MONITOR] Entry-Preis fuer ${params.mint.slice(0,6)} nachtraeglich aus TX ${entryTxid.slice(0,8)}... ergaenzt.`);
+  return true;
+}
+
+async function tryPromoteUsdEntryPriceFromSol(params: {
+  mint: string;
+  tradeData: Record<string, any>;
+  activeTrades: Record<string, any>;
+}): Promise<boolean> {
+  const existingEntryPrice = toFiniteNumber(params.tradeData.entryPrice);
+  if (existingEntryPrice && existingEntryPrice > 0) {
+    return false;
+  }
+
+  const entryPriceSol = toFiniteNumber(params.tradeData.entryPriceSol);
+  if (!entryPriceSol || entryPriceSol <= 0) {
+    return false;
+  }
+
+  const solUsdPrice = await fetchSolUsdPrice();
+  if (!solUsdPrice) {
+    return false;
+  }
+
+  params.tradeData.entryPrice = entryPriceSol * solUsdPrice;
+  params.tradeData.entryPriceSource = params.tradeData.entryPriceSource === 'receipt-backfill-sol-only'
+    ? 'receipt-backfill'
+    : (params.tradeData.entryPriceSource || 'derived-from-sol');
+  params.tradeData.entryUsdPromotedAt = new Date().toISOString();
+  params.activeTrades[params.mint] = params.tradeData;
+  writeActiveTrades(params.activeTrades);
+
+  console.log(`[MONITOR] USD-Einstieg fuer ${params.mint.slice(0,6)} aus entryPriceSol abgeleitet.`);
   return true;
 }
 
@@ -296,6 +333,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
   let realizedExitPriceSol: number | null = null;
   let priceSource = "market-snapshot";
   const reason = customReason || (isWin ? "TAKE PROFIT" : "STOP LOSS");
+  const isPanicExit = reason === "PANIC EXIT";
   let emoji = isWin ? "💰" : "📉";
 
   try {
@@ -331,11 +369,19 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       priority: true,
     });
 
+    if (isPanicExit) {
+      console.warn(`[PANIC SELL] START mint=${mint} balance=${balance} rawAmount=${rawAmount}`);
+    }
+
     // 1. Verkauf ausführen
     const executionReceipt = await executeSellWithRetry({
       mint,
       rawAmount,
     });
+
+    if (isPanicExit) {
+      console.warn(`[PANIC SELL] TXID mint=${mint} txid=${executionReceipt?.txid ?? 'unknown'} source=${executionReceipt?.priceSource ?? 'unknown'}`);
+    }
 
     realizedExitPriceUsd = toFiniteNumber(executionReceipt?.fillPriceUsd);
     realizedExitPriceSol = toFiniteNumber(executionReceipt?.fillPriceSol);
@@ -395,6 +441,10 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       cooldownMs: 300_000,
       priority: true,
     });
+
+    if (isPanicExit) {
+      console.warn(`[PANIC SELL] CONFIRMED mint=${mint} txid=${executionReceipt?.txid ?? 'unknown'} realizedPnl=${realizedChangePct.toFixed(2)} source=${priceSource}`);
+    }
   } catch (e: any) {
     console.error("❌ Auto-Sell failed:", e);
     markTradeExitState(mint, {
@@ -409,6 +459,10 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       cooldownMs: 300_000,
       priority: true,
     });
+
+    if (isPanicExit) {
+      console.error(`[PANIC SELL] FAILED mint=${mint} error=${e.message}`);
+    }
   }
 }
 
@@ -485,6 +539,16 @@ async function monitorPositions() {
           });
 
           if (backfilled) {
+            missingEntryWarnings.delete(mint);
+          }
+
+          const promotedUsdEntry = await tryPromoteUsdEntryPriceFromSol({
+            mint,
+            tradeData,
+            activeTrades,
+          });
+
+          if (promotedUsdEntry) {
             missingEntryWarnings.delete(mint);
           }
         }

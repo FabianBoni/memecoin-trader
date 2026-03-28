@@ -39,6 +39,10 @@ function lamportsToSol(lamports: number): number {
   return lamports / 1_000_000_000;
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function amountToUiAmount(amount: bigint, decimals: number): number {
   return Number(amount) / 10 ** decimals;
 }
@@ -258,6 +262,28 @@ async function buildExecutionReceipt(params: {
   };
 }
 
+async function findLandedReceiptAfterExpiry(params: {
+  connection: Connection;
+  signature: string;
+  walletAddress: string;
+  quote: JupiterQuoteResponse;
+  inputMint: string;
+  outputMint: string;
+}): Promise<ExecutionReceipt | null> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const receipt = await buildExecutionReceipt(params);
+    if (receipt.confirmed) {
+      return receipt;
+    }
+
+    if (attempt < 2) {
+      await sleep(3_000);
+    }
+  }
+
+  return null;
+}
+
 function isLikelyPlanFilePath(input: string): boolean {
   return input.endsWith(".json") || input.includes("/") || input.includes("\\");
 }
@@ -398,7 +424,7 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
           throw confirmError;
         }
 
-        const landedReceipt = await buildExecutionReceipt({
+        const landedReceipt = await findLandedReceiptAfterExpiry({
           connection,
           signature: txid,
           walletAddress: wallet.publicKey.toBase58(),
@@ -407,7 +433,7 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
           outputMint: quoteOutputMint,
         });
 
-        if (landedReceipt.confirmed) {
+        if (landedReceipt?.confirmed) {
           console.warn(`Confirmation window expired for ${txid}, but the transaction was found on-chain.`);
           console.log("🚀 Transaction sent! TXID:", txid);
           console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
