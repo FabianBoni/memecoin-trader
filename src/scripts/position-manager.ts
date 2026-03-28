@@ -8,6 +8,7 @@ import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.j
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { env } from "../config/env.js";
+import { sleep, withRpcRetry } from '../solana/rpc-guard.js';
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
@@ -31,6 +32,14 @@ const PAPER_TRADE_NO_PRICE_TIMEOUT_MS = 30 * 60 * 1000;
 const PAPER_TRADE_MAX_AGE_MS = 2 * 60 * 60 * 1000;
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
+const RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+const connection = new Connection(RPC_URL);
+let monitorRunInProgress = false;
+
+type WalletTokenBalance = {
+  balance: number;
+  rawAmount: string;
+};
 
 function readActiveTrades(): Record<string, any> {
   return readJsonFileSync(ACTIVE_TRADES_PATH, {});
@@ -182,10 +191,18 @@ async function tryBackfillEntryPrice(params: {
     return false;
   }
 
-  const parsedTx = await params.connection.getParsedTransaction(entryTxid, {
-    maxSupportedTransactionVersion: 0,
-    commitment: 'confirmed',
-  });
+  const parsedTx = await withRpcRetry(
+    () => params.connection.getParsedTransaction(entryTxid, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed',
+    }),
+    {
+      delaysMs: RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[MONITOR] RPC-Limit fuer Entry-TX ${entryTxid.slice(0,8)} erkannt. Retry ${attempt}/${RPC_RETRY_DELAYS_MS.length} in ${delayMs}ms.`);
+      },
+    },
+  );
 
   if (!parsedTx) {
     return false;
@@ -269,10 +286,6 @@ function isWithinBalanceGracePeriod(tradeData: unknown): boolean {
   return false;
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function executeSellWithRetry(params: {
   mint: string;
   rawAmount: string;
@@ -317,18 +330,12 @@ function getTrackedWalletAddress(): string {
   return loadExecutionWallet().publicKey.toBase58();
 }
 
-async function reconcileWalletPositions(connection: Connection, walletPubKey: PublicKey) {
+function reconcileWalletPositions(walletBalances: Map<string, WalletTokenBalance>) {
   const activeTrades = readActiveTrades();
-  const tokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID });
   let recoveredCount = 0;
 
-  for (const accountInfo of tokenAccounts.value) {
-    const parsedInfo = accountInfo.account.data.parsed.info;
-    const mint = parsedInfo.mint as string | undefined;
-    const tokenAmount = parsedInfo.tokenAmount;
-    const balance = Number(tokenAmount?.uiAmount ?? 0);
-
-    if (!mint || mint === SOL_MINT || !Number.isFinite(balance) || balance <= 0) {
+  for (const [mint, walletBalance] of walletBalances.entries()) {
+    if (!mint || mint === SOL_MINT || !Number.isFinite(walletBalance.balance) || walletBalance.balance <= 0) {
       continue;
     }
 
@@ -352,6 +359,45 @@ async function reconcileWalletPositions(connection: Connection, walletPubKey: Pu
     writeActiveTrades(activeTrades);
     console.log(`[MONITOR] ${recoveredCount} aktive Wallet-Positionen in active-trades gespiegelt.`);
   }
+}
+
+async function fetchWalletTokenBalances(walletPubKey: PublicKey): Promise<Map<string, WalletTokenBalance>> {
+  const tokenAccounts = await withRpcRetry(
+    () => connection.getParsedTokenAccountsByOwner(walletPubKey, { programId: TOKEN_PROGRAM_ID }),
+    {
+      delaysMs: RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[MONITOR] RPC-Limit beim Wallet-Snapshot erkannt. Retry ${attempt}/${RPC_RETRY_DELAYS_MS.length} in ${delayMs}ms.`);
+      },
+    },
+  );
+
+  const balances = new Map<string, WalletTokenBalance>();
+
+  for (const accountInfo of tokenAccounts.value) {
+    const parsedInfo = accountInfo.account.data.parsed.info;
+    const mint = parsedInfo.mint as string | undefined;
+    const tokenAmount = parsedInfo.tokenAmount;
+    const balance = Number(tokenAmount?.uiAmount ?? 0);
+    const rawAmount = String(tokenAmount?.amount ?? '0');
+
+    if (!mint || !Number.isFinite(balance) || balance <= 0) {
+      continue;
+    }
+
+    const existing = balances.get(mint);
+    if (!existing) {
+      balances.set(mint, { balance, rawAmount });
+      continue;
+    }
+
+    balances.set(mint, {
+      balance: existing.balance + balance,
+      rawAmount: (BigInt(existing.rawAmount) + BigInt(rawAmount)).toString(),
+    });
+  }
+
+  return balances;
 }
 
 async function logExitSignal(mint: string, balance: number, changePct: number, rawAmount: string, customReason?: string) {
@@ -621,6 +667,12 @@ async function monitorPaperTrades() {
 }
 
 async function monitorPositions() {
+  if (monitorRunInProgress) {
+    console.warn('[MONITOR] Vorheriger Zyklus laeuft noch. Ueberlappenden Poll uebersprungen.');
+    return;
+  }
+
+  monitorRunInProgress = true;
   try {
     await monitorPaperTrades();
 
@@ -635,9 +687,9 @@ async function monitorPositions() {
     if (!fs.existsSync(ACTIVE_TRADES_PATH)) return;
     const walletAddress = getTrackedWalletAddress();
     const walletPubKey = new PublicKey(walletAddress);
-    const connection = new Connection(RPC_URL);
+    const walletBalances = await fetchWalletTokenBalances(walletPubKey);
 
-    await reconcileWalletPositions(connection, walletPubKey);
+    reconcileWalletPositions(walletBalances);
 
     const activeTrades = readActiveTrades();
     const mints = Object.keys(activeTrades);
@@ -646,17 +698,9 @@ async function monitorPositions() {
 
     for (const mint of mints) {
       try {
-        const mintPubKey = new PublicKey(mint);
-        const parsedTokenAccounts = await connection.getParsedTokenAccountsByOwner(walletPubKey, { mint: mintPubKey });
-
-        let balance = 0;
-        let rawAmount = "0";
-
-        const tokenAmount = parsedTokenAccounts.value[0]?.account.data.parsed.info.tokenAmount;
-        if (tokenAmount) {
-          balance = tokenAmount.uiAmount;
-          rawAmount = tokenAmount.amount;
-        }
+        const walletPosition = walletBalances.get(mint);
+        const balance = walletPosition?.balance ?? 0;
+        const rawAmount = walletPosition?.rawAmount ?? '0';
 
         if (balance === 0) {
           if (isWithinBalanceGracePeriod(activeTrades[mint])) {
@@ -775,6 +819,8 @@ async function monitorPositions() {
       openPaperTrades: Object.keys(readPaperTrades()).length,
       openLiveTrades: Object.keys(readActiveTrades()).length,
     });
+  } finally {
+    monitorRunInProgress = false;
   }
 }
 

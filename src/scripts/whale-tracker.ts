@@ -8,6 +8,7 @@ import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { env } from "../config/env.js";
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
+import { createAsyncLimiter, withRpcRetry } from '../solana/rpc-guard.js';
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
@@ -23,6 +24,8 @@ const WHALE_SUBSCRIPTION_REFRESH_MS = 60 * 1000;
 const WHALE_SIGNAL_COOLDOWN_MS = 90 * 1000;
 const TRACKER_PRICE_CACHE_TTL_MS = 15_000;
 const TRACKER_PRICE_CONCURRENCY = 3;
+const TRACKER_RPC_CONCURRENCY = 2;
+const TRACKER_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -160,11 +163,14 @@ type WhaleActivityRecord = {
 
 const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
+const inFlightSignatures = new Set<string>();
 const recentWhaleSignals = new Map<string, number>();
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 let activePriceRequests = 0;
 const priceRequestWaiters: Array<() => void> = [];
+const limitTrackerRpc = createAsyncLimiter(TRACKER_RPC_CONCURRENCY);
+const inFlightParsedTransactions = new Map<string, Promise<Awaited<ReturnType<Connection['getParsedTransaction']>> | null>>();
 
 const getWhales = (): WhaleRecord[] => {
   try {
@@ -347,12 +353,44 @@ function pruneProcessedSignatures() {
 
 function markSignatureProcessed(signature: string): boolean {
   pruneProcessedSignatures();
-  if (processedSignatures.has(signature)) {
+  if (processedSignatures.has(signature) || inFlightSignatures.has(signature)) {
     return false;
   }
 
-  processedSignatures.set(signature, Date.now());
+  inFlightSignatures.add(signature);
   return true;
+}
+
+function finalizeSignatureProcessing(signature: string, wasHandled: boolean) {
+  inFlightSignatures.delete(signature);
+  if (wasHandled) {
+    processedSignatures.set(signature, Date.now());
+  }
+}
+
+async function getParsedTransactionQueued(signature: string): Promise<Awaited<ReturnType<Connection['getParsedTransaction']>> | null> {
+  const existing = inFlightParsedTransactions.get(signature);
+  if (existing) {
+    return existing;
+  }
+
+  const request = limitTrackerRpc(async () => withRpcRetry(
+    () => connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed',
+    }),
+    {
+      delaysMs: TRACKER_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[TRACKER] RPC-Limit fuer TX ${signature.slice(0,8)} erkannt. Retry ${attempt}/${TRACKER_RPC_RETRY_DELAYS_MS.length} in ${delayMs}ms.`);
+      },
+    },
+  )).finally(() => {
+    inFlightParsedTransactions.delete(signature);
+  });
+
+  inFlightParsedTransactions.set(signature, request);
+  return request;
 }
 
 function pruneRecentWhaleSignals() {
@@ -646,85 +684,88 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
     return;
   }
 
-  const tx = await connection.getParsedTransaction(signature, {
-    maxSupportedTransactionVersion: 0,
-    commitment: 'confirmed',
-  });
-
-  if (!tx) {
-    return;
-  }
-
+  let wasHandled = false;
   try {
-    if (fs.existsSync(ACTIVE_TRADES_PATH)) {
-      const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
-      const activeMints = Object.keys(activeTrades);
+    const tx = await getParsedTransactionQueued(signature);
+    if (!tx) {
+      return;
+    }
 
-      if (activeMints.length > 0) {
-        const tokenSold = tx.meta?.preTokenBalances?.find((pre) => {
-          if (pre.owner !== whale.address) return false;
-          if (!activeMints.includes(pre.mint)) return false;
+    wasHandled = true;
 
-          const post = tx.meta?.postTokenBalances?.find((p) => p.mint === pre.mint && p.owner === whale.address);
-          const preAmt = Number(pre.uiTokenAmount.uiAmount);
-          const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
-          return preAmt > postAmt && preAmt > 0;
-        });
+    try {
+      if (fs.existsSync(ACTIVE_TRADES_PATH)) {
+        const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
+        const activeMints = Object.keys(activeTrades);
 
-        if (tokenSold) {
-          if (!markWhaleSignalProcessed(whale.address, tokenSold.mint, 'sell')) {
-            console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${whale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
+        if (activeMints.length > 0) {
+          const tokenSold = tx.meta?.preTokenBalances?.find((pre) => {
+            if (pre.owner !== whale.address) return false;
+            if (!activeMints.includes(pre.mint)) return false;
+
+            const post = tx.meta?.postTokenBalances?.find((p) => p.mint === pre.mint && p.owner === whale.address);
+            const preAmt = Number(pre.uiTokenAmount.uiAmount);
+            const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
+            return preAmt > postAmt && preAmt > 0;
+          });
+
+          if (tokenSold) {
+            if (!markWhaleSignalProcessed(whale.address, tokenSold.mint, 'sell')) {
+              console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${whale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
+              return;
+            }
+
+            appendWhaleActivity({
+              whale: whale.address,
+              mint: tokenSold.mint,
+              side: 'sell',
+              detectedAt: new Date().toISOString(),
+              signature,
+              botMode: whale.mode,
+            });
+            await executePanicSell(whale, tokenSold.mint);
             return;
           }
-
-          appendWhaleActivity({
-            whale: whale.address,
-            mint: tokenSold.mint,
-            side: 'sell',
-            detectedAt: new Date().toISOString(),
-            signature,
-            botMode: whale.mode,
-          });
-          await executePanicSell(whale, tokenSold.mint);
-          return;
         }
       }
+    } catch (err) {
+      console.log(`Fehler beim Panik-Check fuer ${whale.address.slice(0,8)}.`);
     }
-  } catch (err) {
-    console.log(`Fehler beim Panik-Check fuer ${whale.address.slice(0,8)}.`);
+
+    const tokenChange = tx.meta?.postTokenBalances?.find((balance) =>
+      balance.owner === whale.address && balance.mint !== SOL_MINT,
+    );
+
+    if (!tokenChange) {
+      return;
+    }
+
+    const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === whale.address && balance.mint === tokenChange.mint);
+    const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
+    const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
+
+    if (postAmt <= preAmt) {
+      return;
+    }
+
+    if (!markWhaleSignalProcessed(whale.address, tokenChange.mint, 'buy')) {
+      console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${whale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
+      return;
+    }
+
+    console.log(`[TREFFER] Wal ${whale.address} hat Token gekauft: ${tokenChange.mint}`);
+    appendWhaleActivity({
+      whale: whale.address,
+      mint: tokenChange.mint,
+      side: 'buy',
+      detectedAt: new Date().toISOString(),
+      signature,
+      botMode: whale.mode,
+    });
+    await logDecision(whale, tokenChange.mint, tx, signature);
+  } finally {
+    finalizeSignatureProcessing(signature, wasHandled);
   }
-
-  const tokenChange = tx.meta?.postTokenBalances?.find((balance) =>
-    balance.owner === whale.address && balance.mint !== SOL_MINT,
-  );
-
-  if (!tokenChange) {
-    return;
-  }
-
-  const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === whale.address && balance.mint === tokenChange.mint);
-  const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
-  const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
-
-  if (postAmt <= preAmt) {
-    return;
-  }
-
-  if (!markWhaleSignalProcessed(whale.address, tokenChange.mint, 'buy')) {
-    console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${whale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
-    return;
-  }
-
-  console.log(`[TREFFER] Wal ${whale.address} hat Token gekauft: ${tokenChange.mint}`);
-  appendWhaleActivity({
-    whale: whale.address,
-    mint: tokenChange.mint,
-    side: 'buy',
-    detectedAt: new Date().toISOString(),
-    signature,
-    botMode: whale.mode,
-  });
-  await logDecision(whale, tokenChange.mint, tx, signature);
 }
 
 async function refreshWhaleSubscriptions() {
