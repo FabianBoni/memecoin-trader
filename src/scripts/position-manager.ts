@@ -2,6 +2,7 @@ import fs from 'fs';
 import { Connection, PublicKey } from "@solana/web3.js";
 import { sendTelegram } from "./telegram-notifier.js";
 import { logWhalePerformance } from "./performance-tracker.js";
+import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "26L5sdD2t88KZiQXSvQUtiY26XEM1DggdY5kv1wm8RNc";
@@ -12,15 +13,11 @@ const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
 
 function readActiveTrades(): Record<string, any> {
-  if (!fs.existsSync('./src/data/active-trades.json')) {
-    return {};
-  }
-
-  return JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+  return readJsonFileSync('./src/data/active-trades.json', {});
 }
 
 function writeActiveTrades(activeTrades: Record<string, any>) {
-  fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
+  writeJsonFileSync('./src/data/active-trades.json', activeTrades);
 }
 
 function markTradeExitState(mint: string, patch: Record<string, unknown> | null): boolean {
@@ -138,10 +135,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
     // 4. NEU: In Historie (Kassenbuch) eintragen
     try {
         const historyPath = './src/data/trade-history.json';
-        let history = [];
-        if (fs.existsSync(historyPath)) {
-            history = JSON.parse(fs.readFileSync(historyPath, 'utf-8'));
-        }
+        let history = readJsonFileSync<any[]>(historyPath, []);
         history.unshift({
             mint: mint,
             whale: whaleAddress || "Unknown",
@@ -157,7 +151,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         });
         // Maximal 50 Einträge behalten, damit das Dashboard schnell bleibt
         if (history.length > 50) history = history.slice(0, 50);
-        fs.writeFileSync(historyPath, JSON.stringify(history, null, 2));
+        writeJsonFileSync(historyPath, history);
     } catch (histErr) {
         console.error("Konnte Historie nicht speichern:", histErr);
     }
@@ -200,7 +194,7 @@ async function getCurrentPrice(mint: string): Promise<number | null> {
 async function monitorPositions() {
   try {
     if (!fs.existsSync('./src/data/active-trades.json')) return;
-    const activeTrades = JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+    const activeTrades = readActiveTrades();
     const mints = Object.keys(activeTrades);
 
     if (mints.length === 0) return;

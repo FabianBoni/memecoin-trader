@@ -1,12 +1,13 @@
 import fs from 'fs';
 import { sendTelegram } from "./telegram-notifier.js";
+import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 
 const PERF_FILE = './src/data/performance.json';
 const WHALE_FILE = './src/data/whales.json';
 
 export async function logWhalePerformance(whaleAddress: string, isWin: boolean) {
   try {
-    const data = JSON.parse(fs.readFileSync(PERF_FILE, 'utf-8'));
+    const data = readJsonFileSync<Record<string, boolean[]>>(PERF_FILE, {});
     
     if (!data[whaleAddress]) data[whaleAddress] = [];
     
@@ -21,17 +22,17 @@ export async function logWhalePerformance(whaleAddress: string, isWin: boolean) 
     
     if (data[whaleAddress].length === 3 && losses === 3) {
       // Wal eliminieren
-      const whales = JSON.parse(fs.readFileSync(WHALE_FILE, 'utf-8'));
+      const whales = readJsonFileSync<string[]>(WHALE_FILE, []);
       const newWhales = whales.filter((w: string) => w !== whaleAddress);
       
-      fs.writeFileSync(WHALE_FILE, JSON.stringify(newWhales));
+      writeJsonFileSync(WHALE_FILE, newWhales);
       delete data[whaleAddress]; // Performance-Daten zurücksetzen
       
       await sendTelegram(`🚫 <b>WAL ELIMINIERT</b>\nAdresse: <code>${whaleAddress.slice(0,8)}...</code>\nGrund: 3 Verluste in Folge. Liste bereinigt!`);
       console.log(`[CLEANUP] Wal ${whaleAddress} entfernt.`);
     }
 
-    fs.writeFileSync(PERF_FILE, JSON.stringify(data));
+    writeJsonFileSync(PERF_FILE, data);
   } catch (e) {
     console.error("Performance Tracker Error:", e);
   }

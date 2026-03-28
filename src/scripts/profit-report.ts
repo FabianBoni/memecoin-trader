@@ -1,16 +1,17 @@
 import fs from 'fs';
 import { sendTelegram } from "./telegram-notifier.js";
+import { readJsonFileSync } from "../storage/json-file-sync.js";
 
 async function sendReport() {
   try {
-    const perfData = JSON.parse(fs.readFileSync('./src/data/performance.json', 'utf-8'));
-    const activeTrades = JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
+    const perfData = readJsonFileSync<Record<string, boolean[]>>('./src/data/performance.json', {});
+    const activeTrades = readJsonFileSync<Record<string, unknown>>('./src/data/active-trades.json', {});
     
     let totalTrades = 0;
     let wins = 0;
     
     for (const whale in perfData) {
-      const history = perfData[whale];
+      const history = Array.isArray(perfData[whale]) ? perfData[whale] : [];
       totalTrades += history.length;
       wins += history.filter((v: boolean) => v === true).length;
     }
