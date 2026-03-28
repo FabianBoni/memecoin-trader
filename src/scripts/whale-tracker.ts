@@ -21,6 +21,8 @@ const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const WHALE_ACTIVITY_PATH = path.resolve(SCRIPT_DIR, '../data/whale-activity.json');
 const WHALE_SUBSCRIPTION_REFRESH_MS = 60 * 1000;
 const WHALE_SIGNAL_COOLDOWN_MS = 90 * 1000;
+const TRACKER_PRICE_CACHE_TTL_MS = 15_000;
+const TRACKER_PRICE_CONCURRENCY = 3;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -159,6 +161,10 @@ type WhaleActivityRecord = {
 const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
 const recentWhaleSignals = new Map<string, number>();
+const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null }>();
+const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
+let activePriceRequests = 0;
+const priceRequestWaiters: Array<() => void> = [];
 
 const getWhales = (): WhaleRecord[] => {
   try {
@@ -189,15 +195,49 @@ function appendWhaleActivity(entry: WhaleActivityRecord) {
   });
 }
 
-async function fetchSolUsdPrice(): Promise<number | null> {
-  try {
-    const res = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
-    const data = await res.json();
-    const price = Number(data?.data?.[SOL_MINT]?.price);
-    return Number.isFinite(price) && price > 0 ? price : null;
-  } catch {
-    return null;
+async function withPriceRequestSlot<T>(operation: () => Promise<T>): Promise<T> {
+  if (activePriceRequests >= TRACKER_PRICE_CONCURRENCY) {
+    await new Promise<void>((resolve) => {
+      priceRequestWaiters.push(resolve);
+    });
   }
+
+  activePriceRequests += 1;
+  try {
+    return await operation();
+  } finally {
+    activePriceRequests -= 1;
+    const next = priceRequestWaiters.shift();
+    if (next) {
+      next();
+    }
+  }
+}
+
+async function fetchSolUsdPrice(): Promise<number | null> {
+  if (solUsdPriceCache.fetchedAt > 0 && (Date.now() - solUsdPriceCache.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+    return solUsdPriceCache.price;
+  }
+
+  return withPriceRequestSlot(async () => {
+    if (solUsdPriceCache.fetchedAt > 0 && (Date.now() - solUsdPriceCache.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+      return solUsdPriceCache.price;
+    }
+
+    try {
+      const res = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
+      const data = await res.json();
+      const price = Number(data?.data?.[SOL_MINT]?.price);
+      const resolvedPrice = Number.isFinite(price) && price > 0 ? price : null;
+      solUsdPriceCache.fetchedAt = Date.now();
+      solUsdPriceCache.price = resolvedPrice;
+      return resolvedPrice;
+    } catch {
+      solUsdPriceCache.fetchedAt = Date.now();
+      solUsdPriceCache.price = null;
+      return null;
+    }
+  });
 }
 
 function getAccountKeyString(accountKey: unknown): string | undefined {
@@ -390,19 +430,30 @@ function getPositionSizeProfile(whaleWallet: string) {
 }
 
 async function fetchEntryPriceUsd(mint: string): Promise<number | null> {
-  try {
-    const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
-    const data = await res.json();
-    const price = Number(data?.data?.[mint]?.price);
-
-    if (Number.isFinite(price) && price > 0) {
-      return price;
-    }
-  } catch (error) {
-    console.error(`Konnte Einstiegspreis fuer ${mint.slice(0,6)} nicht laden:`, error);
+  const cached = tokenPriceCache.get(mint);
+  if (cached && (Date.now() - cached.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+    return cached.price;
   }
 
-  return null;
+  return withPriceRequestSlot(async () => {
+    const rechecked = tokenPriceCache.get(mint);
+    if (rechecked && (Date.now() - rechecked.fetchedAt) < TRACKER_PRICE_CACHE_TTL_MS) {
+      return rechecked.price;
+    }
+
+    try {
+      const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
+      const data = await res.json();
+      const price = Number(data?.data?.[mint]?.price);
+      const resolvedPrice = Number.isFinite(price) && price > 0 ? price : null;
+      tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: resolvedPrice });
+      return resolvedPrice;
+    } catch (error) {
+      console.error(`Konnte Einstiegspreis fuer ${mint.slice(0,6)} nicht laden:`, error);
+      tokenPriceCache.set(mint, { fetchedAt: Date.now(), price: null });
+      return null;
+    }
+  });
 }
 
 // --- KAUF LOGIK (Mit Kassenzettel-System!) ---
