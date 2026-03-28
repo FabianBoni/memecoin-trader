@@ -17,6 +17,7 @@ const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json'
 const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
 const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
+const WHALE_ACTIVITY_PATH = path.resolve(SCRIPT_DIR, '../data/whale-activity.json');
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -141,6 +142,15 @@ type PaperTradeRecord = {
   panicMarkedAt?: string;
 };
 
+type WhaleActivityRecord = {
+  whale: string;
+  mint: string;
+  side: 'buy' | 'sell';
+  detectedAt: string;
+  signature?: string;
+  botMode: 'paper' | 'live';
+};
+
 const getWhales = (): WhaleRecord[] => {
   try {
     return normalizeWhales(readJsonFileSync(WHALES_PATH, []));
@@ -155,6 +165,12 @@ function readPaperTrades(): Record<string, PaperTradeRecord> {
 
 function writePaperTrades(trades: Record<string, PaperTradeRecord>) {
   writeJsonFileSync(PAPER_TRADES_PATH, trades);
+}
+
+function appendWhaleActivity(entry: WhaleActivityRecord) {
+  const activity = readJsonFileSync<WhaleActivityRecord[]>(WHALE_ACTIVITY_PATH, []);
+  activity.unshift(entry);
+  writeJsonFileSync(WHALE_ACTIVITY_PATH, activity.slice(0, 100));
 }
 
 function logSizingConfiguration() {
@@ -427,6 +443,14 @@ async function start() {
             });
 
             if (tokenSold) {
+              appendWhaleActivity({
+                whale: foundWhale.address,
+                mint: tokenSold.mint,
+                side: 'sell',
+                detectedAt: new Date().toISOString(),
+                signature: logs.signature,
+                botMode: foundWhale.mode,
+              });
               await executePanicSell(foundWhale, tokenSold.mint);
               return; // Stop hier! Wir müssen nicht mehr prüfen, ob er gekauft hat.
             }
@@ -450,6 +474,14 @@ async function start() {
 
         if (postAmt > preAmt) {
           console.log(`[TREFFER] Wal ${foundWhale.address} hat Token gekauft: ${tokenChange.mint}`);
+          appendWhaleActivity({
+            whale: foundWhale.address,
+            mint: tokenChange.mint,
+            side: 'buy',
+            detectedAt: new Date().toISOString(),
+            signature: logs.signature,
+            botMode: foundWhale.mode,
+          });
           await logDecision(foundWhale, tokenChange.mint);
         }
       }

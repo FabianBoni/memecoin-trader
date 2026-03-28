@@ -2,8 +2,10 @@ import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import basicAuth from 'express-basic-auth';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { readJsonFileSync } from '../storage/json-file-sync.js';
 import { normalizeWhales } from '../storage/whales.js';
+import { getHeliusRpcUrl } from '../config/env.js';
 
 const app = express();
 
@@ -15,6 +17,22 @@ app.use(basicAuth({
 const PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(SCRIPT_DIR, '../data');
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const dashboardConnection = new Connection(getHeliusRpcUrl());
+
+type WhaleTokenDelta = {
+    mint: string;
+    delta: number;
+};
+
+type WhaleTransactionSummary = {
+    signature: string;
+    detectedAt: string;
+    success: boolean;
+    feeSol: number;
+    solDelta: number | null;
+    tokenDeltas: WhaleTokenDelta[];
+};
 
 function safeReadJSON(filename: string, defaultData: any) {
     try {
@@ -44,6 +62,11 @@ function formatPct(value: unknown): string {
     return `${parsed > 0 ? '+' : ''}${parsed.toFixed(2)}%`;
 }
 
+function formatSignedNumber(value: number, digits = 4): string {
+    if (!Number.isFinite(value)) return 'n/a';
+    return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`;
+}
+
 function formatDateTime(value: unknown): string {
     if (typeof value !== 'string' || value.trim().length === 0) return 'n/a';
     const parsed = Date.parse(value);
@@ -60,12 +83,261 @@ function escapeHtml(value: unknown): string {
         .replace(/'/g, '&#39;');
 }
 
+function whaleDetailsPath(address: string): string {
+    return `/whale/${encodeURIComponent(address)}`;
+}
+
+function renderWhaleLink(address: string, label?: string): string {
+    const safeLabel = escapeHtml(label ?? address);
+    return `<a href="${whaleDetailsPath(address)}" class="text-cyan-300 hover:text-cyan-200 underline decoration-cyan-500/30 underline-offset-2">${safeLabel}</a>`;
+}
+
+function shortenAddress(value: string, start = 8, end = 4): string {
+    return value.length <= start + end ? value : `${value.slice(0, start)}...${value.slice(-end)}`;
+}
+
+function getTokenBalanceMap(entries: any[] | undefined, owner: string): Map<string, number> {
+    const balances = new Map<string, number>();
+    for (const entry of entries ?? []) {
+        if (entry?.owner !== owner || typeof entry?.mint !== 'string') {
+            continue;
+        }
+
+        const amount = Number(entry?.uiTokenAmount?.uiAmount ?? 0);
+        balances.set(entry.mint, (balances.get(entry.mint) ?? 0) + (Number.isFinite(amount) ? amount : 0));
+    }
+
+    return balances;
+}
+
+function summarizeWhaleTransaction(parsedTx: any, whaleAddress: string, signature: string, blockTime: number | null | undefined): WhaleTransactionSummary {
+    const preTokenBalances = getTokenBalanceMap(parsedTx?.meta?.preTokenBalances, whaleAddress);
+    const postTokenBalances = getTokenBalanceMap(parsedTx?.meta?.postTokenBalances, whaleAddress);
+    const mints = new Set<string>([...preTokenBalances.keys(), ...postTokenBalances.keys()]);
+    const tokenDeltas = Array.from(mints)
+        .map((mint) => ({
+            mint,
+            delta: (postTokenBalances.get(mint) ?? 0) - (preTokenBalances.get(mint) ?? 0),
+        }))
+        .filter((entry) => Math.abs(entry.delta) > 0)
+        .sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+
+    const accountKeys = parsedTx?.transaction?.message?.accountKeys ?? [];
+    const walletIndex = accountKeys.findIndex((accountKey: any) => {
+        if (typeof accountKey === 'string') {
+            return accountKey === whaleAddress;
+        }
+
+        if (typeof accountKey?.pubkey === 'string') {
+            return accountKey.pubkey === whaleAddress;
+        }
+
+        if (typeof accountKey?.pubkey?.toBase58 === 'function') {
+            return accountKey.pubkey.toBase58() === whaleAddress;
+        }
+
+        return false;
+    });
+
+    const preBalance = walletIndex >= 0 ? parsedTx?.meta?.preBalances?.[walletIndex] : undefined;
+    const postBalance = walletIndex >= 0 ? parsedTx?.meta?.postBalances?.[walletIndex] : undefined;
+    const solDelta = preBalance !== undefined && postBalance !== undefined
+        ? (postBalance - preBalance) / 1_000_000_000
+        : null;
+
+    return {
+        signature,
+        detectedAt: blockTime ? new Date(blockTime * 1000).toISOString() : new Date().toISOString(),
+        success: !parsedTx?.meta?.err,
+        feeSol: Number(parsedTx?.meta?.fee ?? 0) / 1_000_000_000,
+        solDelta,
+        tokenDeltas,
+    };
+}
+
+async function fetchRecentWhaleTransactions(whaleAddress: string): Promise<WhaleTransactionSummary[]> {
+    const whalePubkey = new PublicKey(whaleAddress);
+    const cutoffUnix = Math.floor((Date.now() - (12 * 60 * 60 * 1000)) / 1000);
+    const signatures: Array<{ signature: string; blockTime: number | null }> = [];
+    let before: string | undefined;
+
+    for (let page = 0; page < 4; page += 1) {
+        const batch = await dashboardConnection.getSignaturesForAddress(whalePubkey, {
+            limit: 25,
+            ...(before ? { before } : {}),
+        });
+
+        if (batch.length === 0) {
+            break;
+        }
+
+        let reachedOlderEntries = false;
+        for (const entry of batch) {
+            if (entry.blockTime && entry.blockTime < cutoffUnix) {
+                reachedOlderEntries = true;
+                break;
+            }
+
+            signatures.push({ signature: entry.signature, blockTime: entry.blockTime ?? null });
+        }
+
+        if (reachedOlderEntries) {
+            break;
+        }
+
+        before = batch[batch.length - 1]?.signature;
+    }
+
+    const parsedTransactions = await Promise.all(
+        signatures.map((entry) => dashboardConnection.getParsedTransaction(entry.signature, {
+            maxSupportedTransactionVersion: 0,
+            commitment: 'confirmed',
+        }).then((parsedTx) => parsedTx ? summarizeWhaleTransaction(parsedTx, whaleAddress, entry.signature, entry.blockTime) : null)),
+    );
+
+    return parsedTransactions.filter((entry): entry is WhaleTransactionSummary => entry !== null);
+}
+
+app.get('/whale/:address', async (req, res) => {
+    const whaleAddress = String(req.params.address ?? '').trim();
+    const whales = normalizeWhales(safeReadJSON('whales.json', []));
+    const whale = whales.find((entry) => entry.address === whaleAddress);
+    const performance = safeReadJSON('performance.json', {});
+    const paperPerformance = safeReadJSON('paper-performance.json', {});
+    const activity = Array.isArray(safeReadJSON('whale-activity.json', []))
+        ? safeReadJSON('whale-activity.json', []).filter((entry: any) => entry?.whale === whaleAddress).slice(0, 20)
+        : [];
+
+    if (!whaleAddress) {
+        res.status(400).send('Whale address missing');
+        return;
+    }
+
+    try {
+        const txRows = await fetchRecentWhaleTransactions(whaleAddress);
+        const liveHistory = Array.isArray(performance[whaleAddress]) ? performance[whaleAddress] : [];
+        const paperHistory = Array.isArray(paperPerformance[whaleAddress]) ? paperPerformance[whaleAddress] : [];
+
+        const txTable = txRows.length === 0
+            ? '<p class="text-slate-500 text-center py-8 italic">Keine Transaktionen in den letzten 12 Stunden gefunden.</p>'
+            : `
+            <div class="overflow-x-auto custom-scrollbar">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-700/50">
+                            <th class="pb-3 pl-2">Zeit</th>
+                            <th class="pb-3">Status</th>
+                            <th class="pb-3">SOL Δ</th>
+                            <th class="pb-3">Fee</th>
+                            <th class="pb-3">Token Changes</th>
+                            <th class="pb-3">Tx</th>
+                        </tr>
+                    </thead>
+                    <tbody>${txRows.map((tx) => {
+                        const tokenChanges = tx.tokenDeltas.length > 0
+                            ? tx.tokenDeltas.slice(0, 4).map((entry) => {
+                                const badgeColor = entry.delta > 0 ? 'text-emerald-300 bg-emerald-500/10' : 'text-red-300 bg-red-500/10';
+                                return `<span class="${badgeColor} px-2 py-1 rounded mr-2 inline-block mb-1">${formatSignedNumber(entry.delta, 2)} ${escapeHtml(shortenAddress(entry.mint, 6, 4))}</span>`;
+                            }).join('')
+                            : '<span class="text-slate-500">keine Token-Änderung</span>';
+                        const statusBadge = tx.success
+                            ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">ok</span>'
+                            : '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">failed</span>';
+                        const solDelta = tx.solDelta === null ? 'n/a' : `${formatSignedNumber(tx.solDelta)} SOL`;
+                        return `
+                        <tr class="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors align-top">
+                            <td class="py-3 pl-2 text-xs text-slate-400">${formatDateTime(tx.detectedAt)}</td>
+                            <td class="py-3 text-xs">${statusBadge}</td>
+                            <td class="py-3 text-xs text-slate-300">${solDelta}</td>
+                            <td class="py-3 text-xs text-slate-400">${tx.feeSol.toFixed(6)} SOL</td>
+                            <td class="py-3 text-xs text-slate-300">${tokenChanges}</td>
+                            <td class="py-3 text-xs text-slate-400"><a href="https://solscan.io/tx/${tx.signature}" target="_blank">${escapeHtml(shortenAddress(tx.signature, 8, 4))}</a></td>
+                        </tr>`;
+                    }).join('')}</tbody>
+                </table>
+            </div>`;
+
+        const activityHtml = activity.length === 0
+            ? '<p class="text-slate-500 text-center py-6 italic">Keine lokal erkannten Bot-Events für diesen Wal.</p>'
+            : activity.map((entry: any) => {
+                const sideBadge = entry?.side === 'buy'
+                    ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">buy</span>'
+                    : '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">sell</span>';
+                return `
+                <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
+                    <div>
+                        <div class="font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${entry.mint}" target="_blank">${escapeHtml(shortenAddress(entry.mint, 8, 4))}</a></div>
+                        <div class="text-[11px] text-slate-500">${formatDateTime(entry.detectedAt)}</div>
+                    </div>
+                    <div class="text-right">
+                        <div class="mb-1 text-xs">${sideBadge}</div>
+                        <div class="text-[11px] text-slate-500">${escapeHtml(entry.botMode ?? 'unknown')}</div>
+                    </div>
+                </div>`;
+            }).join('');
+
+        const html = `
+        <!DOCTYPE html>
+        <html lang="de">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Wal-Details</title>
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+                body { background: linear-gradient(135deg, #0f172a 0%, #020617 100%); color: #f8fafc; font-family: 'Inter', sans-serif; min-height: 100vh; }
+                .glass-card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 16px; padding: 24px; box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5); }
+                .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+                .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+                .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+            </style>
+        </head>
+        <body class="p-4 md:p-8 max-w-7xl mx-auto">
+            <div class="flex justify-between items-center mb-8 gap-4 flex-wrap">
+                <div>
+                    <a href="/" class="text-cyan-300 hover:text-cyan-200 text-sm underline underline-offset-4">← Zurück zum Dashboard</a>
+                    <h1 class="text-3xl font-extrabold mt-3">Wal-Detailansicht</h1>
+                    <p class="text-slate-400 font-mono mt-2">${escapeHtml(whaleAddress)}</p>
+                </div>
+                <div class="text-right">
+                    <div class="text-xs text-slate-500 uppercase tracking-wider">Modus</div>
+                    <div class="text-lg font-bold ${whale?.mode === 'paper' ? 'text-amber-300' : 'text-emerald-300'}">${escapeHtml(whale?.mode ?? 'untracked')}</div>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                <div class="glass-card border-t-4 border-t-cyan-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">12h TX</h2><p class="text-3xl font-black">${txRows.length}</p></div>
+                <div class="glass-card border-t-4 border-t-emerald-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Live Score</h2><p class="text-3xl font-black text-emerald-400">${Array.isArray(liveHistory) ? liveHistory.filter(Boolean).length : 0}/${Array.isArray(liveHistory) ? liveHistory.length : 0}</p></div>
+                <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Score</h2><p class="text-3xl font-black text-amber-300">${Array.isArray(paperHistory) ? paperHistory.filter(Boolean).length : 0}/${Array.isArray(paperHistory) ? paperHistory.length : 0}</p></div>
+                <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Entdeckt</h2><p class="text-sm font-bold text-slate-200 mt-2">${formatDateTime(whale?.discoveredAt)}</p></div>
+            </div>
+
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
+                <div class="glass-card lg:col-span-2">
+                    <h2 class="text-xl font-bold mb-6">Transaktionen der letzten 12 Stunden</h2>
+                    ${txTable}
+                </div>
+                <div class="glass-card">
+                    <h2 class="text-xl font-bold mb-6">Bot-Erkennung für diesen Wal</h2>
+                    <div class="max-h-[560px] overflow-y-auto custom-scrollbar pr-2">${activityHtml}</div>
+                </div>
+            </div>
+        </body>
+        </html>`;
+
+        res.send(html);
+    } catch (error: any) {
+        res.status(500).send(`Konnte Wal-Details nicht laden: ${escapeHtml(error?.message ?? 'unknown error')}`);
+    }
+});
+
 app.get('/', (req, res) => {
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
     const activeTrades = safeReadJSON('active-trades.json', {});
     const paperTrades = safeReadJSON('paper-trades.json', {});
     const performance = safeReadJSON('performance.json', {});
     const paperPerformance = safeReadJSON('paper-performance.json', {});
+    const whaleActivity = safeReadJSON('whale-activity.json', []);
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
     const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
     const liveWhales = whales.length - paperWhales;
@@ -142,7 +414,7 @@ app.get('/', (req, res) => {
             return `
             <tr class="border-b border-slate-800/50 hover:bg-slate-800/30">
                 <td class="py-3 pl-2 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${mint}" target="_blank">${mint.slice(0, 8)}...${mint.slice(-4)}</a></td>
-                <td class="py-3 font-mono text-xs text-slate-400">${whaleStr.slice(0,6)}...</td>
+                <td class="py-3 font-mono text-xs text-slate-400">${renderWhaleLink(whaleStr, `${whaleStr.slice(0,6)}...`)}</td>
                 <td class="py-3 text-xs text-slate-300">${entryPrice}</td>
                 <td class="py-3 text-xs text-slate-400">${escapeHtml(entrySource)}</td>
                 <td class="py-3 text-xs text-slate-300">${positionSol}</td>
@@ -207,7 +479,7 @@ app.get('/', (req, res) => {
         whaleStatsHTML = whaleStats.map(stat => `
             <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
                 <div>
-                    <div class="font-mono text-sm text-slate-300">${stat.address.slice(0,8)}...</div>
+                    <div class="font-mono text-sm text-slate-300">${renderWhaleLink(stat.address, `${stat.address.slice(0,8)}...`)}</div>
                     <div class="text-[11px] text-slate-500">Streak: ${stat.streak || 'n/a'} · Trades: ${stat.total}</div>
                 </div>
                 <div class="flex space-x-3 text-xs font-bold">
@@ -228,7 +500,7 @@ app.get('/', (req, res) => {
             return `
             <div class="flex justify-between items-center py-3 border-b border-slate-800/50">
                 <div>
-                    <div class="font-mono text-sm text-slate-300">${escapeHtml(stat.address.slice(0,8))}...</div>
+                    <div class="font-mono text-sm text-slate-300">${renderWhaleLink(stat.address, `${stat.address.slice(0,8)}...`)}</div>
                     <div class="text-[11px] text-slate-500">Discovery: ${formatDateTime(stat.discoveredAt)} · Streak: ${stat.streak || 'n/a'}</div>
                 </div>
                 <div class="text-right">
@@ -238,6 +510,49 @@ app.get('/', (req, res) => {
                 </div>
             </div>`;
         }).join('');
+    }
+
+    let whaleActivityHTML = '<p class="text-slate-500 text-center py-8 italic">Noch keine erkannten Wal-Trades.</p>';
+    if (Array.isArray(whaleActivity) && whaleActivity.length > 0) {
+        const rows = whaleActivity.slice(0, 20).map((entry: any) => {
+            const isBuy = entry?.side === 'buy';
+            const sideBadge = isBuy
+                ? '<span class="text-emerald-300 bg-emerald-500/10 px-2 py-1 rounded">buy</span>'
+                : '<span class="text-red-300 bg-red-500/10 px-2 py-1 rounded">sell</span>';
+            const modeBadge = entry?.botMode === 'paper'
+                ? '<span class="text-amber-300 bg-amber-500/10 px-2 py-1 rounded">paper</span>'
+                : '<span class="text-sky-300 bg-sky-500/10 px-2 py-1 rounded">live</span>';
+            const mint = typeof entry?.mint === 'string' ? entry.mint : 'Unknown';
+            const whale = typeof entry?.whale === 'string' ? entry.whale : 'Unknown';
+            const signature = typeof entry?.signature === 'string' ? entry.signature : null;
+
+            return `
+            <tr class="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                <td class="py-3 pl-2 text-xs text-slate-400">${formatDateTime(entry?.detectedAt)}</td>
+                <td class="py-3 font-mono text-sm text-slate-300">${renderWhaleLink(whale, `${whale.slice(0,8)}...`)}</td>
+                <td class="py-3 font-mono text-sm text-cyan-300"><a href="https://solscan.io/token/${mint}" target="_blank">${escapeHtml(mint.slice(0, 8))}...${escapeHtml(mint.slice(-4))}</a></td>
+                <td class="py-3 text-xs">${sideBadge}</td>
+                <td class="py-3 text-xs">${modeBadge}</td>
+                <td class="py-3 text-xs text-slate-400">${signature ? `<a href="https://solscan.io/tx/${signature}" target="_blank">${escapeHtml(signature.slice(0,8))}...</a>` : 'n/a'}</td>
+            </tr>`;
+        }).join('');
+
+        whaleActivityHTML = `
+        <div class="overflow-x-auto max-h-[320px] custom-scrollbar">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="text-slate-400 text-xs uppercase tracking-wider border-b border-slate-700/50">
+                        <th class="pb-3 pl-2">Zeit</th>
+                        <th class="pb-3">Wal</th>
+                        <th class="pb-3">Token</th>
+                        <th class="pb-3">Side</th>
+                        <th class="pb-3">Bot-Modus</th>
+                        <th class="pb-3">Tx</th>
+                    </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+            </table>
+        </div>`;
     }
 
     // NEU: Trade Historie generieren
@@ -323,6 +638,13 @@ app.get('/', (req, res) => {
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-amber-500/20 p-2 rounded-lg mr-3 text-amber-300">🧪</span> Paper Trades</h2><div class="overflow-x-auto">${paperTradesHTML}</div></div>
             <div class="glass-card"><h2 class="text-xl font-bold mb-4 flex items-center"><span class="bg-cyan-500/20 p-2 rounded-lg mr-3 text-cyan-300">🛰️</span> Quarantäne-Wale</h2><div class="max-h-[300px] overflow-y-auto custom-scrollbar pr-2">${paperWhalesHTML}</div></div>
+        </div>
+
+        <div class="glass-card mb-8">
+            <h2 class="text-xl font-bold mb-6 flex items-center">
+                <span class="bg-rose-500/20 p-2 rounded-lg mr-3 text-rose-300">📡</span> Letzte Wal-Trades
+            </h2>
+            ${whaleActivityHTML}
         </div>
 
         <div class="glass-card">
