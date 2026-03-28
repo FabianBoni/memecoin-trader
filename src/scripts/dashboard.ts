@@ -17,8 +17,13 @@ app.use(basicAuth({
 const PORT = 3000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(SCRIPT_DIR, '../data');
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const dashboardConnection = new Connection(getHeliusRpcUrl());
+const WHALE_DETAIL_CACHE_MS = 60 * 1000;
+const WHALE_DETAIL_PAGE_LIMIT = 3;
+const WHALE_DETAIL_SIGNATURES_PER_PAGE = 15;
+const WHALE_DETAIL_PARSE_BATCH_SIZE = 5;
+
+const whaleTransactionCache = new Map<string, { fetchedAt: number; data: WhaleTransactionSummary[] }>();
 
 type WhaleTokenDelta = {
     mint: string;
@@ -156,14 +161,19 @@ function summarizeWhaleTransaction(parsedTx: any, whaleAddress: string, signatur
 }
 
 async function fetchRecentWhaleTransactions(whaleAddress: string): Promise<WhaleTransactionSummary[]> {
+    const cached = whaleTransactionCache.get(whaleAddress);
+    if (cached && (Date.now() - cached.fetchedAt) < WHALE_DETAIL_CACHE_MS) {
+        return cached.data;
+    }
+
     const whalePubkey = new PublicKey(whaleAddress);
     const cutoffUnix = Math.floor((Date.now() - (12 * 60 * 60 * 1000)) / 1000);
     const signatures: Array<{ signature: string; blockTime: number | null }> = [];
     let before: string | undefined;
 
-    for (let page = 0; page < 4; page += 1) {
+    for (let page = 0; page < WHALE_DETAIL_PAGE_LIMIT; page += 1) {
         const batch = await dashboardConnection.getSignaturesForAddress(whalePubkey, {
-            limit: 25,
+            limit: WHALE_DETAIL_SIGNATURES_PER_PAGE,
             ...(before ? { before } : {}),
         });
 
@@ -188,14 +198,21 @@ async function fetchRecentWhaleTransactions(whaleAddress: string): Promise<Whale
         before = batch[batch.length - 1]?.signature;
     }
 
-    const parsedTransactions = await Promise.all(
-        signatures.map((entry) => dashboardConnection.getParsedTransaction(entry.signature, {
-            maxSupportedTransactionVersion: 0,
-            commitment: 'confirmed',
-        }).then((parsedTx) => parsedTx ? summarizeWhaleTransaction(parsedTx, whaleAddress, entry.signature, entry.blockTime) : null)),
-    );
+    const parsedTransactions: WhaleTransactionSummary[] = [];
+    for (let index = 0; index < signatures.length; index += WHALE_DETAIL_PARSE_BATCH_SIZE) {
+        const chunk = signatures.slice(index, index + WHALE_DETAIL_PARSE_BATCH_SIZE);
+        const chunkResults = await Promise.all(
+            chunk.map((entry) => dashboardConnection.getParsedTransaction(entry.signature, {
+                maxSupportedTransactionVersion: 0,
+                commitment: 'confirmed',
+            }).then((parsedTx) => parsedTx ? summarizeWhaleTransaction(parsedTx, whaleAddress, entry.signature, entry.blockTime) : null)),
+        );
 
-    return parsedTransactions.filter((entry): entry is WhaleTransactionSummary => entry !== null);
+        parsedTransactions.push(...chunkResults.filter((entry): entry is WhaleTransactionSummary => entry !== null));
+    }
+
+    whaleTransactionCache.set(whaleAddress, { fetchedAt: Date.now(), data: parsedTransactions });
+    return parsedTransactions;
 }
 
 app.get('/whale/:address', async (req, res) => {

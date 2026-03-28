@@ -18,6 +18,7 @@ const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
 const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const WHALE_ACTIVITY_PATH = path.resolve(SCRIPT_DIR, '../data/whale-activity.json');
+const WHALE_SUBSCRIPTION_REFRESH_MS = 60 * 1000;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
@@ -151,6 +152,9 @@ type WhaleActivityRecord = {
   botMode: 'paper' | 'live';
 };
 
+const whaleLogSubscriptions = new Map<string, number>();
+const processedSignatures = new Map<string, number>();
+
 const getWhales = (): WhaleRecord[] => {
   try {
     return normalizeWhales(readJsonFileSync(WHALES_PATH, []));
@@ -171,6 +175,25 @@ function appendWhaleActivity(entry: WhaleActivityRecord) {
   const activity = readJsonFileSync<WhaleActivityRecord[]>(WHALE_ACTIVITY_PATH, []);
   activity.unshift(entry);
   writeJsonFileSync(WHALE_ACTIVITY_PATH, activity.slice(0, 100));
+}
+
+function pruneProcessedSignatures() {
+  const cutoff = Date.now() - (6 * 60 * 60 * 1000);
+  for (const [signature, seenAt] of processedSignatures.entries()) {
+    if (seenAt < cutoff) {
+      processedSignatures.delete(signature);
+    }
+  }
+}
+
+function markSignatureProcessed(signature: string): boolean {
+  pruneProcessedSignatures();
+  if (processedSignatures.has(signature)) {
+    return false;
+  }
+
+  processedSignatures.set(signature, Date.now());
+  return true;
 }
 
 function logSizingConfiguration() {
@@ -406,87 +429,124 @@ async function executePanicSell(whale: WhaleRecord, mint: string) {
   }
 }
 
+async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
+  if (!markSignatureProcessed(signature)) {
+    return;
+  }
+
+  const tx = await connection.getParsedTransaction(signature, {
+    maxSupportedTransactionVersion: 0,
+    commitment: 'confirmed',
+  });
+
+  if (!tx) {
+    return;
+  }
+
+  try {
+    if (fs.existsSync(ACTIVE_TRADES_PATH)) {
+      const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
+      const activeMints = Object.keys(activeTrades);
+
+      if (activeMints.length > 0) {
+        const tokenSold = tx.meta?.preTokenBalances?.find((pre) => {
+          if (pre.owner !== whale.address) return false;
+          if (!activeMints.includes(pre.mint)) return false;
+
+          const post = tx.meta?.postTokenBalances?.find((p) => p.mint === pre.mint && p.owner === whale.address);
+          const preAmt = Number(pre.uiTokenAmount.uiAmount);
+          const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
+          return preAmt > postAmt && preAmt > 0;
+        });
+
+        if (tokenSold) {
+          appendWhaleActivity({
+            whale: whale.address,
+            mint: tokenSold.mint,
+            side: 'sell',
+            detectedAt: new Date().toISOString(),
+            signature,
+            botMode: whale.mode,
+          });
+          await executePanicSell(whale, tokenSold.mint);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`Fehler beim Panik-Check fuer ${whale.address.slice(0,8)}.`);
+  }
+
+  const tokenChange = tx.meta?.postTokenBalances?.find((balance) =>
+    balance.owner === whale.address && balance.mint !== SOL_MINT,
+  );
+
+  if (!tokenChange) {
+    return;
+  }
+
+  const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === whale.address && balance.mint === tokenChange.mint);
+  const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
+  const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
+
+  if (postAmt <= preAmt) {
+    return;
+  }
+
+  console.log(`[TREFFER] Wal ${whale.address} hat Token gekauft: ${tokenChange.mint}`);
+  appendWhaleActivity({
+    whale: whale.address,
+    mint: tokenChange.mint,
+    side: 'buy',
+    detectedAt: new Date().toISOString(),
+    signature,
+    botMode: whale.mode,
+  });
+  await logDecision(whale, tokenChange.mint);
+}
+
+async function refreshWhaleSubscriptions() {
+  const whales = getWhales();
+  const trackedAddresses = new Set(whales.map((whale) => whale.address));
+
+  for (const [address, subscriptionId] of whaleLogSubscriptions.entries()) {
+    if (trackedAddresses.has(address)) {
+      continue;
+    }
+
+    await connection.removeOnLogsListener(subscriptionId);
+    whaleLogSubscriptions.delete(address);
+    console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt.`);
+  }
+
+  for (const whale of whales) {
+    if (whaleLogSubscriptions.has(whale.address)) {
+      continue;
+    }
+
+    const subscriptionId = connection.onLogs(new PublicKey(whale.address), async (logs) => {
+      try {
+        await processTrackedWhaleLog(whale, logs.signature);
+      } catch (error) {
+        console.error(`[TRACKER] Verarbeitung fuer ${whale.address.slice(0,8)} fehlgeschlagen:`, error);
+      }
+    }, 'confirmed');
+
+    whaleLogSubscriptions.set(whale.address, subscriptionId);
+    console.log(`[TRACKER] Subscription aktiv fuer ${whale.address.slice(0,8)} (${whale.mode}).`);
+  }
+}
+
 // --- HAUPTSCHLEIFE ---
 async function start() {
   console.log("🏹 Jäger-Bot ONLINE (Präzisions-Modus inkl. Panik-Schild & Kassenzettel)");
   logSizingConfiguration();
-
-  connection.onLogs("all", async (logs) => {
-    const whales = getWhales();
-    const foundWhale = whales.find((whale) => logs.logs.some((line) => line.includes(whale.address)));
-
-    if (foundWhale) {
-      const tx = await connection.getParsedTransaction(logs.signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed"
-      });
-
-      if (!tx) return;
-
-      // --- 1. PRÜFE AUF WAL-VERKAUF (PANIK) ---
-      try {
-        if (fs.existsSync(ACTIVE_TRADES_PATH)) {
-          const activeTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
-          const activeMints = Object.keys(activeTrades);
-
-          if (activeMints.length > 0) {
-            const tokenSold = tx.meta?.preTokenBalances?.find(pre => {
-              if(pre.owner !== foundWhale.address) return false;
-              if(!activeMints.includes(pre.mint)) return false; // Token gehört zu unseren!
-
-              const post = tx.meta?.postTokenBalances?.find(p => p.mint === pre.mint && p.owner === foundWhale.address);
-              const preAmt = Number(pre.uiTokenAmount.uiAmount);
-              const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
-
-              // Wenn Balance gesunken ist, hat er verkauft!
-              return preAmt > postAmt && preAmt > 0;
-            });
-
-            if (tokenSold) {
-              appendWhaleActivity({
-                whale: foundWhale.address,
-                mint: tokenSold.mint,
-                side: 'sell',
-                detectedAt: new Date().toISOString(),
-                signature: logs.signature,
-                botMode: foundWhale.mode,
-              });
-              await executePanicSell(foundWhale, tokenSold.mint);
-              return; // Stop hier! Wir müssen nicht mehr prüfen, ob er gekauft hat.
-            }
-          }
-        }
-      } catch (err) {
-        console.log("Fehler beim Panik-Check.");
-      }
-
-      // --- 2. PRÜFE AUF WAL-KAUF ---
-      const tokenChange = tx.meta?.postTokenBalances?.find(b =>
-        b.owner === foundWhale.address &&
-        b.mint !== "So11111111111111111111111111111111111111112"
-      );
-
-      if (tokenChange) {
-        // Wir prüfen zusätzlich, ob die Balance VORHER niedriger war (also ein echter Kauf)
-        const preBalance = tx.meta?.preTokenBalances?.find(b => b.owner === foundWhale.address && b.mint === tokenChange.mint);
-        const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
-        const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
-
-        if (postAmt > preAmt) {
-          console.log(`[TREFFER] Wal ${foundWhale.address} hat Token gekauft: ${tokenChange.mint}`);
-          appendWhaleActivity({
-            whale: foundWhale.address,
-            mint: tokenChange.mint,
-            side: 'buy',
-            detectedAt: new Date().toISOString(),
-            signature: logs.signature,
-            botMode: foundWhale.mode,
-          });
-          await logDecision(foundWhale, tokenChange.mint);
-        }
-      }
-    }
-  }, "confirmed");
+  await refreshWhaleSubscriptions();
+  setInterval(() => {
+    refreshWhaleSubscriptions().catch((error) => {
+      console.error('[TRACKER] Subscription-Refresh fehlgeschlagen:', error);
+    });
+  }, WHALE_SUBSCRIPTION_REFRESH_MS);
 }
 
 start().catch(console.error);
