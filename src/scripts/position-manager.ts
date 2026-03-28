@@ -17,6 +17,8 @@ const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json'
 
 const highWaterMarks = new Map<string, number>();
 const missingEntryWarnings = new Set<string>();
+const SELL_RETRY_ATTEMPTS = 3;
+const SELL_RETRY_DELAY_MS = 2_500;
 
 function readActiveTrades(): Record<string, any> {
   return readJsonFileSync(ACTIVE_TRADES_PATH, {});
@@ -52,6 +54,46 @@ function markTradeExitState(mint: string, patch: Record<string, unknown> | null)
 function toFiniteNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function executeSellWithRetry(params: {
+  mint: string;
+  rawAmount: string;
+}) {
+  const { executeJupiter } = await import("./execute-trade.js");
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= SELL_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      if (attempt > 1) {
+        console.warn(`[SELL] Retry ${attempt}/${SELL_RETRY_ATTEMPTS} fuer ${params.mint.slice(0,6)} gestartet.`);
+      }
+
+      return await executeJupiter({
+        planId: `SELL-${params.mint.slice(0,4)}-A${attempt}`,
+        tokenAddress: params.mint,
+        executionMode: "jupiter",
+        inputMint: params.mint,
+        outputMint: "So11111111111111111111111111111111111111112",
+        amount: params.rawAmount,
+        maxSlippageBps: 500,
+        dryRun: false
+      } as any);
+    } catch (error) {
+      lastError = error;
+      console.error(`[SELL] Versuch ${attempt}/${SELL_RETRY_ATTEMPTS} fuer ${params.mint.slice(0,6)} fehlgeschlagen:`, error);
+
+      if (attempt < SELL_RETRY_ATTEMPTS) {
+        await sleep(SELL_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Sell execution failed after retries.");
 }
 
 function getTrackedWalletAddress(): string {
@@ -142,17 +184,10 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
     });
 
     // 1. Verkauf ausführen
-    const { executeJupiter } = await import("./execute-trade.js");
-    const executionReceipt = await executeJupiter({
-      planId: `SELL-${mint.slice(0,4)}`,
-      tokenAddress: mint,
-      executionMode: "jupiter",
-      inputMint: mint,
-      outputMint: "So11111111111111111111111111111111111111112",
-      amount: rawAmount,
-      maxSlippageBps: 500,
-      dryRun: false
-    } as any);
+    const executionReceipt = await executeSellWithRetry({
+      mint,
+      rawAmount,
+    });
 
     realizedExitPriceUsd = toFiniteNumber(executionReceipt?.fillPriceUsd);
     realizedExitPriceSol = toFiniteNumber(executionReceipt?.fillPriceSol);

@@ -27,6 +27,17 @@ function formatSolAmount(value: unknown): string {
   return parsed >= 0.1 ? parsed.toFixed(3) : parsed.toFixed(4);
 }
 
+function shouldSuppressBuyFailureTelegram(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes('transactionexpiredblockheightexceedederror')
+    || message.includes('block height exceeded')
+    || message.includes('signature has expired');
+}
+
 const getWhales = (): string[] => {
   try {
     return readJsonFileSync(WHALES_PATH, []);
@@ -156,6 +167,13 @@ async function logDecision(whaleWallet: string, mint: string) {
     });
 
   } catch (e: any) {
+    console.error(`❌ [BUY] Kauf fuer ${mint.slice(0,6)} fehlgeschlagen:`, e);
+
+    if (shouldSuppressBuyFailureTelegram(e)) {
+      console.warn(`[BUY] Telegram-Alarm fuer temporaeren Confirm/Broadcast-Fehler unterdrueckt: ${e.message}`);
+      return;
+    }
+
     await sendTelegram(`❌ <b>KAUF FEHLGESCHLAGEN</b>\nFehler: ${e.message}`, {
       dedupeKey: `buy-failed:${mint}:${e.message}`,
       cooldownMs: 300_000,
