@@ -1,11 +1,16 @@
-import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync } from "../storage/json-file-sync.js";
 
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
+const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
+
 async function sendReport() {
   try {
-    const perfData = readJsonFileSync<Record<string, boolean[]>>('./src/data/performance.json', {});
-    const activeTrades = readJsonFileSync<Record<string, unknown>>('./src/data/active-trades.json', {});
+    const perfData = readJsonFileSync<Record<string, boolean[]>>(PERFORMANCE_PATH, {});
+    const activeTrades = readJsonFileSync<Record<string, unknown>>(ACTIVE_TRADES_PATH, {});
     
     let totalTrades = 0;
     let wins = 0;

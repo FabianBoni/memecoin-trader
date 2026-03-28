@@ -1,9 +1,11 @@
-import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 
-const PERF_FILE = './src/data/performance.json';
-const WHALE_FILE = './src/data/whales.json';
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PERF_FILE = path.resolve(SCRIPT_DIR, '../data/performance.json');
+const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 
 export async function logWhalePerformance(whaleAddress: string, isWin: boolean) {
   try {

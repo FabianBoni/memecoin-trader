@@ -10,16 +10,26 @@ import { loadExecutionWallet } from "../wallet.js";
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
 const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
-const PERFORMANCE_PATH = './src/data/performance.json';
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
+const PERFORMANCE_PATH = path.resolve(SCRIPT_DIR, '../data/performance.json');
+const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || loadExecutionWallet().publicKey.toBase58();
 
+function formatSolAmount(value: unknown): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 'n/a';
+  }
+
+  return parsed >= 0.1 ? parsed.toFixed(3) : parsed.toFixed(4);
+}
+
 const getWhales = (): string[] => {
   try {
-    return readJsonFileSync('./src/data/whales.json', []);
+    return readJsonFileSync(WHALES_PATH, []);
   } catch (e) {
     return [];
   }
@@ -87,12 +97,6 @@ async function logDecision(whaleWallet: string, mint: string) {
     ? `${positionProfile.sampleSize} Trades (Testphase)`
     : `${positionProfile.winRate.toFixed(0)}% aus ${positionProfile.sampleSize} Trades`;
 
-  await sendTelegram(`🚀 <b>WAL-SIGNAL!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBetrag: ${positionProfile.positionSol} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}`, {
-    dedupeKey: `whale-signal:${whaleWallet}:${mint}`,
-    cooldownMs: 30 * 60 * 1000,
-    priority: true,
-  });
-
   try {
     const { executeJupiter } = await import("./execute-trade.js");
     const executionReceipt = await executeJupiter({
@@ -137,6 +141,19 @@ async function logDecision(whaleWallet: string, mint: string) {
     };
 
     writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
+
+    const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
+    const activeCount = Object.keys(persistedTrades).length;
+    const executedSol = Number(executionReceipt?.inputAmountUi);
+    const actualSizeSol = Number.isFinite(executedSol) && executedSol > 0
+      ? executedSol
+      : positionProfile.positionSol;
+
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+      dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
+      cooldownMs: 300_000,
+      priority: true,
+    });
 
   } catch (e: any) {
     await sendTelegram(`❌ <b>KAUF FEHLGESCHLAGEN</b>\nFehler: ${e.message}`, {
