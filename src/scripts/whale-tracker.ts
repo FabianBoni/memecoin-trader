@@ -5,6 +5,7 @@ import { sendTelegram } from "./telegram-notifier.js";
 const RPC_URL = process.env.HELIUS_RPC_URL || "";
 const WS_URL = RPC_URL.replace("https://", "wss://");
 const connection = new Connection(RPC_URL, { wsEndpoint: WS_URL });
+const PERFORMANCE_PATH = './src/data/performance.json';
 
 // DEINE WALLET ADRESSE HIER (wichtig für den Panik-Verkauf)
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "26L5sdD2t88KZiQXSvQUtiY26XEM1DggdY5kv1wm8RNc";
@@ -17,33 +18,89 @@ const getWhales = (): string[] => {
   }
 };
 
+function getPositionSizeProfile(whaleWallet: string) {
+  const fullSize = Number(process.env.AUTO_BUY_AMOUNT_SOL || 0.05);
+  const reducedSize = Number(process.env.AUTO_BUY_MID_AMOUNT_SOL || Math.min(fullSize, 0.1));
+  const minimalSize = Number(process.env.AUTO_BUY_LOW_AMOUNT_SOL || Math.min(reducedSize, 0.02));
+
+  try {
+    if (!fs.existsSync(PERFORMANCE_PATH)) {
+      return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+    }
+
+    const performance = JSON.parse(fs.readFileSync(PERFORMANCE_PATH, 'utf-8'));
+    const history = Array.isArray(performance[whaleWallet])
+      ? performance[whaleWallet].filter((value: unknown) => typeof value === 'boolean')
+      : [];
+
+    if (history.length === 0) {
+      return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+    }
+
+    const wins = history.filter(Boolean).length;
+    const winRate = (wins / history.length) * 100;
+
+    if (winRate > 60) {
+      return { positionSol: fullSize, sampleSize: history.length, winRate, tier: "full" };
+    }
+
+    if (winRate >= 30) {
+      return { positionSol: reducedSize, sampleSize: history.length, winRate, tier: "reduced" };
+    }
+
+    return { positionSol: minimalSize, sampleSize: history.length, winRate, tier: "minimal" };
+  } catch (error) {
+    console.error("Konnte Wal-Performance nicht auswerten:", error);
+    return { positionSol: reducedSize, sampleSize: 0, winRate: null as number | null, tier: "reduced" };
+  }
+}
+
+async function fetchEntryPriceUsd(mint: string): Promise<number | null> {
+  try {
+    const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
+    const data = await res.json();
+    const price = Number(data?.data?.[mint]?.price);
+
+    if (Number.isFinite(price) && price > 0) {
+      return price;
+    }
+  } catch (error) {
+    console.error(`Konnte Einstiegspreis fuer ${mint.slice(0,6)} nicht laden:`, error);
+  }
+
+  return null;
+}
+
 // --- KAUF LOGIK (Mit Kassenzettel-System!) ---
 async function logDecision(whaleWallet: string, mint: string) {
-  const autoBuyAmount = Number(process.env.AUTO_BUY_AMOUNT_SOL || 0.05);
-  await sendTelegram(`🚀 <b>WAL-SIGNAL!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBetrag: ${autoBuyAmount} SOL`);
+  const positionProfile = getPositionSizeProfile(whaleWallet);
+
+  const winRateLabel = positionProfile.winRate === null
+    ? "keine Historie"
+    : `${positionProfile.winRate.toFixed(0)}% aus ${positionProfile.sampleSize} Trades`;
+
+  await sendTelegram(`🚀 <b>WAL-SIGNAL!</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nBetrag: ${positionProfile.positionSol} SOL\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}`);
 
   try {
     const { executeJupiter } = await import("./execute-trade.js");
-    await executeJupiter({
+    const executionReceipt = await executeJupiter({
       planId: `AUTO-${Date.now()}`,
       tokenAddress: mint,
-      finalPositionSol: autoBuyAmount,
+      finalPositionSol: positionProfile.positionSol,
       executionMode: "jupiter",
       dryRun: false
     } as any);
 
-    // NEU: Kassenzettel (Kaufpreis) von Jupiter holen
-    let entryPrice = 0;
-    try {
-      const res = await fetch(`https://api.jup.ag/price/v2?ids=${mint}`);
-      const data = await res.json();
-      if (data.data[mint] && data.data[mint].price) {
-        entryPrice = Number(data.data[mint].price);
-        console.log(`[KASSENZETTEL] Kaufpreis für ${mint.slice(0,6)} gesichert: $${entryPrice}`);
-      }
-    } catch (err) {
-      console.log("Konnte Preis nicht sofort abrufen. Baseline wird später vom Manager gesetzt.");
+    const entryPrice = executionReceipt?.fillPriceUsd ?? await fetchEntryPriceUsd(mint);
+    if (!entryPrice) {
+      await sendTelegram(`⚠️ <b>ENTRY PRICE UNBEKANNT</b>\nWal: <code>${whaleWallet.slice(0,8)}</code>\nToken: <code>${mint}</code>\nTrade wurde ausgefuehrt, aber der Fill-Preis konnte nicht berechnet werden.`);
+      return;
     }
+
+    const fillSource = executionReceipt?.priceSource ?? "fallback-quote";
+    const fillTxid = executionReceipt?.txid;
+    const fillPriceSol = executionReceipt?.fillPriceSol;
+    console.log(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} gesichert: $${entryPrice} (${fillSource})`);
 
     const activeTradesPath = './src/data/active-trades.json';
     let activeTrades: any = {};
@@ -54,7 +111,13 @@ async function logDecision(whaleWallet: string, mint: string) {
     // NEU: Wir speichern jetzt das Hybrid-Objekt inkl. Preis und Wal-Adresse!
     activeTrades[mint] = {
       whale: whaleWallet,
-      entryPrice: entryPrice
+      entryPrice,
+      openedAt: new Date().toISOString(),
+      positionSol: positionProfile.positionSol,
+      whaleWinRateAtEntry: positionProfile.winRate,
+      entryPriceSource: fillSource,
+      entryTxid: fillTxid,
+      entryPriceSol: fillPriceSol
     };
 
     fs.writeFileSync(activeTradesPath, JSON.stringify(activeTrades, null, 2));
@@ -81,10 +144,8 @@ async function executePanicSell(whaleWallet: string, mint: string) {
          return;
     }
 
-    // Wir setzen den Entry-Preis virtuell auf 1 Millionen, 
-    // damit der Trailing-Stop im sell-manager SOFORT in Panik auslöst
-    activeTrades[mint].entryPrice = 1000000;
     activeTrades[mint].panic = true; // Markierung für den Manager
+    activeTrades[mint].panicMarkedAt = new Date().toISOString();
     
     fs.writeFileSync(activeTradesPath, JSON.stringify(activeTrades, null, 2));
     

@@ -8,21 +8,36 @@ const WALLET_ADDRESS = process.env.WALLET_ADDRESS || "26L5sdD2t88KZiQXSvQUtiY26X
 const TAKE_PROFIT = Number(process.env.TAKE_PROFIT_PCT_MONITOR || 50);
 const STOP_LOSS = Number(process.env.STOP_LOSS_PCT_MONITOR || -20);
 
-const baselinePrices = new Map<string, number>();
 const highWaterMarks = new Map<string, number>();
+const missingEntryWarnings = new Set<string>();
+
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 async function logExitSignal(mint: string, balance: number, changePct: number, rawAmount: string, customReason?: string) {
-  const isWin = changePct > 0;
+  let isWin = changePct > 0;
+  let realizedChangePct = changePct;
+  let realizedExitPriceUsd: number | null = null;
+  let realizedExitPriceSol: number | null = null;
+  let priceSource = "market-snapshot";
   const reason = customReason || (isWin ? "TAKE PROFIT" : "STOP LOSS");
-  const emoji = isWin ? "💰" : "📉";
+  let emoji = isWin ? "💰" : "📉";
 
   try {
     let whaleAddress = null;
+    let entryPriceUsd: number | null = null;
+    let entryPriceSol: number | null = null;
     try {
       const activeTrades = JSON.parse(fs.readFileSync('./src/data/active-trades.json', 'utf-8'));
       const tradeData = activeTrades[mint];
       // Hybrid-Logik: Unterstützt altes String-Format und neues Objekt-Format
       whaleAddress = typeof tradeData === 'string' ? tradeData : tradeData.whale;
+      if (typeof tradeData === 'object' && tradeData !== null) {
+        entryPriceUsd = toFiniteNumber(tradeData.entryPrice);
+        entryPriceSol = toFiniteNumber(tradeData.entryPriceSol);
+      }
     } catch (err) {
       console.log("Konnte active-trades.json nicht lesen.");
     }
@@ -31,7 +46,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
 
     // 1. Verkauf ausführen
     const { executeJupiter } = await import("./execute-trade.js");
-    await executeJupiter({
+    const executionReceipt = await executeJupiter({
       planId: `SELL-${mint.slice(0,4)}`,
       tokenAddress: mint,
       executionMode: "jupiter",
@@ -41,6 +56,19 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
       maxSlippageBps: 1500,
       dryRun: false
     } as any);
+
+    realizedExitPriceUsd = toFiniteNumber(executionReceipt?.fillPriceUsd);
+    realizedExitPriceSol = toFiniteNumber(executionReceipt?.fillPriceSol);
+    priceSource = executionReceipt?.priceSource ?? priceSource;
+
+    if (entryPriceUsd && realizedExitPriceUsd) {
+      realizedChangePct = ((realizedExitPriceUsd - entryPriceUsd) / entryPriceUsd) * 100;
+    } else if (entryPriceSol && realizedExitPriceSol) {
+      realizedChangePct = ((realizedExitPriceSol - entryPriceSol) / entryPriceSol) * 100;
+    }
+
+    isWin = realizedChangePct > 0;
+    emoji = isWin ? "💰" : "📉";
 
     // 2. Performance tracken (falls Wal bekannt)
     if (whaleAddress) {
@@ -53,7 +81,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         delete activeTrades[mint];
         fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
         highWaterMarks.delete(mint);
-        baselinePrices.delete(mint);
+        missingEntryWarnings.delete(mint);
     } catch (cleanupErr) {
         console.error("Fehler beim Aufräumen der aktiven Trades:", cleanupErr);
     }
@@ -68,9 +96,15 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         history.unshift({
             mint: mint,
             whale: whaleAddress || "Unknown",
-            pnl: changePct.toFixed(2),
+          pnl: realizedChangePct.toFixed(2),
             reason: reason,
-            date: new Date().toLocaleString('de-DE')
+          date: new Date().toLocaleString('de-DE'),
+          entryPriceUsd: entryPriceUsd,
+          exitPriceUsd: realizedExitPriceUsd,
+          entryPriceSol: entryPriceSol,
+          exitPriceSol: realizedExitPriceSol,
+          exitTxid: executionReceipt?.txid,
+          priceSource
         });
         // Maximal 50 Einträge behalten, damit das Dashboard schnell bleibt
         if (history.length > 50) history = history.slice(0, 50);
@@ -79,7 +113,7 @@ async function logExitSignal(mint: string, balance: number, changePct: number, r
         console.error("Konnte Historie nicht speichern:", histErr);
     }
 
-    await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...`);
+    await sendTelegram(`✅ <b>SUCCESSFULLY SOLD</b>\nToken: ${mint.slice(0,6)}...\nRealized PnL: ${realizedChangePct.toFixed(2)}%\nQuelle: ${priceSource}`);
   } catch (e: any) {
     console.error("❌ Auto-Sell failed:", e);
     await sendTelegram(`❌ <b>SELL FAILED</b>\nToken: ${mint.slice(0,6)}\nError: ${e.message}`);
@@ -118,32 +152,47 @@ async function monitorPositions() {
         let balance = 0;
         let rawAmount = "0";
 
-        if (parsedTokenAccounts.value.length > 0) {
-          balance = parsedTokenAccounts.value[0].account.data.parsed.info.tokenAmount.uiAmount;
-          rawAmount = parsedTokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
+        const tokenAmount = parsedTokenAccounts.value[0]?.account.data.parsed.info.tokenAmount;
+        if (tokenAmount) {
+          balance = tokenAmount.uiAmount;
+          rawAmount = tokenAmount.amount;
         }
 
         if (balance === 0) {
           delete activeTrades[mint];
           fs.writeFileSync('./src/data/active-trades.json', JSON.stringify(activeTrades, null, 2));
+          highWaterMarks.delete(mint);
+          missingEntryWarnings.delete(mint);
+          continue;
+        }
+
+        const tradeData = activeTrades[mint];
+        const hasStructuredTrade = typeof tradeData === 'object' && tradeData !== null;
+        const baseline = hasStructuredTrade ? Number(tradeData.entryPrice) : Number.NaN;
+        const hasValidEntryPrice = Number.isFinite(baseline) && baseline > 0;
+
+        if (hasStructuredTrade && tradeData.panic) {
+          const currentPrice = await getCurrentPrice(mint);
+          const panicChangePct = currentPrice && hasValidEntryPrice
+            ? ((currentPrice - baseline) / baseline) * 100
+            : 0;
+          await logExitSignal(mint, balance, panicChangePct, rawAmount, "PANIC EXIT");
+          continue;
+        }
+
+        if (!hasValidEntryPrice) {
+          if (!missingEntryWarnings.has(mint)) {
+            missingEntryWarnings.add(mint);
+            console.warn(`[MONITOR] ${mint.slice(0,6)} uebersprungen: entryPrice fehlt oder ist ungueltig.`);
+            await sendTelegram(`⚠️ <b>ENTRY PRICE FEHLT</b>\nToken: <code>${mint}</code>\nDer Trade wird nicht ueberwacht, bis ein gueltiger entryPrice gespeichert ist.`);
+          }
           continue;
         }
 
         const currentPrice = await getCurrentPrice(mint);
         if (!currentPrice) continue;
 
-        let baseline = 0;
-        const tradeData = activeTrades[mint];
-
-        if (typeof tradeData === 'object' && tradeData.entryPrice) {
-          baseline = tradeData.entryPrice;
-        } else {
-          if (!baselinePrices.has(mint)) {
-            baselinePrices.set(mint, currentPrice);
-            continue;
-          }
-          baseline = baselinePrices.get(mint)!;
-        }
+        missingEntryWarnings.delete(mint);
 
         const changePct = ((currentPrice - baseline) / baseline) * 100;
         const currentHigh = highWaterMarks.get(mint) || 0;

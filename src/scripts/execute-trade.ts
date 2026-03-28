@@ -11,12 +11,200 @@ import { loadTradePlans } from "../storage/trades.js";
 import type { TradePlan } from "../types/trade.js";
 import { loadExecutionWallet } from "../wallet.js";
 
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+interface ExecutionReceipt {
+  txid?: string;
+  confirmed: boolean;
+  quote: Awaited<ReturnType<JupiterClient["getQuote"]>>;
+  inputMint: string;
+  outputMint: string;
+  inputAmount: string;
+  outputAmount?: string;
+  inputAmountUi?: number;
+  outputAmountUi?: number;
+  nativeSolDelta?: number;
+  fillPriceSol?: number;
+  fillPriceUsd?: number;
+  priceSource: "receipt" | "fallback-quote";
+}
+
+type JupiterQuoteResponse = Awaited<ReturnType<JupiterClient["getQuote"]>>;
+
 function solToLamportsString(sol: number): string {
   return String(Math.round(sol * 1_000_000_000));
 }
 
 function lamportsToSol(lamports: number): number {
   return lamports / 1_000_000_000;
+}
+
+function amountToUiAmount(amount: bigint, decimals: number): number {
+  return Number(amount) / 10 ** decimals;
+}
+
+async function fetchSolUsdPrice(): Promise<number | null> {
+  try {
+    const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
+    const data = await response.json();
+    const price = Number(data?.data?.[SOL_MINT]?.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getParsedTransactionWithRetry(connection: Connection, signature: string) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const parsed = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: "confirmed",
+    });
+
+    if (parsed) {
+      return parsed;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
+
+  return null;
+}
+
+function getAccountKeyString(accountKey: unknown): string | undefined {
+  if (!accountKey) {
+    return undefined;
+  }
+
+  if (typeof accountKey === "string") {
+    return accountKey;
+  }
+
+  if (typeof accountKey === "object" && accountKey !== null) {
+    const maybePubkey = "pubkey" in accountKey ? (accountKey as { pubkey?: unknown }).pubkey : accountKey;
+    if (typeof maybePubkey === "string") {
+      return maybePubkey;
+    }
+
+    if (typeof maybePubkey === "object" && maybePubkey !== null && "toBase58" in maybePubkey) {
+      const toBase58 = (maybePubkey as { toBase58?: () => string }).toBase58;
+      if (typeof toBase58 === "function") {
+        return toBase58.call(maybePubkey);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function getWalletNativeSolDelta(parsedTx: Awaited<ReturnType<Connection["getParsedTransaction"]>>, walletAddress: string): number | undefined {
+  const accountKeys = (parsedTx?.transaction.message as { accountKeys?: unknown[] } | undefined)?.accountKeys;
+  const walletIndex = accountKeys?.findIndex((accountKey) => getAccountKeyString(accountKey) === walletAddress) ?? -1;
+
+  if (walletIndex < 0) {
+    return undefined;
+  }
+
+  const preBalance = parsedTx?.meta?.preBalances?.[walletIndex];
+  const postBalance = parsedTx?.meta?.postBalances?.[walletIndex];
+
+  if (preBalance === undefined || postBalance === undefined) {
+    return undefined;
+  }
+
+  return lamportsToSol(postBalance - preBalance);
+}
+
+function getTokenDelta(params: {
+  parsedTx: Awaited<ReturnType<Connection["getParsedTransaction"]>>;
+  walletAddress: string;
+  mint: string;
+}) {
+  const postBalances = params.parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === params.walletAddress && balance.mint === params.mint,
+  ) ?? [];
+  const preBalances = params.parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === params.walletAddress && balance.mint === params.mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+
+  return {
+    deltaRaw,
+    decimals,
+    deltaUi: deltaRaw !== 0n ? amountToUiAmount(deltaRaw < 0n ? -deltaRaw : deltaRaw, decimals) : undefined,
+  };
+}
+
+async function buildExecutionReceipt(params: {
+  connection: Connection;
+  signature: string;
+  walletAddress: string;
+  quote: JupiterQuoteResponse;
+  inputMint: string;
+  outputMint: string;
+}): Promise<ExecutionReceipt> {
+  const parsedTx = await getParsedTransactionWithRetry(params.connection, params.signature);
+
+  if (!parsedTx) {
+    return {
+      txid: params.signature,
+      confirmed: false,
+      quote: params.quote,
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+      inputAmount: params.quote.inAmount,
+      outputAmount: params.quote.outAmount,
+      priceSource: "fallback-quote",
+    };
+  }
+
+  const walletAddress = params.walletAddress;
+  const nativeSolDelta = getWalletNativeSolDelta(parsedTx, walletAddress);
+  const outputTokenDelta = params.outputMint === SOL_MINT
+    ? { deltaRaw: 0n, deltaUi: undefined }
+    : getTokenDelta({ parsedTx, walletAddress, mint: params.outputMint });
+  const inputTokenDelta = params.inputMint === SOL_MINT
+    ? { deltaRaw: 0n, deltaUi: undefined }
+    : getTokenDelta({ parsedTx, walletAddress, mint: params.inputMint });
+
+  const outputAmountUi = params.outputMint === SOL_MINT
+    ? (nativeSolDelta !== undefined && nativeSolDelta > 0 ? nativeSolDelta : undefined)
+    : outputTokenDelta.deltaUi;
+  const outputAmountRaw = params.outputMint === SOL_MINT
+    ? (nativeSolDelta !== undefined && nativeSolDelta > 0 ? String(Math.round(nativeSolDelta * 1_000_000_000)) : params.quote.outAmount)
+    : (outputTokenDelta.deltaRaw > 0n ? outputTokenDelta.deltaRaw.toString() : params.quote.outAmount);
+  const inputAmountUi = params.inputMint === SOL_MINT
+    ? (nativeSolDelta !== undefined && nativeSolDelta < 0 ? Math.abs(nativeSolDelta) : lamportsToSol(Number(params.quote.inAmount)))
+    : inputTokenDelta.deltaUi;
+
+  let fillPriceSol: number | undefined;
+  if (params.inputMint === SOL_MINT && inputAmountUi && outputAmountUi && outputAmountUi > 0) {
+    fillPriceSol = inputAmountUi / outputAmountUi;
+  } else if (params.outputMint === SOL_MINT && inputAmountUi && inputAmountUi > 0 && outputAmountUi && outputAmountUi > 0) {
+    fillPriceSol = outputAmountUi / inputAmountUi;
+  }
+
+  const solUsdPrice = fillPriceSol !== undefined ? await fetchSolUsdPrice() : null;
+
+  return {
+    txid: params.signature,
+    confirmed: true,
+    quote: params.quote,
+    inputMint: params.inputMint,
+    outputMint: params.outputMint,
+    inputAmount: params.quote.inAmount,
+    outputAmount: outputAmountRaw,
+    priceSource: "receipt",
+    ...(inputAmountUi !== undefined ? { inputAmountUi } : {}),
+    ...(outputAmountUi !== undefined ? { outputAmountUi } : {}),
+    ...(nativeSolDelta !== undefined ? { nativeSolDelta } : {}),
+    ...(fillPriceSol !== undefined ? { fillPriceSol } : {}),
+    ...(fillPriceSol !== undefined && solUsdPrice ? { fillPriceUsd: fillPriceSol * solUsdPrice } : {}),
+  };
 }
 
 function isLikelyPlanFilePath(input: string): boolean {
@@ -49,7 +237,7 @@ async function loadPlan(input: string): Promise<TradePlan> {
   return plan;
 }
 
-export async function executeJupiter(plan: TradePlan) {
+export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt | undefined> {
   if (plan.executionMode !== "jupiter") {
     throw new Error(`Plan ${plan.planId} is not marked for jupiter execution.`);
   }
@@ -74,7 +262,7 @@ export async function executeJupiter(plan: TradePlan) {
 
   // --- START DUAL MODE (KAUFEN & VERKAUFEN) ---
   const anyPlan = plan as any;
-  const isSellOrder = anyPlan.inputMint && anyPlan.inputMint !== "So11111111111111111111111111111111111111112";
+  const isSellOrder = anyPlan.inputMint && anyPlan.inputMint !== SOL_MINT;
 
   // --- START EISERNER PUFFER (SOL RESERVE) ---
   if (!isSellOrder) {
@@ -95,7 +283,7 @@ export async function executeJupiter(plan: TradePlan) {
   }
   // --- END EISERNER PUFFER ---
 
-  const quoteInputMint = anyPlan.inputMint || "So11111111111111111111111111111111111111112";
+  const quoteInputMint = anyPlan.inputMint || SOL_MINT;
   const quoteOutputMint = anyPlan.outputMint || plan.tokenAddress;
 
   // Nimm die rohe Zahl (amount) beim Verkaufen, sonst rechne SOL in Lamports um beim Kaufen
@@ -141,12 +329,28 @@ export async function executeJupiter(plan: TradePlan) {
 
     try {
       const txid = await connection.sendRawTransaction(rawTx, { skipPreflight: true });
+      if (swap.lastValidBlockHeight !== undefined) {
+        await connection.confirmTransaction({
+          signature: txid,
+          blockhash: transaction.message.recentBlockhash,
+          lastValidBlockHeight: swap.lastValidBlockHeight,
+        }, "confirmed");
+      } else {
+        await connection.confirmTransaction(txid, "confirmed");
+      }
       console.log("🚀 Transaction sent! TXID:", txid);
       console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
-      return; // Beendet das Skript hier, damit er unten keinen Fehler wirft
+      return await buildExecutionReceipt({
+        connection,
+        signature: txid,
+        walletAddress: wallet.publicKey.toBase58(),
+        quote,
+        inputMint: quoteInputMint,
+        outputMint: quoteOutputMint,
+      });
     } catch (e) {
       console.error("Broadcast failed:", e);
-      return;
+      throw e;
     }
   }
   // --- END MANUAL PATCH ---
