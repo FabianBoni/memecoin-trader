@@ -837,6 +837,56 @@ function getWalletTokenRawDelta(parsedTx: ParsedTransactionResponse, walletAddre
   return postRaw - preRaw;
 }
 
+function isOnCurveAddress(address: string): boolean {
+  try {
+    return PublicKey.isOnCurve(new PublicKey(address).toBytes());
+  } catch {
+    return false;
+  }
+}
+
+function getSeedTraderAddresses(parsedTx: ParsedTransactionResponse, mint: string): string[] {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => typeof balance.owner === 'string' && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => typeof balance.owner === 'string' && balance.mint === mint,
+  ) ?? [];
+
+  const candidateOwners = new Set<string>();
+  for (const balance of [...preBalances, ...postBalances]) {
+    if (typeof balance.owner === 'string' && balance.owner.length > 0) {
+      candidateOwners.add(balance.owner);
+    }
+  }
+
+  const ownersWithDelta = [...candidateOwners]
+    .filter((owner) => isOnCurveAddress(owner))
+    .map((owner) => ({ owner, rawDelta: getWalletTokenRawDelta(parsedTx, owner, mint) }))
+    .filter((entry) => entry.rawDelta !== 0n)
+    .sort((left, right) => {
+      const leftAbs = left.rawDelta < 0n ? -left.rawDelta : left.rawDelta;
+      const rightAbs = right.rawDelta < 0n ? -right.rawDelta : right.rawDelta;
+      if (leftAbs === rightAbs) {
+        return left.owner.localeCompare(right.owner);
+      }
+
+      return rightAbs > leftAbs ? 1 : -1;
+    })
+    .map((entry) => entry.owner);
+
+  if (ownersWithDelta.length > 0) {
+    return ownersWithDelta;
+  }
+
+  const signerAddress = getSignerAddress(parsedTx);
+  if (!signerAddress || !isOnCurveAddress(signerAddress)) {
+    return [];
+  }
+
+  return getWalletTokenRawDelta(parsedTx, signerAddress, mint) !== 0n ? [signerAddress] : [];
+}
+
 async function fetchSolUsdPrice(): Promise<number | null> {
   try {
     const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
@@ -1014,40 +1064,37 @@ async function collectTopTokenTraders(
             continue;
           }
 
-          const signerAddress = getSignerAddress(tx);
-          if (!signerAddress) {
+          const traderAddresses = getSeedTraderAddresses(tx, mintAddress);
+          if (traderAddresses.length === 0) {
             continue;
           }
 
-          const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
-          if (tokenRawDelta === 0n) {
-            continue;
+          for (const traderAddress of traderAddresses) {
+            const tradeVolumeUsd = estimateSeedTradeVolumeUsd(
+              tx,
+              traderAddress,
+              mintAddress,
+              solUsdPrice,
+              tokenPriceUsd,
+            );
+            if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
+              continue;
+            }
+
+            const existing = traderStats.get(traderAddress) ?? {
+              walletAddress: traderAddress,
+              tokenVolumeUsd: 0,
+              tokenTradeCount: 0,
+            };
+
+            existing.tokenVolumeUsd += tradeVolumeUsd;
+            existing.tokenTradeCount += 1;
+            if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
+              existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+            }
+
+            traderStats.set(traderAddress, existing);
           }
-
-          const tradeVolumeUsd = estimateSeedTradeVolumeUsd(
-            tx,
-            signerAddress,
-            mintAddress,
-            solUsdPrice,
-            tokenPriceUsd,
-          );
-          if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
-            continue;
-          }
-
-          const existing = traderStats.get(signerAddress) ?? {
-            walletAddress: signerAddress,
-            tokenVolumeUsd: 0,
-            tokenTradeCount: 0,
-          };
-
-          existing.tokenVolumeUsd += tradeVolumeUsd;
-          existing.tokenTradeCount += 1;
-          if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
-            existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
-          }
-
-          traderStats.set(signerAddress, existing);
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
