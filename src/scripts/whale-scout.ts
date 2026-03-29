@@ -818,9 +818,11 @@ function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderC
     SCOUT_DEEP_SCAN_MIN_SEED_VOLUME_USD,
     env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 0.5,
   );
+  const moderateSeedVolumeSignal = trader.tokenVolumeUsd >= seedVolumeFloor
+    && stats.estimatedVolumeUsd >= SCOUT_DEEP_SCAN_MIN_QUICK_VOLUME_FOR_STRONG_SEED_USD;
 
   return stats.estimatedVolumeUsd >= quickVolumeFloor
-    || trader.tokenVolumeUsd >= seedVolumeFloor;
+    || moderateSeedVolumeSignal;
 }
 
 function shouldExtendedScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
