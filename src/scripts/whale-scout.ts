@@ -35,6 +35,10 @@ const SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD = 10_000;
 const SCOUT_WALLET_EXPOSURE_SKEW_LIMIT = 5;
 const MIN_RELIABLE_SCOUT_SOL_DELTA = 0.01;
 const SCOUT_WHALE_ADAPTIVE_SIGNATURE_SCAN_CAP = 900;
+const SPECIALIST_WHALE_VOLUME_FACTOR = 0.4;
+const SPECIALIST_WHALE_MIN_VOLUME_USD = 10_000;
+const SPECIALIST_WHALE_MIN_TRADE_MULTIPLIER = 2;
+const SPECIALIST_WHALE_MIN_SEED_VOLUME_USD = 1_500;
 const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
@@ -781,6 +785,10 @@ function buildWhaleRejectReason(stats: ScoutCandidateStats): string {
 }
 
 function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+  if (stats.estimatedVolumeUsd <= 0) {
+    return false;
+  }
+
   const tradeTrigger = Math.max(4, Math.floor(env.SCOUT_MIN_WHALE_TX_COUNT / 2));
 
   return stats.estimatedVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
@@ -1178,6 +1186,30 @@ function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
   return stats.estimatedVolumeUsd >= env.SCOUT_MIN_WHALE_VOLUME_USD
     && stats.qualifyingTradeCount >= env.SCOUT_MIN_WHALE_TX_COUNT
     && stats.distinctTokenCount >= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS;
+}
+
+function qualifiesAsSpecialistPaperWhale(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+  const specialistVolumeFloor = Math.max(
+    SPECIALIST_WHALE_MIN_VOLUME_USD,
+    env.SCOUT_MIN_WHALE_VOLUME_USD * SPECIALIST_WHALE_VOLUME_FACTOR,
+  );
+  const specialistTradeFloor = Math.max(
+    env.SCOUT_MIN_WHALE_TX_COUNT + 2,
+    env.SCOUT_MIN_WHALE_TX_COUNT * SPECIALIST_WHALE_MIN_TRADE_MULTIPLIER,
+  );
+  const specialistSeedVolumeFloor = Math.max(
+    SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 1.5,
+  );
+
+  return stats.estimatedVolumeUsd >= specialistVolumeFloor
+    && stats.qualifyingTradeCount >= specialistTradeFloor
+    && stats.distinctTokenCount >= 1
+    && trader.tokenVolumeUsd >= specialistSeedVolumeFloor;
+}
+
+function qualifiesAsPaperWhaleCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+  return qualifiesAsEstablishedWhale(stats) || qualifiesAsSpecialistPaperWhale(stats, trader);
 }
 
 function getSeedSignatureScanCap(seed: ScoutSeedCandidate): number | undefined {
@@ -1827,7 +1859,7 @@ async function scout() {
         }
 
         let candidateStats = quickStats;
-        if (!qualifiesAsEstablishedWhale(candidateStats)
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)
           && env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT > env.SCOUT_WHALE_SIGNATURE_LIMIT
           && shouldDeepScanCandidate(candidateStats, trader)) {
           console.log(`[SCOUT] Vertiefe Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Quick-Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
@@ -1839,7 +1871,7 @@ async function scout() {
           ) ?? candidateStats;
         }
 
-        if (!qualifiesAsEstablishedWhale(candidateStats)
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)
           && env.SCOUT_WHALE_EXTENDED_SIGNATURE_LIMIT > env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT
           && shouldExtendedScanCandidate(candidateStats, trader)) {
           console.log(`[SCOUT] Erweitere Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}.`);
@@ -1851,12 +1883,19 @@ async function scout() {
           ) ?? candidateStats;
         }
 
-        if (!qualifiesAsEstablishedWhale(candidateStats)) {
+        const specialistPaperWhale = !qualifiesAsEstablishedWhale(candidateStats)
+          && qualifiesAsSpecialistPaperWhale(candidateStats, trader);
+
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)) {
           const rejectReason = buildWhaleRejectReason(candidateStats);
           rememberRejectedCandidate(rejectedCandidates, walletAddress, rejectReason, candidateStats, mintAddress, trader);
           rejectedCandidatesDirty = true;
           console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount} (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
           continue;
+        }
+
+        if (specialistPaperWhale) {
+          console.log(`[SCOUT] Akzeptiere spezialisierten Paper-Wal ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
         }
 
         const discoveredAt = new Date().toISOString();
