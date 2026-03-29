@@ -688,6 +688,19 @@ function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderC
     || trader.tokenTradeCount >= tradeTrigger;
 }
 
+function shouldExtendedScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+  const nearVolumeFloor = Math.max(10_000, env.SCOUT_MIN_WHALE_VOLUME_USD * 0.7);
+  const nearTradeFloor = Math.max(1, env.SCOUT_MIN_WHALE_TX_COUNT - 1);
+  const nearTokenFloor = Math.max(1, env.SCOUT_MIN_WHALE_DISTINCT_TOKENS);
+
+  return stats.estimatedVolumeUsd >= nearVolumeFloor
+    && (
+      stats.qualifyingTradeCount >= nearTradeFloor
+      || stats.distinctTokenCount >= nearTokenFloor
+      || trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD
+    );
+}
+
 function getAccountKeyString(accountKey: unknown): string | undefined {
   if (!accountKey) {
     return undefined;
@@ -1600,6 +1613,18 @@ async function scout() {
           ) ?? candidateStats;
         }
 
+        if (!qualifiesAsEstablishedWhale(candidateStats)
+          && env.SCOUT_WHALE_EXTENDED_SIGNATURE_LIMIT > env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT
+          && shouldExtendedScanCandidate(candidateStats, trader)) {
+          console.log(`[SCOUT] Erweitere Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}.`);
+          candidateStats = await evaluateWhaleCandidate(
+            connection,
+            walletAddress,
+            solUsdPrice,
+            env.SCOUT_WHALE_EXTENDED_SIGNATURE_LIMIT,
+          ) ?? candidateStats;
+        }
+
         if (!qualifiesAsEstablishedWhale(candidateStats)) {
           const rejectReason = buildWhaleRejectReason(candidateStats);
           rememberRejectedCandidate(rejectedCandidates, walletAddress, rejectReason, candidateStats, mintAddress, trader);
@@ -1642,9 +1667,9 @@ async function scout() {
 
     if (addedCount > 0) {
         writeJsonFileSync(WHALE_FILE, currentWhales);
-        console.log(`[SCOUT] ${addedCount} neue etablierte Wale hinzugefuegt.`);
+      console.log(`[SCOUT] ${addedCount} neue qualifizierte Paper-Wale hinzugefuegt.`);
     } else {
-        console.log('[SCOUT] Keine neuen qualifizierten Wale hinzugefuegt.');
+      console.log('[SCOUT] Keine neuen qualifizierten Paper-Wale hinzugefuegt.');
     }
 
     updateRuntimeStatus('scout', {
