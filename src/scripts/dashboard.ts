@@ -698,6 +698,8 @@ app.get('/', (req, res) => {
                 <p class="text-lg font-black text-cyan-300">${escapeHtml(String(scoutStatus.state ?? 'n/a'))}</p>
                 <p class="text-xs text-slate-500 mt-1">Letzter Lauf ${formatDateTime(scoutStatus.lastRunAt)}</p>
                 <p class="text-xs text-slate-500">Token ${escapeHtml(shortenAddress(String(scoutStatus.lastToken ?? 'n/a'), 8, 4))}</p>
+                <p class="text-xs text-slate-500">Seeds ${escapeHtml(String(scoutStatus.highVolumeSeedCount ?? 0))}/${escapeHtml(String(scoutStatus.migratedSeedCount ?? 0))} high-volume · Cooldown ${escapeHtml(String(scoutStatus.cooldownSkippedCandidates ?? 0))}</p>
+                <p class="text-xs text-slate-500">Filter Vol24h $${escapeHtml(String(scoutStatus.minSeedVolumeUsd ?? 'n/a'))} · Seed-Wal $${escapeHtml(String(scoutStatus.minSeedTraderVolumeUsd ?? 'n/a'))}</p>
                 <p class="text-xs text-slate-500">Next ${formatDateTime(scoutStatus.nextRunAt)}</p>
             </div>
             <div class="glass-card border-t-4 border-t-emerald-500">

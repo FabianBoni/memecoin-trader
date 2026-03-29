@@ -13,6 +13,7 @@ import type { DexPairSummary } from '../types/market.js';
 const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
+const SCOUT_CANDIDATE_CACHE_FILE = path.resolve(SCRIPT_DIR, '../data/scout-candidate-cache.json');
 const EMPTY_SCOUT_INTERVAL_MS = 60 * 1000;
 const FAST_SCOUT_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_SCOUT_INTERVAL_MS = 60 * 60 * 1000;
@@ -53,6 +54,30 @@ type SeedTraderCandidate = {
   tokenTradeCount: number;
   lastTradeAt?: string;
 };
+
+type ScoutSeedCandidate = {
+  mintAddress: string;
+  reason: string;
+  boostWeight: number;
+  marketVolume24hUsd: number;
+  marketLiquidityUsd: number;
+  marketTxCount24h: number;
+  highVolumeEligible: boolean;
+};
+
+type RejectedScoutCandidateRecord = {
+  address: string;
+  rejectUntil: string;
+  lastRejectedAt: string;
+  lastRejectReason: string;
+  estimatedVolumeUsd?: number;
+  qualifyingTradeCount?: number;
+  distinctTokenCount?: number;
+  lastSeedToken?: string;
+  seedTokenVolumeUsd?: number;
+};
+
+type RejectedScoutCandidateStore = Record<string, RejectedScoutCandidateRecord>;
 
 // Hilfsfunktion für Pausen
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -120,6 +145,188 @@ function getBestDexPriceUsd(pairs: DexPairSummary[]): number | null {
 
   const priceUsd = Number(bestPair.priceUsd);
   return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
+}
+
+function toFiniteNumber(value: unknown): number {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : 0;
+}
+
+function getPairLiquidityUsd(pair: DexPairSummary | null | undefined): number {
+  return pair ? toFiniteNumber(pair.liquidity?.usd) : 0;
+}
+
+function getPairVolume24hUsd(pair: DexPairSummary | null | undefined): number {
+  return pair ? toFiniteNumber(pair.volume?.h24) : 0;
+}
+
+function getPairTxCount24h(pair: DexPairSummary | null | undefined): number {
+  if (!pair) {
+    return 0;
+  }
+
+  return Math.max(0, Math.round(toFiniteNumber(pair.txns?.h24?.buys) + toFiniteNumber(pair.txns?.h24?.sells)));
+}
+
+function isScoutPairMatch(pair: DexPairSummary, mintAddress: string): boolean {
+  return pair.chainId === 'solana'
+    && (pair.baseToken?.address === mintAddress || pair.quoteToken?.address === mintAddress);
+}
+
+function pickBestScoutSeedPair(mintAddress: string, pairs: DexPairSummary[]): DexPairSummary | null {
+  const matchingPairs = pairs.filter((pair) => isScoutPairMatch(pair, mintAddress));
+  if (matchingPairs.length === 0) {
+    return null;
+  }
+
+  return [...matchingPairs].sort((left, right) => {
+    const volumeDiff = getPairVolume24hUsd(right) - getPairVolume24hUsd(left);
+    if (volumeDiff !== 0) {
+      return volumeDiff;
+    }
+
+    const liquidityDiff = getPairLiquidityUsd(right) - getPairLiquidityUsd(left);
+    if (liquidityDiff !== 0) {
+      return liquidityDiff;
+    }
+
+    return getPairTxCount24h(right) - getPairTxCount24h(left);
+  })[0] ?? null;
+}
+
+function qualifiesAsHighVolumeSeed(seed: Pick<ScoutSeedCandidate, 'marketVolume24hUsd' | 'marketLiquidityUsd' | 'marketTxCount24h'>): boolean {
+  return seed.marketVolume24hUsd >= env.SCOUT_MIN_SEED_VOLUME_USD
+    && seed.marketLiquidityUsd >= env.SCOUT_MIN_SEED_LIQUIDITY_USD
+    && seed.marketTxCount24h >= env.SCOUT_MIN_SEED_TX_COUNT;
+}
+
+function normalizeRejectedCandidateStore(input: unknown): RejectedScoutCandidateStore {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    return {};
+  }
+
+  const normalized: RejectedScoutCandidateStore = {};
+  for (const [address, value] of Object.entries(input as Record<string, unknown>)) {
+    try {
+      new PublicKey(address);
+    } catch {
+      continue;
+    }
+
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      continue;
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const rejectUntil = typeof candidate.rejectUntil === 'string' ? candidate.rejectUntil : undefined;
+    if (!rejectUntil || !Number.isFinite(Date.parse(rejectUntil))) {
+      continue;
+    }
+
+    normalized[address] = {
+      address,
+      rejectUntil,
+      lastRejectedAt: typeof candidate.lastRejectedAt === 'string' ? candidate.lastRejectedAt : rejectUntil,
+      lastRejectReason: typeof candidate.lastRejectReason === 'string' ? candidate.lastRejectReason : 'unknown',
+      ...(Number.isFinite(Number(candidate.estimatedVolumeUsd)) ? { estimatedVolumeUsd: Number(candidate.estimatedVolumeUsd) } : {}),
+      ...(Number.isFinite(Number(candidate.qualifyingTradeCount)) ? { qualifyingTradeCount: Number(candidate.qualifyingTradeCount) } : {}),
+      ...(Number.isFinite(Number(candidate.distinctTokenCount)) ? { distinctTokenCount: Number(candidate.distinctTokenCount) } : {}),
+      ...(typeof candidate.lastSeedToken === 'string' ? { lastSeedToken: candidate.lastSeedToken } : {}),
+      ...(Number.isFinite(Number(candidate.seedTokenVolumeUsd)) ? { seedTokenVolumeUsd: Number(candidate.seedTokenVolumeUsd) } : {}),
+    };
+  }
+
+  return normalized;
+}
+
+function readRejectedCandidateStore(): RejectedScoutCandidateStore {
+  return normalizeRejectedCandidateStore(readJsonFileSync(SCOUT_CANDIDATE_CACHE_FILE, {}));
+}
+
+function writeRejectedCandidateStore(store: RejectedScoutCandidateStore) {
+  writeJsonFileSync(SCOUT_CANDIDATE_CACHE_FILE, store);
+}
+
+function pruneRejectedCandidateStore(store: RejectedScoutCandidateStore, nowMs = Date.now()): boolean {
+  let dirty = false;
+
+  for (const [address, record] of Object.entries(store)) {
+    const rejectUntilMs = Date.parse(record.rejectUntil);
+    if (!Number.isFinite(rejectUntilMs) || rejectUntilMs <= nowMs) {
+      delete store[address];
+      dirty = true;
+    }
+  }
+
+  return dirty;
+}
+
+function isCandidateCoolingDown(store: RejectedScoutCandidateStore, address: string, nowMs = Date.now()): boolean {
+  const rejectUntil = store[address]?.rejectUntil;
+  if (!rejectUntil) {
+    return false;
+  }
+
+  const rejectUntilMs = Date.parse(rejectUntil);
+  return Number.isFinite(rejectUntilMs) && rejectUntilMs > nowMs;
+}
+
+function rememberRejectedCandidate(
+  store: RejectedScoutCandidateStore,
+  walletAddress: string,
+  rejectReason: string,
+  stats: ScoutCandidateStats,
+  mintAddress: string,
+  trader: SeedTraderCandidate,
+) {
+  const rejectedAt = new Date();
+  store[walletAddress] = {
+    address: walletAddress,
+    lastRejectedAt: rejectedAt.toISOString(),
+    rejectUntil: new Date(rejectedAt.getTime() + env.SCOUT_REJECT_COOLDOWN_MINUTES * 60_000).toISOString(),
+    lastRejectReason: rejectReason,
+    estimatedVolumeUsd: Math.round(stats.estimatedVolumeUsd),
+    qualifyingTradeCount: stats.qualifyingTradeCount,
+    distinctTokenCount: stats.distinctTokenCount,
+    lastSeedToken: mintAddress,
+    seedTokenVolumeUsd: Math.round(trader.tokenVolumeUsd),
+  };
+}
+
+function clearRejectedCandidate(store: RejectedScoutCandidateStore, walletAddress: string): boolean {
+  if (!(walletAddress in store)) {
+    return false;
+  }
+
+  delete store[walletAddress];
+  return true;
+}
+
+function buildWhaleRejectReason(stats: ScoutCandidateStats): string {
+  const reasons: string[] = [];
+
+  if (stats.estimatedVolumeUsd < env.SCOUT_MIN_WHALE_VOLUME_USD) {
+    reasons.push(`volume ${stats.estimatedVolumeUsd.toFixed(0)}/${env.SCOUT_MIN_WHALE_VOLUME_USD}`);
+  }
+
+  if (stats.qualifyingTradeCount < env.SCOUT_MIN_WHALE_TX_COUNT) {
+    reasons.push(`trades ${stats.qualifyingTradeCount}/${env.SCOUT_MIN_WHALE_TX_COUNT}`);
+  }
+
+  if (stats.distinctTokenCount < env.SCOUT_MIN_WHALE_DISTINCT_TOKENS) {
+    reasons.push(`tokens ${stats.distinctTokenCount}/${env.SCOUT_MIN_WHALE_DISTINCT_TOKENS}`);
+  }
+
+  return reasons.join(', ');
+}
+
+function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+  const tradeTrigger = Math.max(4, Math.floor(env.SCOUT_MIN_WHALE_TX_COUNT / 2));
+
+  return stats.estimatedVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
+    || trader.tokenVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
+    || stats.qualifyingTradeCount >= tradeTrigger
+    || trader.tokenTradeCount >= tradeTrigger;
 }
 
 function getAccountKeyString(accountKey: unknown): string | undefined {
@@ -376,6 +583,7 @@ async function evaluateWhaleCandidate(
   connection: Connection,
   walletAddress: string,
   solUsdPrice: number,
+  signatureLimit = env.SCOUT_WHALE_SIGNATURE_LIMIT,
 ): Promise<ScoutCandidateStats | null> {
   let walletPubKey: PublicKey;
   try {
@@ -384,7 +592,7 @@ async function evaluateWhaleCandidate(
     return null;
   }
 
-  const signatures = await connection.getSignaturesForAddress(walletPubKey, { limit: env.SCOUT_WHALE_SIGNATURE_LIMIT });
+  const signatures = await connection.getSignaturesForAddress(walletPubKey, { limit: signatureLimit });
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   let estimatedVolumeUsd = 0;
   let qualifyingTradeCount = 0;
@@ -441,8 +649,70 @@ async function evaluateWhaleCandidate(
   };
 }
 
+async function buildScoutSeeds(tokens: Array<DexBoostToken & { tokenAddress: string }>): Promise<ScoutSeedCandidate[]> {
+  const scoutSeeds: ScoutSeedCandidate[] = [];
+
+  for (const token of tokens) {
+    const mintAddress = token.tokenAddress;
+    const migratedSeed = await checkMigratedScoutSeed(mintAddress);
+    if (!migratedSeed.eligible) {
+      console.log(`[SCOUT] Ueberspringe Seed ${mintAddress}: ${migratedSeed.reason}.`);
+      updateRuntimeStatus('scout', {
+        lastSkippedSeedToken: mintAddress,
+        lastSkippedSeedReason: migratedSeed.reason,
+      });
+      continue;
+    }
+
+    let bestPair: DexPairSummary | null = null;
+    try {
+      bestPair = pickBestScoutSeedPair(mintAddress, await dexscreenerClient.searchTokenPairs(mintAddress));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`[SCOUT] Seed-Marktcheck fuer ${mintAddress} fehlgeschlagen: ${message}`);
+    }
+
+    const scoutSeed: ScoutSeedCandidate = {
+      mintAddress,
+      reason: migratedSeed.reason,
+      boostWeight: getBoostWeight(token),
+      marketVolume24hUsd: getPairVolume24hUsd(bestPair),
+      marketLiquidityUsd: getPairLiquidityUsd(bestPair),
+      marketTxCount24h: getPairTxCount24h(bestPair),
+      highVolumeEligible: false,
+    };
+    scoutSeed.highVolumeEligible = qualifiesAsHighVolumeSeed(scoutSeed);
+    scoutSeeds.push(scoutSeed);
+  }
+
+  return scoutSeeds.sort((left, right) => {
+    if (left.highVolumeEligible !== right.highVolumeEligible) {
+      return Number(right.highVolumeEligible) - Number(left.highVolumeEligible);
+    }
+
+    const volumeDiff = right.marketVolume24hUsd - left.marketVolume24hUsd;
+    if (volumeDiff !== 0) {
+      return volumeDiff;
+    }
+
+    const liquidityDiff = right.marketLiquidityUsd - left.marketLiquidityUsd;
+    if (liquidityDiff !== 0) {
+      return liquidityDiff;
+    }
+
+    const txDiff = right.marketTxCount24h - left.marketTxCount24h;
+    if (txDiff !== 0) {
+      return txDiff;
+    }
+
+    return right.boostWeight - left.boostWeight;
+  });
+}
+
 async function scout() {
   console.log('[SCOUT] Starte Whale-Suche ueber migrierte Seed-Tokens...');
+  const rejectedCandidates = readRejectedCandidateStore();
+  let rejectedCandidatesDirty = pruneRejectedCandidateStore(rejectedCandidates);
   updateRuntimeStatus('scout', {
     lastRunAt: new Date().toISOString(),
     state: 'running',
@@ -463,7 +733,7 @@ async function scout() {
     const boostedSolanaTokens = tokens
       .filter((token): token is DexBoostToken & { tokenAddress: string } => token.chainId === 'solana' && isLikelySolanaMintAddress(token.tokenAddress))
       .sort((left, right) => getBoostWeight(right) - getBoostWeight(left))
-      .slice(0, env.SCOUT_BOOST_TOKEN_LIMIT);
+      .slice(0, env.SCOUT_BOOST_SCAN_LIMIT);
 
     if (boostedSolanaTokens.length === 0) {
       updateRuntimeStatus('scout', {
@@ -474,6 +744,30 @@ async function scout() {
       });
       return;
     }
+
+    const migratedScoutSeeds = await buildScoutSeeds(boostedSolanaTokens);
+    const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
+    const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && migratedScoutSeeds.length > 0;
+    const scoutSeeds = (usingFallbackSeeds ? migratedScoutSeeds : highVolumeScoutSeeds)
+      .slice(0, env.SCOUT_BOOST_TOKEN_LIMIT);
+
+    if (migratedScoutSeeds.length === 0) {
+      console.log('[SCOUT] Keine migrierten Seeds mit Marktinformationen verfuegbar.');
+      updateRuntimeStatus('scout', {
+        state: 'idle',
+        lastSuccessAt: new Date().toISOString(),
+        lastAddedCount: 0,
+        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        migratedSeedCount: 0,
+        highVolumeSeedCount: 0,
+      });
+      return;
+    }
+
+    if (usingFallbackSeeds) {
+      console.warn(`[SCOUT] Kein migrierter Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze beste verfuegbare Seeds als Fallback.`);
+    }
+
     const currentWhales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
     const knownWhales = new Set(currentWhales.map((whale) => whale.address));
     const evaluatedCandidates = new Set<string>();
@@ -495,32 +789,27 @@ async function scout() {
     }
 
     let addedCount = 0;
-    let migratedSeedCount = 0;
+    let cooldownSkippedCandidates = 0;
+    const migratedSeedCount = migratedScoutSeeds.length;
+    const highVolumeSeedCount = highVolumeScoutSeeds.length;
 
-    for (const token of boostedSolanaTokens) {
+    for (const seed of scoutSeeds) {
       if (addedCount >= MAX_NEW_WHALES_PER_RUN || evaluatedCandidates.size >= MAX_CANDIDATES_PER_RUN) {
         break;
       }
 
-      const mintAddress = token.tokenAddress;
-      const migratedSeed = await checkMigratedScoutSeed(mintAddress);
-      if (!migratedSeed.eligible) {
-        console.log(`[SCOUT] Ueberspringe Seed ${mintAddress}: ${migratedSeed.reason}.`);
-        updateRuntimeStatus('scout', {
-          lastSkippedSeedToken: mintAddress,
-          lastSkippedSeedReason: migratedSeed.reason,
-        });
-        continue;
-      }
-
-      migratedSeedCount += 1;
+      const mintAddress = seed.mintAddress;
       updateRuntimeStatus('scout', {
         lastToken: mintAddress,
         lastMigratedSeedToken: mintAddress,
-        lastMigratedSeedReason: migratedSeed.reason,
+        lastMigratedSeedReason: seed.reason,
+        lastSeedMarketVolumeUsd: Math.round(seed.marketVolume24hUsd),
+        lastSeedMarketLiquidityUsd: Math.round(seed.marketLiquidityUsd),
+        lastSeedMarketTxCount: seed.marketTxCount24h,
       });
 
-      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} (${migratedSeed.reason})...`);
+      const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} (${seed.reason}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
       const topTokenTraders = await collectTopTokenTraders(connection, mintAddress, solUsdPrice);
 
       for (let traderIndex = 0; traderIndex < topTokenTraders.length; traderIndex += 1) {
@@ -531,18 +820,49 @@ async function scout() {
 
         const walletAddress = trader.walletAddress;
 
-        if (knownWhales.has(walletAddress) || evaluatedCandidates.has(walletAddress)) {
+        if (knownWhales.has(walletAddress)) {
+          continue;
+        }
+
+        if (isCandidateCoolingDown(rejectedCandidates, walletAddress)) {
+          cooldownSkippedCandidates += 1;
+          evaluatedCandidates.add(walletAddress);
+          continue;
+        }
+
+        if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
+          console.log(`[SCOUT] Ueberspringe ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} unter Mindestwert $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}.`);
+          continue;
+        }
+
+        if (evaluatedCandidates.has(walletAddress)) {
           continue;
         }
 
         evaluatedCandidates.add(walletAddress);
-        const candidateStats = await evaluateWhaleCandidate(connection, walletAddress, solUsdPrice);
-        if (!candidateStats) {
+        const quickStats = await evaluateWhaleCandidate(connection, walletAddress, solUsdPrice);
+        if (!quickStats) {
           continue;
         }
 
+        let candidateStats = quickStats;
+        if (!qualifiesAsEstablishedWhale(candidateStats)
+          && env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT > env.SCOUT_WHALE_SIGNATURE_LIMIT
+          && shouldDeepScanCandidate(candidateStats, trader)) {
+          console.log(`[SCOUT] Vertiefe Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Quick-Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
+          candidateStats = await evaluateWhaleCandidate(
+            connection,
+            walletAddress,
+            solUsdPrice,
+            env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT,
+          ) ?? candidateStats;
+        }
+
         if (!qualifiesAsEstablishedWhale(candidateStats)) {
-          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}.`);
+          const rejectReason = buildWhaleRejectReason(candidateStats);
+          rememberRejectedCandidate(rejectedCandidates, walletAddress, rejectReason, candidateStats, mintAddress, trader);
+          rejectedCandidatesDirty = true;
+          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount} (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
           continue;
         }
 
@@ -559,7 +879,7 @@ async function scout() {
           distinctTokenCount: candidateStats.distinctTokenCount,
           lastScoutedAt: discoveredAt,
           lastScoutedToken: mintAddress,
-          lastScoutedReason: migratedSeed.reason,
+          lastScoutedReason: seed.reason,
           seedTraderRank: traderIndex + 1,
           seedTokenVolumeUsd: Math.round(trader.tokenVolumeUsd),
           seedTokenTradeCount: trader.tokenTradeCount,
@@ -567,10 +887,11 @@ async function scout() {
 
         currentWhales.push(newWhale);
         knownWhales.add(walletAddress);
+        rejectedCandidatesDirty = clearRejectedCandidate(rejectedCandidates, walletAddress) || rejectedCandidatesDirty;
         addedCount += 1;
 
         console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${candidateStats.estimatedVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
-        await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${migratedSeed.reason})\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
+        await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${seed.reason})\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
           dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
           cooldownMs: 24 * 60 * 60 * 1000,
         });
@@ -589,9 +910,16 @@ async function scout() {
       lastSuccessAt: new Date().toISOString(),
       lastAddedCount: addedCount,
       whaleCount: currentWhales.length,
-      lastToken: boostedSolanaTokens[0]?.tokenAddress,
+      lastToken: scoutSeeds[0]?.mintAddress,
       lastEvaluatedCandidates: evaluatedCandidates.size,
+      cooldownSkippedCandidates,
       migratedSeedCount,
+      highVolumeSeedCount,
+      usingFallbackSeeds,
+      minSeedVolumeUsd: env.SCOUT_MIN_SEED_VOLUME_USD,
+      minSeedLiquidityUsd: env.SCOUT_MIN_SEED_LIQUIDITY_USD,
+      minSeedTxCount: env.SCOUT_MIN_SEED_TX_COUNT,
+      minSeedTraderVolumeUsd: env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
       minWhaleVolumeUsd: env.SCOUT_MIN_WHALE_VOLUME_USD,
     });
 
@@ -602,6 +930,10 @@ async function scout() {
       lastErrorAt: new Date().toISOString(),
       lastError: e.message,
     });
+  } finally {
+    if (rejectedCandidatesDirty) {
+      writeRejectedCandidateStore(rejectedCandidates);
+    }
   }
 }
 
