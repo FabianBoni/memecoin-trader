@@ -90,10 +90,10 @@ const envSchema = z.object({
   SCOUT_MIN_SEED_LIQUIDITY_USD: z.coerce.number().nonnegative().default(25000),
   SCOUT_MIN_SEED_TX_COUNT: z.coerce.number().int().nonnegative().default(100),
   SCOUT_MIN_SEED_TRADER_VOLUME_USD: z.coerce.number().nonnegative().default(1000),
-  SCOUT_PARSED_TX_BATCH_SIZE: z.coerce.number().int().positive().default(25),
-  SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT: z.coerce.number().int().positive().default(100),
+  SCOUT_PARSED_TX_BATCH_SIZE: z.coerce.number().int().positive().default(12),
+  SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT: z.coerce.number().int().positive().default(50),
   SCOUT_TOKEN_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(8),
-  SCOUT_TOKEN_SIGNATURE_SCAN_CAP: z.coerce.number().int().positive().default(250),
+  SCOUT_TOKEN_SIGNATURE_SCAN_CAP: z.coerce.number().int().positive().default(150),
   SCOUT_WHALE_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(20),
   SCOUT_WHALE_DEEP_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(120),
   SCOUT_WHALE_LOOKBACK_HOURS: z.coerce.number().int().positive().default(24),
@@ -101,6 +101,7 @@ const envSchema = z.object({
   SCOUT_MIN_WHALE_VOLUME_USD: z.coerce.number().nonnegative().default(50000),
   SCOUT_MIN_WHALE_TX_COUNT: z.coerce.number().int().positive().default(8),
   SCOUT_MIN_WHALE_DISTINCT_TOKENS: z.coerce.number().int().positive().default(3),
+  SCOUT_RATE_LIMIT_COOLDOWN_MS: z.coerce.number().int().nonnegative().default(4000),
   SCOUT_REJECT_COOLDOWN_MINUTES: z.coerce.number().int().positive().default(180),
   REQUIRE_EXPLICIT_GO: z
     .string()
