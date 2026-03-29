@@ -212,6 +212,26 @@ const getWhales = (): WhaleRecord[] => {
   }
 };
 
+function getTrackedWhale(address: string): WhaleRecord | null {
+  return getWhales().find((whale) => whale.address === address) ?? null;
+}
+
+async function removeTrackedWhaleSubscription(address: string, reason: string) {
+  const subscriptionId = whaleLogSubscriptions.get(address);
+  if (subscriptionId === undefined) {
+    return;
+  }
+
+  try {
+    await connection.removeOnLogsListener(subscriptionId);
+  } catch (error) {
+    console.warn(`[TRACKER] Konnte stale Subscription fuer ${address.slice(0,8)} nicht sauber entfernen:`, error);
+  }
+
+  whaleLogSubscriptions.delete(address);
+  console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt (${reason}).`);
+}
+
 function readPaperTrades(): Record<string, PaperTradeRecord> {
   return readJsonFileSync(PAPER_TRADES_PATH, {});
 }
@@ -1220,6 +1240,11 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
     }
 
     wasHandled = true;
+    const currentWhale = getTrackedWhale(whale.address);
+    if (!currentWhale) {
+      await removeTrackedWhaleSubscription(whale.address, 'whale deleted');
+      return;
+    }
 
     try {
       if (fs.existsSync(ACTIVE_TRADES_PATH) || fs.existsSync(PAPER_TRADES_PATH)) {
@@ -1228,12 +1253,12 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
         const trackedMints = new Set<string>();
 
         for (const [mint, tradeData] of Object.entries(activeTrades)) {
-          if (typeof tradeData === 'string' && tradeData === whale.address) {
+          if (typeof tradeData === 'string' && tradeData === currentWhale.address) {
             trackedMints.add(mint);
             continue;
           }
 
-          if (tradeData && typeof tradeData === 'object' && tradeData.whale === whale.address) {
+          if (tradeData && typeof tradeData === 'object' && tradeData.whale === currentWhale.address) {
             trackedMints.add(mint);
           }
         }
@@ -1243,17 +1268,17 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
             continue;
           }
 
-          if (trade.whale === whale.address && typeof trade.mint === 'string') {
+          if (trade.whale === currentWhale.address && typeof trade.mint === 'string') {
             trackedMints.add(trade.mint);
           }
         }
 
         if (trackedMints.size > 0) {
           const tokenSold = tx.meta?.preTokenBalances?.find((pre) => {
-            if (pre.owner !== whale.address) return false;
+            if (pre.owner !== currentWhale.address) return false;
             if (!trackedMints.has(pre.mint)) return false;
 
-            const post = tx.meta?.postTokenBalances?.find((p) => p.mint === pre.mint && p.owner === whale.address);
+            const post = tx.meta?.postTokenBalances?.find((p) => p.mint === pre.mint && p.owner === currentWhale.address);
             const preAmt = Number(pre.uiTokenAmount.uiAmount);
             const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
             return preAmt > postAmt && preAmt > 0;
@@ -1265,37 +1290,37 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
             const postAmt = post ? Number(post.uiTokenAmount.uiAmount) : 0;
             const soldFractionPct = preAmt > 0 ? Math.min(100, Math.max(0, ((preAmt - postAmt) / preAmt) * 100)) : 100;
 
-            if (!markWhaleSignalProcessed(whale.address, tokenSold.mint, 'sell')) {
-              console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${whale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
+            if (!markWhaleSignalProcessed(currentWhale.address, tokenSold.mint, 'sell')) {
+              console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${currentWhale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
               return;
             }
 
             appendWhaleActivity({
-              whale: whale.address,
+              whale: currentWhale.address,
               mint: tokenSold.mint,
               side: 'sell',
               detectedAt: new Date().toISOString(),
               signature,
-              botMode: whale.mode,
+              botMode: currentWhale.mode,
             });
-            await executePanicSell(whale, tokenSold.mint, soldFractionPct);
+            await executePanicSell(currentWhale, tokenSold.mint, soldFractionPct);
             return;
           }
         }
       }
     } catch (err) {
-      console.log(`Fehler beim Panik-Check fuer ${whale.address.slice(0,8)}.`);
+      console.log(`Fehler beim Panik-Check fuer ${currentWhale.address.slice(0,8)}.`);
     }
 
     const tokenChange = tx.meta?.postTokenBalances?.find((balance) =>
-      balance.owner === whale.address && balance.mint !== SOL_MINT,
+      balance.owner === currentWhale.address && balance.mint !== SOL_MINT,
     );
 
     if (!tokenChange) {
       return;
     }
 
-    const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === whale.address && balance.mint === tokenChange.mint);
+    const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === currentWhale.address && balance.mint === tokenChange.mint);
     const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
     const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
 
@@ -1303,21 +1328,21 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       return;
     }
 
-    if (!markWhaleSignalProcessed(whale.address, tokenChange.mint, 'buy')) {
-      console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${whale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
+    if (!markWhaleSignalProcessed(currentWhale.address, tokenChange.mint, 'buy')) {
+      console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${currentWhale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
       return;
     }
 
-    console.log(`[TREFFER] Wal ${whale.address} hat Token gekauft: ${tokenChange.mint}`);
+    console.log(`[TREFFER] Wal ${currentWhale.address} hat Token gekauft: ${tokenChange.mint}`);
     appendWhaleActivity({
-      whale: whale.address,
+      whale: currentWhale.address,
       mint: tokenChange.mint,
       side: 'buy',
       detectedAt: new Date().toISOString(),
       signature,
-      botMode: whale.mode,
+      botMode: currentWhale.mode,
     });
-    await logDecision(whale, tokenChange.mint, tx, signature);
+    await logDecision(currentWhale, tokenChange.mint, tx, signature);
   } finally {
     finalizeSignatureProcessing(signature, wasHandled);
   }
