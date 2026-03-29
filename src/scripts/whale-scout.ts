@@ -1454,6 +1454,11 @@ async function collectTopTokenTraders(
     const fallbackSeedTraderCount = [...traderStats.values()]
       .filter((trader) => trader.tokenVolumeUsd >= fallbackSeedTraderFloor)
       .length;
+    if (scanAddress !== mintAddress && scannedSignatures >= initialSignatureTarget && traderStats.size === 0) {
+      console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} blieb nach ${scannedSignatures} Signaturen ohne Trader. Wechsle frueh auf Mint-Scan ${mintAddress.slice(0, 8)}.`);
+      break;
+    }
+
     if (scannedSignatures >= initialSignatureTarget && qualifiedSeedTraderCount >= TOP_TRADERS_PER_TOKEN) {
       break;
     }
@@ -1461,8 +1466,10 @@ async function collectTopTokenTraders(
     const usingExtendedHighVolumeScan = signatureScanCap > env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     const coveredBaseSeedWindow = scannedSignatures >= env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     if (usingExtendedHighVolumeScan && coveredBaseSeedWindow) {
-      if (qualifiedSeedTraderCount >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT) {
-        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} reichen fuer die Kandidatenpruefung.`);
+      const enoughTraderCandidates = traderStats.size >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
+
+      if (qualifiedSeedTraderCount > 0 && enoughTraderCandidates) {
+        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} und ${traderStats.size} Trader insgesamt reichen fuer die Kandidatenpruefung.`);
         break;
       }
 
