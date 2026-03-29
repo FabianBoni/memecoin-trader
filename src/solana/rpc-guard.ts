@@ -15,6 +15,10 @@ export function isSolanaRpcRateLimitError(error: unknown): boolean {
     || message.includes('status 429')
     || message.includes('status: 429')
     || message.includes('rate limited')
+    || message.includes('compute units per second capacity')
+    || message.includes('exceeded its compute units')
+    || message.includes('failed to get transactions: your app has exceeded')
+    || message.includes('alchemy.com/reference/throughput')
     || message.includes('code":-32429')
     || message.includes('error code: 429');
 }
