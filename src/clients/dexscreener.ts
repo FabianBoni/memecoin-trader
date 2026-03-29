@@ -13,8 +13,7 @@ export class DexscreenerClient {
     this.baseUrl = baseUrl.replace(/\/$/, "");
   }
 
-  async searchTokenPairs(tokenAddress: string): Promise<DexPairSummary[]> {
-    const url = `${this.baseUrl}/dex/tokens/${encodeURIComponent(tokenAddress)}`;
+  private async fetchPairs(url: string): Promise<DexPairSummary[]> {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
     });
@@ -25,5 +24,15 @@ export class DexscreenerClient {
 
     const payload = (await response.json()) as DexscreenerResponse;
     return payload.pairs ?? [];
+  }
+
+  async searchTokenPairs(tokenAddress: string): Promise<DexPairSummary[]> {
+    const url = `${this.baseUrl}/dex/tokens/${encodeURIComponent(tokenAddress)}`;
+    return this.fetchPairs(url);
+  }
+
+  async searchPairs(query: string): Promise<DexPairSummary[]> {
+    const url = `${this.baseUrl}/dex/search?q=${encodeURIComponent(query)}`;
+    return this.fetchPairs(url);
   }
 }

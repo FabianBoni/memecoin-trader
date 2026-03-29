@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { env, getReadOnlyRpcUrl } from '../config/env.js';
 import { DexscreenerClient } from '../clients/dexscreener.js';
 import { LiquidityScreenService } from '../services/liquidity-screen.js';
+import { withRpcRetry } from '../solana/rpc-guard.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
@@ -23,6 +24,7 @@ const MAX_CANDIDATES_PER_RUN = 12;
 const TOP_TRADERS_PER_TOKEN = 10;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_SOL_USD_FALLBACK = 100;
+const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 
@@ -33,6 +35,17 @@ type DexBoostToken = {
   tokenAddress?: string;
   amount?: number;
   totalAmount?: number;
+};
+
+type ScoutSeedSource = 'boost' | 'market' | 'boost+market';
+
+type RawScoutSeedInput = {
+  tokenAddress: string;
+  boostWeight: number;
+  source: ScoutSeedSource;
+  sourceMarketVolume24hUsd: number;
+  sourceMarketLiquidityUsd: number;
+  sourceMarketTxCount24h: number;
 };
 
 type ScoutCandidateStats = {
@@ -46,6 +59,7 @@ type ScoutCandidateStats = {
 type MigratedSeedCheck = {
   eligible: boolean;
   reason: string;
+  scanAddress?: string;
 };
 
 type SeedTraderCandidate = {
@@ -57,6 +71,8 @@ type SeedTraderCandidate = {
 
 type ScoutSeedCandidate = {
   mintAddress: string;
+  scanAddress: string;
+  source: ScoutSeedSource;
   reason: string;
   boostWeight: number;
   marketVolume24hUsd: number;
@@ -81,6 +97,36 @@ type RejectedScoutCandidateStore = Record<string, RejectedScoutCandidateRecord>;
 
 // Hilfsfunktion für Pausen
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function getSignaturesForAddressWithRetry(
+  connection: Connection,
+  address: PublicKey,
+  options: Parameters<Connection['getSignaturesForAddress']>[1],
+) {
+  return withRpcRetry(
+    () => connection.getSignaturesForAddress(address, options),
+    {
+      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[SCOUT] RPC Retry getSignaturesForAddress ${address.toBase58().slice(0, 8)} in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+      },
+    },
+  );
+}
+
+async function getParsedTransactionWithRetry(connection: Connection, signature: string) {
+  return withRpcRetry(
+    () => connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+    }),
+    {
+      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[SCOUT] RPC Retry getParsedTransaction ${signature.slice(0, 8)} in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+      },
+    },
+  );
+}
 
 function isLikelySolanaMintAddress(value: unknown): value is string {
   if (typeof value !== 'string') {
@@ -168,6 +214,79 @@ function getPairTxCount24h(pair: DexPairSummary | null | undefined): number {
   return Math.max(0, Math.round(toFiniteNumber(pair.txns?.h24?.buys) + toFiniteNumber(pair.txns?.h24?.sells)));
 }
 
+function compareSeedMarketQuality(
+  left: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
+  right: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
+): number {
+  const volumeDiff = right.sourceMarketVolume24hUsd - left.sourceMarketVolume24hUsd;
+  if (volumeDiff !== 0) {
+    return volumeDiff;
+  }
+
+  const liquidityDiff = right.sourceMarketLiquidityUsd - left.sourceMarketLiquidityUsd;
+  if (liquidityDiff !== 0) {
+    return liquidityDiff;
+  }
+
+  const txDiff = right.sourceMarketTxCount24h - left.sourceMarketTxCount24h;
+  if (txDiff !== 0) {
+    return txDiff;
+  }
+
+  return right.boostWeight - left.boostWeight;
+}
+
+function getScoutSeedSourceLabel(hasBoost: boolean, hasMarket: boolean): ScoutSeedSource {
+  if (hasBoost && hasMarket) {
+    return 'boost+market';
+  }
+
+  if (hasMarket) {
+    return 'market';
+  }
+
+  return 'boost';
+}
+
+function getNonSolTokenAddress(pair: DexPairSummary): string | null {
+  const baseAddress = pair.baseToken?.address;
+  const quoteAddress = pair.quoteToken?.address;
+
+  if (baseAddress && baseAddress !== SOL_MINT && quoteAddress === SOL_MINT) {
+    return baseAddress;
+  }
+
+  if (quoteAddress && quoteAddress !== SOL_MINT && baseAddress === SOL_MINT) {
+    return quoteAddress;
+  }
+
+  if (baseAddress && baseAddress !== SOL_MINT) {
+    return baseAddress;
+  }
+
+  if (quoteAddress && quoteAddress !== SOL_MINT) {
+    return quoteAddress;
+  }
+
+  return null;
+}
+
+function isPumpSwapMarketSeedPair(pair: DexPairSummary): boolean {
+  return pair.chainId === 'solana'
+    && (pair.dexId === 'pumpswap' || pair.dexId === 'pumpfun-amm')
+    && typeof pair.pairAddress === 'string'
+    && pair.pairAddress.trim().length > 0
+    && getNonSolTokenAddress(pair) !== null;
+}
+
+function qualifiesAsHighVolumeRawSeed(input: RawScoutSeedInput): boolean {
+  return qualifiesAsHighVolumeSeed({
+    marketVolume24hUsd: input.sourceMarketVolume24hUsd,
+    marketLiquidityUsd: input.sourceMarketLiquidityUsd,
+    marketTxCount24h: input.sourceMarketTxCount24h,
+  });
+}
+
 function isScoutPairMatch(pair: DexPairSummary, mintAddress: string): boolean {
   return pair.chainId === 'solana'
     && (pair.baseToken?.address === mintAddress || pair.quoteToken?.address === mintAddress);
@@ -198,6 +317,103 @@ function qualifiesAsHighVolumeSeed(seed: Pick<ScoutSeedCandidate, 'marketVolume2
   return seed.marketVolume24hUsd >= env.SCOUT_MIN_SEED_VOLUME_USD
     && seed.marketLiquidityUsd >= env.SCOUT_MIN_SEED_LIQUIDITY_USD
     && seed.marketTxCount24h >= env.SCOUT_MIN_SEED_TX_COUNT;
+}
+
+async function fetchBoostScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
+  const response = await fetch('https://api.dexscreener.com/token-boosts/latest/v1');
+  if (!response.ok) {
+    throw new Error(`Dexscreener token boosts request failed with ${response.status}`);
+  }
+
+  const rawTokens = await response.json();
+  const tokens = Array.isArray(rawTokens) ? rawTokens as DexBoostToken[] : [];
+
+  return tokens
+    .filter((token): token is DexBoostToken & { tokenAddress: string } => token.chainId === 'solana' && isLikelySolanaMintAddress(token.tokenAddress))
+    .sort((left, right) => getBoostWeight(right) - getBoostWeight(left))
+    .slice(0, env.SCOUT_BOOST_SCAN_LIMIT)
+    .map((token) => ({
+      tokenAddress: token.tokenAddress,
+      boostWeight: getBoostWeight(token),
+      source: 'boost' as const,
+      sourceMarketVolume24hUsd: 0,
+      sourceMarketLiquidityUsd: 0,
+      sourceMarketTxCount24h: 0,
+    }));
+}
+
+async function fetchMarketScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
+  const marketQueries = ['pump', 'pumpswap'];
+  const settledResults = await Promise.allSettled(marketQueries.map((query) => dexscreenerClient.searchPairs(query)));
+  const candidates = new Map<string, RawScoutSeedInput>();
+
+  for (const result of settledResults) {
+    if (result.status !== 'fulfilled') {
+      const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      console.warn(`[SCOUT] Dexscreener Markt-Seed-Suche fehlgeschlagen: ${message}`);
+      continue;
+    }
+
+    for (const pair of result.value) {
+      if (!isPumpSwapMarketSeedPair(pair)) {
+        continue;
+      }
+
+      const tokenAddress = getNonSolTokenAddress(pair);
+      if (!tokenAddress || !isLikelySolanaMintAddress(tokenAddress)) {
+        continue;
+      }
+
+      const nextCandidate: RawScoutSeedInput = {
+        tokenAddress,
+        boostWeight: 0,
+        source: 'market',
+        sourceMarketVolume24hUsd: getPairVolume24hUsd(pair),
+        sourceMarketLiquidityUsd: getPairLiquidityUsd(pair),
+        sourceMarketTxCount24h: getPairTxCount24h(pair),
+      };
+      const existing = candidates.get(tokenAddress);
+      if (!existing || compareSeedMarketQuality(existing, nextCandidate) > 0) {
+        candidates.set(tokenAddress, nextCandidate);
+      }
+    }
+  }
+
+  const rankedCandidates = [...candidates.values()].sort(compareSeedMarketQuality);
+  const highVolumeCandidates = rankedCandidates.filter(qualifiesAsHighVolumeRawSeed);
+  return (highVolumeCandidates.length > 0 ? highVolumeCandidates : rankedCandidates)
+    .slice(0, env.SCOUT_MARKET_TOKEN_LIMIT);
+}
+
+function mergeScoutSeedInputs(
+  boostInputs: RawScoutSeedInput[],
+  marketInputs: RawScoutSeedInput[],
+): RawScoutSeedInput[] {
+  const mergedInputs = new Map<string, RawScoutSeedInput>();
+
+  for (const input of [...boostInputs, ...marketInputs]) {
+    const existing = mergedInputs.get(input.tokenAddress);
+    if (!existing) {
+      mergedInputs.set(input.tokenAddress, { ...input });
+      continue;
+    }
+
+    const merged: RawScoutSeedInput = {
+      tokenAddress: input.tokenAddress,
+      boostWeight: Math.max(existing.boostWeight, input.boostWeight),
+      source: getScoutSeedSourceLabel(
+        existing.source === 'boost' || existing.source === 'boost+market' || input.source === 'boost' || input.source === 'boost+market',
+        existing.source === 'market' || existing.source === 'boost+market' || input.source === 'market' || input.source === 'boost+market',
+      ),
+      sourceMarketVolume24hUsd: Math.max(existing.sourceMarketVolume24hUsd, input.sourceMarketVolume24hUsd),
+      sourceMarketLiquidityUsd: Math.max(existing.sourceMarketLiquidityUsd, input.sourceMarketLiquidityUsd),
+      sourceMarketTxCount24h: Math.max(existing.sourceMarketTxCount24h, input.sourceMarketTxCount24h),
+    };
+
+    mergedInputs.set(input.tokenAddress, merged);
+  }
+
+  return [...mergedInputs.values()].sort(compareSeedMarketQuality);
 }
 
 function normalizeRejectedCandidateStore(input: unknown): RejectedScoutCandidateStore {
@@ -468,11 +684,13 @@ async function checkMigratedScoutSeed(mintAddress: string): Promise<MigratedSeed
     const liquidity = await liquidityScreenService.screenLiquidity(mintAddress);
     const pumpStatus = liquidity.pumpFun?.status;
     const hasAmmEvidence = Boolean(liquidity.pool?.pairAddress) || liquidity.pumpFun?.canonicalPoolDetected === true;
+    const scanAddress = liquidity.pool?.pairAddress ?? liquidity.pumpFun?.canonicalPoolAddress ?? mintAddress;
 
     if (pumpStatus === 'migrated' && hasAmmEvidence) {
       return {
         eligible: true,
         reason: liquidity.pool?.dexId ?? 'pumpfun-migrated',
+        scanAddress,
       };
     }
 
@@ -505,64 +723,93 @@ async function checkMigratedScoutSeed(mintAddress: string): Promise<MigratedSeed
 async function collectTopTokenTraders(
   connection: Connection,
   mintAddress: string,
+  scanAddress: string,
   solUsdPrice: number,
 ): Promise<SeedTraderCandidate[]> {
-  const mintPubKey = new PublicKey(mintAddress);
-  const signatureLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
-  const signatures = await connection.getSignaturesForAddress(mintPubKey, { limit: signatureLimit });
+  const scanPubKey = new PublicKey(scanAddress);
+  const initialSignatureTarget = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
+  const signatureBatchLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT, initialSignatureTarget);
+  const signatureScanCap = Math.max(env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP, initialSignatureTarget);
+  const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   const traderStats = new Map<string, SeedTraderCandidate>();
+  let beforeSignature: string | undefined;
+  let scannedSignatures = 0;
+  let reachedCutoff = false;
 
-  for (const signature of signatures) {
-    try {
-      const tx = await connection.getParsedTransaction(signature.signature, {
-        maxSupportedTransactionVersion: 0,
-      });
-      if (!tx || tx.meta?.err) {
-        await sleep(250);
-        continue;
-      }
+  while (scannedSignatures < signatureScanCap && !reachedCutoff) {
+    const remaining = signatureScanCap - scannedSignatures;
+    const batchLimit = Math.min(signatureBatchLimit, remaining);
+    const signatures = await getSignaturesForAddressWithRetry(connection, scanPubKey, {
+      limit: batchLimit,
+      ...(beforeSignature ? { before: beforeSignature } : {}),
+    });
 
-      const signerAddress = getSignerAddress(tx);
-      if (!signerAddress) {
-        await sleep(250);
-        continue;
-      }
-
-      const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
-      if (tokenRawDelta === 0n) {
-        await sleep(250);
-        continue;
-      }
-
-      const solDelta = getWalletNativeSolDelta(tx, signerAddress);
-      const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
-      if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
-        await sleep(250);
-        continue;
-      }
-
-      const existing = traderStats.get(signerAddress) ?? {
-        walletAddress: signerAddress,
-        tokenVolumeUsd: 0,
-        tokenTradeCount: 0,
-      };
-
-      existing.tokenVolumeUsd += tradeVolumeUsd;
-      existing.tokenTradeCount += 1;
-      if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
-        existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
-      }
-
-      traderStats.set(signerAddress, existing);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.log(`[SCOUT] Ueberspringe Kandidaten-TX ${signature.signature.slice(0, 8)} wegen Fehler: ${message}`);
+    if (signatures.length === 0) {
+      break;
     }
 
-    await sleep(250);
+    for (const signature of signatures) {
+      scannedSignatures += 1;
+      if (typeof signature.blockTime === 'number' && signature.blockTime < cutoffTimestampSec) {
+        reachedCutoff = true;
+        break;
+      }
+
+      try {
+        const tx = await getParsedTransactionWithRetry(connection, signature.signature);
+        if (!tx || tx.meta?.err) {
+          continue;
+        }
+
+        const signerAddress = getSignerAddress(tx);
+        if (!signerAddress) {
+          continue;
+        }
+
+        const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
+        if (tokenRawDelta === 0n) {
+          continue;
+        }
+
+        const solDelta = getWalletNativeSolDelta(tx, signerAddress);
+        const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+        if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
+          continue;
+        }
+
+        const existing = traderStats.get(signerAddress) ?? {
+          walletAddress: signerAddress,
+          tokenVolumeUsd: 0,
+          tokenTradeCount: 0,
+        };
+
+        existing.tokenVolumeUsd += tradeVolumeUsd;
+        existing.tokenTradeCount += 1;
+        if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
+          existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+        }
+
+        traderStats.set(signerAddress, existing);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.log(`[SCOUT] Ueberspringe Kandidaten-TX ${signature.signature.slice(0, 8)} wegen Fehler: ${message}`);
+      }
+    }
+
+    beforeSignature = signatures.at(-1)?.signature;
+    const qualifiedSeedTraderCount = [...traderStats.values()]
+      .filter((trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD)
+      .length;
+    if (scannedSignatures >= initialSignatureTarget && qualifiedSeedTraderCount >= TOP_TRADERS_PER_TOKEN) {
+      break;
+    }
+
+    if (signatures.length < batchLimit || !beforeSignature) {
+      break;
+    }
   }
 
-  return [...traderStats.values()]
+  const rankedTraders = [...traderStats.values()]
     .sort((left, right) => {
       const volumeDiff = right.tokenVolumeUsd - left.tokenVolumeUsd;
       if (volumeDiff !== 0) {
@@ -575,8 +822,14 @@ async function collectTopTokenTraders(
       }
 
       return Date.parse(right.lastTradeAt ?? '0') - Date.parse(left.lastTradeAt ?? '0');
-    })
-    .slice(0, TOP_TRADERS_PER_TOKEN);
+    });
+
+  const qualifiedSeedTraderCount = rankedTraders.filter(
+    (trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
+  ).length;
+  console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}: ${scannedSignatures} Signaturen, ${rankedTraders.length} Trader, ${qualifiedSeedTraderCount} >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}.`);
+
+  return rankedTraders.slice(0, TOP_TRADERS_PER_TOKEN);
 }
 
 async function evaluateWhaleCandidate(
@@ -649,11 +902,11 @@ async function evaluateWhaleCandidate(
   };
 }
 
-async function buildScoutSeeds(tokens: Array<DexBoostToken & { tokenAddress: string }>): Promise<ScoutSeedCandidate[]> {
+async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSeedCandidate[]> {
   const scoutSeeds: ScoutSeedCandidate[] = [];
 
-  for (const token of tokens) {
-    const mintAddress = token.tokenAddress;
+  for (const seedInput of seedInputs) {
+    const mintAddress = seedInput.tokenAddress;
     const migratedSeed = await checkMigratedScoutSeed(mintAddress);
     if (!migratedSeed.eligible) {
       console.log(`[SCOUT] Ueberspringe Seed ${mintAddress}: ${migratedSeed.reason}.`);
@@ -674,8 +927,10 @@ async function buildScoutSeeds(tokens: Array<DexBoostToken & { tokenAddress: str
 
     const scoutSeed: ScoutSeedCandidate = {
       mintAddress,
+      scanAddress: migratedSeed.scanAddress ?? mintAddress,
+      source: seedInput.source,
       reason: migratedSeed.reason,
-      boostWeight: getBoostWeight(token),
+      boostWeight: seedInput.boostWeight,
       marketVolume24hUsd: getPairVolume24hUsd(bestPair),
       marketLiquidityUsd: getPairLiquidityUsd(bestPair),
       marketTxCount24h: getPairTxCount24h(bestPair),
@@ -723,29 +978,25 @@ async function scout() {
       disableRetryOnRateLimit: true,
     });
 
-    const response = await fetch('https://api.dexscreener.com/token-boosts/latest/v1');
-    if (!response.ok) {
-      throw new Error(`Dexscreener token boosts request failed with ${response.status}`);
-    }
+    const [boostScoutSeedInputs, marketScoutSeedInputs] = await Promise.all([
+      fetchBoostScoutSeedInputs(),
+      fetchMarketScoutSeedInputs(),
+    ]);
+    const scoutSeedInputs = mergeScoutSeedInputs(boostScoutSeedInputs, marketScoutSeedInputs);
 
-    const rawTokens = await response.json();
-    const tokens = Array.isArray(rawTokens) ? rawTokens as DexBoostToken[] : [];
-    const boostedSolanaTokens = tokens
-      .filter((token): token is DexBoostToken & { tokenAddress: string } => token.chainId === 'solana' && isLikelySolanaMintAddress(token.tokenAddress))
-      .sort((left, right) => getBoostWeight(right) - getBoostWeight(left))
-      .slice(0, env.SCOUT_BOOST_SCAN_LIMIT);
-
-    if (boostedSolanaTokens.length === 0) {
+    if (scoutSeedInputs.length === 0) {
       updateRuntimeStatus('scout', {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
         whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        boostSeedInputCount: 0,
+        marketSeedInputCount: 0,
       });
       return;
     }
 
-    const migratedScoutSeeds = await buildScoutSeeds(boostedSolanaTokens);
+    const migratedScoutSeeds = await buildScoutSeeds(scoutSeedInputs);
     const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
     const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && migratedScoutSeeds.length > 0;
     const scoutSeeds = (usingFallbackSeeds ? migratedScoutSeeds : highVolumeScoutSeeds)
@@ -809,8 +1060,8 @@ async function scout() {
       });
 
       const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
-      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} (${seed.reason}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
-      const topTokenTraders = await collectTopTokenTraders(connection, mintAddress, solUsdPrice);
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
+      const topTokenTraders = await collectTopTokenTraders(connection, mintAddress, seed.scanAddress, solUsdPrice);
 
       for (let traderIndex = 0; traderIndex < topTokenTraders.length; traderIndex += 1) {
         const trader = topTokenTraders[traderIndex]!;
@@ -915,6 +1166,9 @@ async function scout() {
       cooldownSkippedCandidates,
       migratedSeedCount,
       highVolumeSeedCount,
+      boostSeedInputCount: boostScoutSeedInputs.length,
+      marketSeedInputCount: marketScoutSeedInputs.length,
+      mergedSeedInputCount: scoutSeedInputs.length,
       usingFallbackSeeds,
       minSeedVolumeUsd: env.SCOUT_MIN_SEED_VOLUME_USD,
       minSeedLiquidityUsd: env.SCOUT_MIN_SEED_LIQUIDITY_USD,
