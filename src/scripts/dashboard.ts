@@ -153,6 +153,16 @@ function resetAllPaperWhales() {
     resetPaperStats();
 }
 
+function resetAllWhales() {
+    writeJsonFileSync(WHALES_FILE, []);
+    writeWhaleStats({});
+    writeDataJSON('performance.json', {});
+    writeDataJSON('paper-performance.json', {});
+    writeDataJSON('paper-trades.json', {});
+    writeDataJSON('whale-activity.json', []);
+    whaleTransactionCache.clear();
+}
+
 function formatUsd(value: unknown): string {
     const parsed = Number(value);
     if (!Number.isFinite(parsed) || parsed <= 0) return 'n/a';
@@ -431,6 +441,11 @@ app.post('/actions/reset-paper-all', (_req, res) => {
     redirectWithMessage(res, { message: 'Alle Paper-Bewertungen, Discards und offenen Paper-Trades wurden zurueckgesetzt.' });
 });
 
+app.post('/actions/reset-whales-all', (_req, res) => {
+    resetAllWhales();
+    redirectWithMessage(res, { message: 'Alle Wale, Whale-Stats, Whale-Activity sowie Paper-Performance wurden geloescht. Aktive Live-Trades bleiben unberuehrt.' });
+});
+
 app.get('/whale/:address', async (req, res) => {
     const whaleAddress = String(req.params.address ?? '').trim();
     const whales = normalizeWhales(safeReadJSON('whales.json', []));
@@ -668,6 +683,9 @@ app.get('/', (req, res) => {
         <div class="flex flex-wrap items-center gap-3">
             <form method="POST" action="/actions/reset-paper-all" onsubmit="return confirm('Alle Paper-Bewertungen, Discards und offenen Paper-Trades wirklich zuruecksetzen?');">
                 <button type="submit" class="px-3 py-2 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-bold uppercase tracking-wide hover:bg-red-500/20 transition-colors">Reset Alle Paper-Bewertungen</button>
+            </form>
+            <form method="POST" action="/actions/reset-whales-all" onsubmit="return confirm('Wirklich alle Wale inklusive Whale-Stats, Whale-Activity und Paper-Daten loeschen? Aktive Live-Trades bleiben bestehen.');">
+                <button type="submit" class="px-3 py-2 rounded-lg border border-rose-400/50 bg-rose-500/15 text-rose-200 text-xs font-bold uppercase tracking-wide hover:bg-rose-500/25 transition-colors">Alle Wale Loeschen</button>
             </form>
             <span class="text-xs text-slate-500">Loescht Paper-Metriken, Discards und offene Paper-Trades der Quarantaene.</span>
         </div>`;
