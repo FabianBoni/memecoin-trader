@@ -29,8 +29,11 @@ const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const SCOUT_BATCH_PAUSE_MS = 75;
 const SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN = 3;
 const SCOUT_TOKEN_PRICE_CACHE_TTL_MS = 60 * 1000;
-const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 2;
-const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.25;
+const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
+const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
+const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
+const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 4;
+const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.1;
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
@@ -866,6 +869,18 @@ function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
     && stats.distinctTokenCount >= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS;
 }
 
+function getSeedSignatureScanCap(seed: ScoutSeedCandidate): number | undefined {
+  if (!seed.highVolumeEligible) {
+    return undefined;
+  }
+
+  if (seed.marketVolume24hUsd >= HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD || seed.marketTxCount24h >= HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT) {
+    return Math.max(env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP, HIGH_VOLUME_SEED_DEEP_SCAN_CAP);
+  }
+
+  return undefined;
+}
+
 async function checkMigratedScoutSeed(mintAddress: string): Promise<MigratedSeedCheck> {
   const cached = getCachedMigratedScoutSeed(mintAddress);
   if (cached) {
@@ -897,11 +912,16 @@ async function collectTopTokenTraders(
   scanAddress: string,
   solUsdPrice: number,
   tokenPriceUsd: number | null,
+  signatureScanCapOverride?: number,
 ): Promise<SeedTraderCandidate[]> {
   const scanPubKey = new PublicKey(scanAddress);
   const initialSignatureTarget = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
   const signatureBatchLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT, initialSignatureTarget);
-  const signatureScanCap = Math.max(env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP, initialSignatureTarget);
+  const signatureScanCap = Math.max(
+    env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP,
+    signatureScanCapOverride ?? 0,
+    initialSignatureTarget,
+  );
   let parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   const traderStats = new Map<string, SeedTraderCandidate>();
@@ -1095,7 +1115,7 @@ async function collectTopTokenTraders(
 
   if (rankedTraders.length === 0 && scanAddress !== mintAddress && !abortedByRateLimit) {
     console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} ergab 0 Trader. Fallback auf Mint-Scan ${mintAddress.slice(0, 8)}...`);
-    return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice, tokenPriceUsd);
+    return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice, tokenPriceUsd, signatureScanCapOverride);
   }
 
   console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}: ${scannedSignatures} Signaturen, ${rankedTraders.length} Trader, ${qualifiedSeedTraderCount} >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}${abortedByRateLimit ? ' (frueh beendet wegen RPC-Limit)' : ''}.`);
@@ -1418,7 +1438,8 @@ async function scout() {
       });
 
       const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
-      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
+      const seedSignatureScanCap = getSeedSignatureScanCap(seed);
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h}${seedSignatureScanCap ? `, Scan-Cap ${seedSignatureScanCap}` : ''})...`);
       let topTokenTraders: SeedTraderCandidate[];
       try {
         topTokenTraders = await collectTopTokenTraders(
@@ -1427,6 +1448,7 @@ async function scout() {
           seed.scanAddress,
           solUsdPrice,
           seed.marketPriceUsd > 0 ? seed.marketPriceUsd : null,
+          seedSignatureScanCap,
         );
       } catch (error) {
         if (isSolanaRpcRateLimitError(error)) {
