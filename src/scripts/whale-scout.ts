@@ -2005,6 +2005,7 @@ async function scout() {
         knownWhales.add(walletAddress);
         rejectedCandidatesDirty = clearRejectedCandidate(rejectedCandidates, walletAddress) || rejectedCandidatesDirty;
         addedCount += 1;
+        writeJsonFileSync(WHALE_FILE, currentWhales);
 
         console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${candidateStats.estimatedVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
         await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${seed.reason})\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
@@ -2015,7 +2016,6 @@ async function scout() {
     }
 
     if (addedCount > 0) {
-        writeJsonFileSync(WHALE_FILE, currentWhales);
       console.log(`[SCOUT] ${addedCount} neue qualifizierte Paper-Wale hinzugefuegt.`);
     } else {
       console.log('[SCOUT] Keine neuen qualifizierten Paper-Wale hinzugefuegt.');
