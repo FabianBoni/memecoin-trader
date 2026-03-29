@@ -34,6 +34,7 @@ const SCOUT_TOKEN_PRICE_CACHE_TTL_MS = 60 * 1000;
 const SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD = 10_000;
 const SCOUT_WALLET_EXPOSURE_SKEW_LIMIT = 5;
 const MIN_RELIABLE_SCOUT_SOL_DELTA = 0.01;
+const SCOUT_WHALE_ADAPTIVE_SIGNATURE_SCAN_CAP = 900;
 const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
@@ -57,6 +58,7 @@ const limitScoutDirectRpc = createAsyncLimiter(1);
 let scoutDirectRpcNextAllowedAt = 0;
 
 type ParsedTransactionResponse = Awaited<ReturnType<Connection['getParsedTransaction']>>;
+type SignatureInfoResponse = Awaited<ReturnType<Connection['getSignaturesForAddress']>>[number];
 
 type DexBoostToken = {
   chainId?: string;
@@ -186,6 +188,80 @@ function reduceParsedTxBatchSize(currentBatchSize: number, scope: string): numbe
   }
 
   return nextBatchSize;
+}
+
+function getOldestSignatureBlockTime(signatures: SignatureInfoResponse[]): number | null {
+  for (let index = signatures.length - 1; index >= 0; index -= 1) {
+    const blockTime = signatures[index]?.blockTime;
+    if (typeof blockTime === 'number') {
+      return blockTime;
+    }
+  }
+
+  return null;
+}
+
+async function collectWalletSignatures(
+  connection: Connection,
+  walletPubKey: PublicKey,
+  walletAddress: string,
+  signatureLimit: number,
+  cutoffTimestampSec: number,
+): Promise<SignatureInfoResponse[] | null> {
+  const requestedLimit = Math.max(1, signatureLimit);
+  const signatureScanCap = requestedLimit >= env.SCOUT_WHALE_EXTENDED_SIGNATURE_LIMIT
+    ? Math.max(requestedLimit, SCOUT_WHALE_ADAPTIVE_SIGNATURE_SCAN_CAP)
+    : requestedLimit;
+  const pageLimit = Math.max(1, Math.min(env.SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT, signatureScanCap));
+  const signatures: SignatureInfoResponse[] = [];
+  let beforeSignature: string | undefined;
+  let expandedWindow = false;
+
+  while (signatures.length < signatureScanCap) {
+    const nextLimit = Math.min(pageLimit, signatureScanCap - signatures.length);
+
+    let nextPage;
+    try {
+      nextPage = await getSignaturesForAddressWithRetry(connection, walletPubKey, {
+        limit: nextLimit,
+        ...(beforeSignature ? { before: beforeSignature } : {}),
+      });
+    } catch (error) {
+      if (isSolanaRpcRateLimitError(error)) {
+        await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (Signaturen)`);
+        return null;
+      }
+
+      throw error;
+    }
+
+    if (nextPage.length === 0) {
+      break;
+    }
+
+    signatures.push(...nextPage);
+    const oldestBlockTime = getOldestSignatureBlockTime(signatures);
+    const coversLookback = typeof oldestBlockTime === 'number' && oldestBlockTime < cutoffTimestampSec;
+
+    if (!expandedWindow && signatures.length >= requestedLimit && signatureScanCap > requestedLimit && !coversLookback) {
+      expandedWindow = true;
+      const oldestAgeMinutes = typeof oldestBlockTime === 'number'
+        ? Math.max(1, Math.round((Date.now() / 1000 - oldestBlockTime) / 60))
+        : null;
+      console.log(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} erweitert Signaturfenster ueber ${requestedLimit}, da ${env.SCOUT_WHALE_LOOKBACK_HOURS}h noch nicht abgedeckt sind${oldestAgeMinutes ? ` (aelteste Signatur ~${oldestAgeMinutes}m alt)` : ''}.`);
+    }
+
+    if (signatures.length >= requestedLimit && coversLookback) {
+      break;
+    }
+
+    beforeSignature = nextPage.at(-1)?.signature;
+    if (!beforeSignature || nextPage.length < nextLimit) {
+      break;
+    }
+  }
+
+  return signatures;
 }
 
 function isLikelySolanaMintAddress(value: unknown): value is string {
@@ -1343,20 +1419,19 @@ async function evaluateWhaleCandidate(
     return null;
   }
 
-  let signatures;
-  try {
-    signatures = await getSignaturesForAddressWithRetry(connection, walletPubKey, { limit: signatureLimit });
-  } catch (error) {
-    if (isSolanaRpcRateLimitError(error)) {
-      await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (Signaturen)`);
-      return null;
-    }
-
-    throw error;
+  const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
+  const signatures = await collectWalletSignatures(
+    connection,
+    walletPubKey,
+    walletAddress,
+    signatureLimit,
+    cutoffTimestampSec,
+  );
+  if (!signatures) {
+    return null;
   }
 
   let parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
-  const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   let estimatedVolumeUsd = 0;
   let qualifyingTradeCount = 0;
   let lastTradeAt: string | undefined;
