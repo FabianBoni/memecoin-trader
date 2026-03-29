@@ -85,6 +85,7 @@ const envSchema = z.object({
   SCOUT_BOOST_SCAN_LIMIT: z.coerce.number().int().positive().default(12),
   SCOUT_BOOST_TOKEN_LIMIT: z.coerce.number().int().positive().default(5),
   SCOUT_MARKET_TOKEN_LIMIT: z.coerce.number().int().positive().default(12),
+  SCOUT_SEED_CHECK_LIMIT: z.coerce.number().int().positive().default(10),
   SCOUT_MIN_SEED_VOLUME_USD: z.coerce.number().nonnegative().default(100000),
   SCOUT_MIN_SEED_LIQUIDITY_USD: z.coerce.number().nonnegative().default(25000),
   SCOUT_MIN_SEED_TX_COUNT: z.coerce.number().int().nonnegative().default(100),

@@ -700,6 +700,7 @@ app.get('/', (req, res) => {
                 <p class="text-xs text-slate-500">Token ${escapeHtml(shortenAddress(String(scoutStatus.lastToken ?? 'n/a'), 8, 4))}</p>
                 <p class="text-xs text-slate-500">Seeds ${escapeHtml(String(scoutStatus.highVolumeSeedCount ?? 0))}/${escapeHtml(String(scoutStatus.migratedSeedCount ?? 0))} high-volume · Cooldown ${escapeHtml(String(scoutStatus.cooldownSkippedCandidates ?? 0))}</p>
                 <p class="text-xs text-slate-500">Quellen Boost ${escapeHtml(String(scoutStatus.boostSeedInputCount ?? 0))} · Market ${escapeHtml(String(scoutStatus.marketSeedInputCount ?? 0))} · Merge ${escapeHtml(String(scoutStatus.mergedSeedInputCount ?? 0))}</p>
+                <p class="text-xs text-slate-500">On-Chain Seeds ${escapeHtml(String(scoutStatus.seedCheckInputCount ?? 0))}</p>
                 <p class="text-xs text-slate-500">Filter Vol24h $${escapeHtml(String(scoutStatus.minSeedVolumeUsd ?? 'n/a'))} · Seed-Wal $${escapeHtml(String(scoutStatus.minSeedTraderVolumeUsd ?? 'n/a'))}</p>
                 <p class="text-xs text-slate-500">Next ${formatDateTime(scoutStatus.nextRunAt)}</p>
             </div>

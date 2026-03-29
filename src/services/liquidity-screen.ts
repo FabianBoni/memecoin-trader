@@ -154,6 +154,93 @@ export class LiquidityScreenService {
     return decoded.lpMint;
   }
 
+  private async discoverLiquidityPool(tokenAddress: string, pumpFun: PumpFunCheckResult, evidence: string[]): Promise<LiquidityPoolDiscovery | undefined> {
+    const pairs = await this.dexscreenerClient.searchTokenPairs(tokenAddress);
+    const pools = discoverCandidatePools(tokenAddress, pairs);
+
+    let pool = pickBestPool(pools);
+
+    if (!pool && pumpFun.status === "migrated" && pumpFun.canonicalPoolAddress && pumpFun.canonicalPoolDetected) {
+      evidence.push(`Using Pump.fun canonical migrated pool ${pumpFun.canonicalPoolAddress} as fallback pool candidate.`);
+      pool = {
+        pairAddress: pumpFun.canonicalPoolAddress,
+        dexId: "pumpfun-amm",
+        chainId: "solana",
+        baseTokenAddress: tokenAddress,
+        quoteTokenAddress: "So11111111111111111111111111111111111111112",
+        programIdHint: getPumpAmmProgramId(),
+      };
+    }
+
+    return pool;
+  }
+
+  async screenScoutSeedLiquidity(tokenAddress: string): Promise<{
+    eligible: boolean;
+    reason: string;
+    scanAddress?: string;
+    pool?: LiquidityPoolDiscovery;
+    pumpFun?: PumpFunCheckResult;
+    warnings: string[];
+    evidence: string[];
+  }> {
+    const warnings: string[] = [];
+    const evidence: string[] = [];
+
+    try {
+      const pumpFun = await this.detectPumpFunState(tokenAddress, evidence);
+
+      if (pumpFun.status === "bonding-curve-live") {
+        return {
+          eligible: false,
+          reason: "token still on bonding curve",
+          pumpFun,
+          warnings,
+          evidence: pumpFun.evidence,
+        };
+      }
+
+      const pool = await this.discoverLiquidityPool(tokenAddress, pumpFun, evidence);
+
+      if (pumpFun.status === "migrated" && pool) {
+        return {
+          eligible: true,
+          reason: pool.dexId ?? "pumpfun-migrated",
+          scanAddress: pool.pairAddress,
+          pool,
+          pumpFun,
+          warnings,
+          evidence,
+        };
+      }
+
+      if (pumpFun.status === "migrated") {
+        return {
+          eligible: false,
+          reason: "migration detected but no AMM pool evidence",
+          pumpFun,
+          warnings,
+          evidence,
+        };
+      }
+
+      return {
+        eligible: false,
+        reason: `pump status ${pumpFun.status ?? "unknown"}`,
+        pumpFun,
+        warnings,
+        evidence,
+      };
+    } catch (error) {
+      return {
+        eligible: false,
+        reason: error instanceof Error ? error.message : String(error),
+        warnings,
+        evidence,
+      };
+    }
+  }
+
   async screenLiquidity(tokenAddress: string): Promise<LiquidityCheckResult> {
     const reasons: string[] = [];
     const warnings: string[] = [];
@@ -172,22 +259,7 @@ export class LiquidityScreenService {
       };
     }
 
-    const pairs = await this.dexscreenerClient.searchTokenPairs(tokenAddress);
-    const pools = discoverCandidatePools(tokenAddress, pairs);
-
-    let pool = pickBestPool(pools);
-
-    if (!pool && pumpFun.status === "migrated" && pumpFun.canonicalPoolAddress && pumpFun.canonicalPoolDetected) {
-      evidence.push(`Using Pump.fun canonical migrated pool ${pumpFun.canonicalPoolAddress} as fallback pool candidate.`);
-      pool = {
-        pairAddress: pumpFun.canonicalPoolAddress,
-        dexId: "pumpfun-amm",
-        chainId: "solana",
-        baseTokenAddress: tokenAddress,
-        quoteTokenAddress: "So11111111111111111111111111111111111111112",
-        programIdHint: getPumpAmmProgramId(),
-      };
-    }
+    const pool = await this.discoverLiquidityPool(tokenAddress, pumpFun, evidence);
 
     if (!pool) {
       return {

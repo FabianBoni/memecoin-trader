@@ -24,9 +24,11 @@ const MAX_CANDIDATES_PER_RUN = 12;
 const TOP_TRADERS_PER_TOKEN = 10;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_SOL_USD_FALLBACK = 100;
+const SCOUT_SEED_CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
+const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
 
 type ParsedTransactionResponse = Awaited<ReturnType<Connection['getParsedTransaction']>>;
 
@@ -317,6 +319,27 @@ function qualifiesAsHighVolumeSeed(seed: Pick<ScoutSeedCandidate, 'marketVolume2
   return seed.marketVolume24hUsd >= env.SCOUT_MIN_SEED_VOLUME_USD
     && seed.marketLiquidityUsd >= env.SCOUT_MIN_SEED_LIQUIDITY_USD
     && seed.marketTxCount24h >= env.SCOUT_MIN_SEED_TX_COUNT;
+}
+
+function getCachedMigratedScoutSeed(mintAddress: string): MigratedSeedCheck | null {
+  const cached = scoutSeedCheckCache.get(mintAddress);
+  if (!cached) {
+    return null;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    scoutSeedCheckCache.delete(mintAddress);
+    return null;
+  }
+
+  return cached.value;
+}
+
+function setCachedMigratedScoutSeed(mintAddress: string, value: MigratedSeedCheck) {
+  scoutSeedCheckCache.set(mintAddress, {
+    expiresAt: Date.now() + SCOUT_SEED_CHECK_CACHE_TTL_MS,
+    value,
+  });
 }
 
 async function fetchBoostScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
@@ -680,43 +703,27 @@ function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
 }
 
 async function checkMigratedScoutSeed(mintAddress: string): Promise<MigratedSeedCheck> {
+  const cached = getCachedMigratedScoutSeed(mintAddress);
+  if (cached) {
+    return cached;
+  }
+
   try {
-    const liquidity = await liquidityScreenService.screenLiquidity(mintAddress);
-    const pumpStatus = liquidity.pumpFun?.status;
-    const hasAmmEvidence = Boolean(liquidity.pool?.pairAddress) || liquidity.pumpFun?.canonicalPoolDetected === true;
-    const scanAddress = liquidity.pool?.pairAddress ?? liquidity.pumpFun?.canonicalPoolAddress ?? mintAddress;
-
-    if (pumpStatus === 'migrated' && hasAmmEvidence) {
-      return {
-        eligible: true,
-        reason: liquidity.pool?.dexId ?? 'pumpfun-migrated',
-        scanAddress,
-      };
-    }
-
-    if (pumpStatus === 'bonding-curve-live') {
-      return {
-        eligible: false,
-        reason: 'token still on bonding curve',
-      };
-    }
-
-    if (pumpStatus === 'migrated') {
-      return {
-        eligible: false,
-        reason: 'migration detected but no AMM pool evidence',
-      };
-    }
-
-    return {
-      eligible: false,
-      reason: `pump status ${pumpStatus ?? 'unknown'}`,
+    const scoutLiquidity = await liquidityScreenService.screenScoutSeedLiquidity(mintAddress);
+    const result: MigratedSeedCheck = {
+      eligible: scoutLiquidity.eligible,
+      reason: scoutLiquidity.reason,
+      ...(scoutLiquidity.scanAddress ? { scanAddress: scoutLiquidity.scanAddress } : {}),
     };
+    setCachedMigratedScoutSeed(mintAddress, result);
+    return result;
   } catch (error) {
-    return {
+    const result: MigratedSeedCheck = {
       eligible: false,
       reason: error instanceof Error ? error.message : String(error),
     };
+    setCachedMigratedScoutSeed(mintAddress, result);
+    return result;
   }
 }
 
@@ -996,7 +1003,8 @@ async function scout() {
       return;
     }
 
-    const migratedScoutSeeds = await buildScoutSeeds(scoutSeedInputs);
+    const seedInputsToCheck = scoutSeedInputs.slice(0, Math.max(env.SCOUT_SEED_CHECK_LIMIT, env.SCOUT_BOOST_TOKEN_LIMIT));
+    const migratedScoutSeeds = await buildScoutSeeds(seedInputsToCheck);
     const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
     const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && migratedScoutSeeds.length > 0;
     const scoutSeeds = (usingFallbackSeeds ? migratedScoutSeeds : highVolumeScoutSeeds)
@@ -1169,6 +1177,7 @@ async function scout() {
       boostSeedInputCount: boostScoutSeedInputs.length,
       marketSeedInputCount: marketScoutSeedInputs.length,
       mergedSeedInputCount: scoutSeedInputs.length,
+      seedCheckInputCount: seedInputsToCheck.length,
       usingFallbackSeeds,
       minSeedVolumeUsd: env.SCOUT_MIN_SEED_VOLUME_USD,
       minSeedLiquidityUsd: env.SCOUT_MIN_SEED_LIQUIDITY_USD,
