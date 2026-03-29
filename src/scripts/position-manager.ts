@@ -4,7 +4,7 @@ import { Connection, PublicKey } from "@solana/web3.js";
 import { fileURLToPath } from 'url';
 import { DexscreenerClient } from '../clients/dexscreener.js';
 import { sendTelegram } from "./telegram-notifier.js";
-import { discardPaperWhalePerformance, logPaperWhalePerformance, logWhalePerformance } from "./performance-tracker.js";
+import { discardPaperWhalePerformance, logPaperWhalePerformance, logWhalePerformance, reconcilePaperWhales } from "./performance-tracker.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import type { DexPairSummary } from '../types/market.js';
@@ -1041,6 +1041,7 @@ async function monitorPositions() {
   monitorRunInProgress = true;
   try {
     await monitorPaperTrades();
+    await reconcilePaperWhales();
 
     updateRuntimeStatus('positionManager', {
       state: 'monitoring',
