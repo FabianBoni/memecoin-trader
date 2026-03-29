@@ -27,6 +27,7 @@ const DEFAULT_SOL_USD_FALLBACK = 100;
 const SCOUT_SEED_CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const SCOUT_BATCH_PAUSE_MS = 75;
+const SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN = 3;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 2;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.25;
 const dexscreenerClient = new DexscreenerClient();
@@ -128,36 +129,13 @@ async function getSignaturesForAddressWithRetry(
   );
 }
 
-async function getParsedTransactionWithRetry(connection: Connection, signature: string) {
-  return withRpcRetry(
-    () => connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-    }),
-    {
-      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
-      onRetry: (delayMs, attempt) => {
-        console.warn(`[SCOUT] RPC Retry getParsedTransaction ${signature.slice(0, 8)} in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
-      },
-    },
-  );
-}
-
-async function getParsedTransactionsWithRetry(connection: Connection, signatures: string[]) {
-  if (signatures.length === 0) {
-    return [] as Array<ParsedTransactionResponse | null>;
+function reduceParsedTxBatchSize(currentBatchSize: number, scope: string): number {
+  const nextBatchSize = Math.max(1, Math.floor(currentBatchSize / 2));
+  if (nextBatchSize < currentBatchSize) {
+    console.warn(`[SCOUT] ${scope}: reduziere Parsed-TX-Batch von ${currentBatchSize} auf ${nextBatchSize}.`);
   }
 
-  return withRpcRetry(
-    () => connection.getParsedTransactions(signatures, {
-      maxSupportedTransactionVersion: 0,
-    }),
-    {
-      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
-      onRetry: (delayMs, attempt) => {
-        console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${signatures.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
-      },
-    },
-  );
+  return nextBatchSize;
 }
 
 function isLikelySolanaMintAddress(value: unknown): value is string {
@@ -767,13 +745,14 @@ async function collectTopTokenTraders(
   const initialSignatureTarget = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
   const signatureBatchLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT, initialSignatureTarget);
   const signatureScanCap = Math.max(env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP, initialSignatureTarget);
-  const parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
+  let parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   const traderStats = new Map<string, SeedTraderCandidate>();
   let beforeSignature: string | undefined;
   let scannedSignatures = 0;
   let reachedCutoff = false;
   let abortedByRateLimit = false;
+  let rateLimitedBatchCount = 0;
 
   while (scannedSignatures < signatureScanCap && !reachedCutoff && !abortedByRateLimit) {
     const remaining = signatureScanCap - scannedSignatures;
@@ -798,7 +777,7 @@ async function collectTopTokenTraders(
       break;
     }
 
-    for (let batchStart = 0; batchStart < signatures.length; batchStart += parsedTxBatchSize) {
+    for (let batchStart = 0; batchStart < signatures.length;) {
       const signatureBatch = signatures.slice(batchStart, batchStart + parsedTxBatchSize);
       const eligibleBatch = signatureBatch.filter((signature) => {
         scannedSignatures += 1;
@@ -818,11 +797,35 @@ async function collectTopTokenTraders(
         continue;
       }
 
+      let batchRateLimited = false;
+
       try {
-        const parsedTransactions = await getParsedTransactionsWithRetry(
-          connection,
-          eligibleBatch.map((signature) => signature.signature),
+        const parsedTransactions = await withRpcRetry(
+          () => connection.getParsedTransactions(
+            eligibleBatch.map((signature) => signature.signature),
+            { maxSupportedTransactionVersion: 0 },
+          ),
+          {
+            delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+            onRetry: (delayMs, attempt) => {
+              batchRateLimited = true;
+              console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${eligibleBatch.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+            },
+          },
         );
+
+        if (batchRateLimited) {
+          rateLimitedBatchCount += 1;
+          parsedTxBatchSize = reduceParsedTxBatchSize(
+            parsedTxBatchSize,
+            `Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}`,
+          );
+          if (rateLimitedBatchCount >= SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN) {
+            abortedByRateLimit = true;
+            console.warn(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} frueh beendet: ${rateLimitedBatchCount} rate-limitierte TX-Batches.`);
+            await backOffAfterScoutRateLimit(`Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} (TX-Batch-Budget)`);
+          }
+        }
 
         for (let index = 0; index < eligibleBatch.length; index += 1) {
           const signature = eligibleBatch[index]!;
@@ -864,14 +867,27 @@ async function collectTopTokenTraders(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (isSolanaRpcRateLimitError(error)) {
+          rateLimitedBatchCount += 1;
+          const nextBatchSize = reduceParsedTxBatchSize(
+            parsedTxBatchSize,
+            `Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}`,
+          );
+          if (nextBatchSize < parsedTxBatchSize) {
+            parsedTxBatchSize = nextBatchSize;
+            await backOffAfterScoutRateLimit(`Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} (TX-Batch)`);
+            continue;
+          }
+
           abortedByRateLimit = true;
-          console.warn(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} abgebrochen: TX-Batch mit ${eligibleBatch.length} Signaturen lief ins RPC-Limit.`);
-          await backOffAfterScoutRateLimit(`Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} (TX-Batch)`);
+          console.warn(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} abgebrochen: TX-Batch mit ${eligibleBatch.length} Signaturen lief trotz Minimal-Batch weiter ins RPC-Limit.`);
+          await backOffAfterScoutRateLimit(`Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} (TX-Batch-Minimum)`);
           break;
         }
 
         console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}: Batch mit ${eligibleBatch.length} Signaturen fehlgeschlagen: ${message}`);
       }
+
+      batchStart += signatureBatch.length;
 
       if (reachedCutoff || abortedByRateLimit) {
         break;
@@ -947,15 +963,16 @@ async function evaluateWhaleCandidate(
     throw error;
   }
 
-  const parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
+  let parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   let estimatedVolumeUsd = 0;
   let qualifyingTradeCount = 0;
   let lastTradeAt: string | undefined;
   const distinctTokenMints = new Set<string>();
   let abortedByRateLimit = false;
+  let rateLimitedBatchCount = 0;
 
-  for (let batchStart = 0; batchStart < signatures.length; batchStart += parsedTxBatchSize) {
+  for (let batchStart = 0; batchStart < signatures.length;) {
     const signatureBatch = signatures.slice(batchStart, batchStart + parsedTxBatchSize);
     const eligibleBatch = signatureBatch.filter((signature) => (
       typeof signature.blockTime !== 'number' || signature.blockTime >= cutoffTimestampSec
@@ -969,11 +986,35 @@ async function evaluateWhaleCandidate(
       continue;
     }
 
+    let batchRateLimited = false;
+
     try {
-      const parsedTransactions = await getParsedTransactionsWithRetry(
-        connection,
-        eligibleBatch.map((signature) => signature.signature),
+      const parsedTransactions = await withRpcRetry(
+        () => connection.getParsedTransactions(
+          eligibleBatch.map((signature) => signature.signature),
+          { maxSupportedTransactionVersion: 0 },
+        ),
+        {
+          delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+          onRetry: (delayMs, attempt) => {
+            batchRateLimited = true;
+            console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${eligibleBatch.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+          },
+        },
       );
+
+      if (batchRateLimited) {
+        rateLimitedBatchCount += 1;
+        parsedTxBatchSize = reduceParsedTxBatchSize(
+          parsedTxBatchSize,
+          `Wallet-Pruefung ${walletAddress.slice(0, 8)}`,
+        );
+        if (rateLimitedBatchCount >= SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN) {
+          abortedByRateLimit = true;
+          console.warn(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} frueh beendet: ${rateLimitedBatchCount} rate-limitierte TX-Batches.`);
+          await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (TX-Batch-Budget)`);
+        }
+      }
 
       for (let index = 0; index < eligibleBatch.length; index += 1) {
         const signature = eligibleBatch[index]!;
@@ -1002,15 +1043,28 @@ async function evaluateWhaleCandidate(
       }
     } catch (error) {
       if (isSolanaRpcRateLimitError(error)) {
+        rateLimitedBatchCount += 1;
+        const nextBatchSize = reduceParsedTxBatchSize(
+          parsedTxBatchSize,
+          `Wallet-Pruefung ${walletAddress.slice(0, 8)}`,
+        );
+        if (nextBatchSize < parsedTxBatchSize) {
+          parsedTxBatchSize = nextBatchSize;
+          await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (TX-Batch)`);
+          continue;
+        }
+
         abortedByRateLimit = true;
-        console.warn(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} abgebrochen: TX-Batch mit ${eligibleBatch.length} Signaturen lief ins RPC-Limit.`);
-        await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (TX-Batch)`);
+        console.warn(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} abgebrochen: TX-Batch mit ${eligibleBatch.length} Signaturen lief trotz Minimal-Batch weiter ins RPC-Limit.`);
+        await backOffAfterScoutRateLimit(`Wallet-Pruefung ${walletAddress.slice(0, 8)} (TX-Batch-Minimum)`);
         break;
       }
 
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} fehlgeschlagen: ${message}`);
     }
+
+    batchStart += signatureBatch.length;
 
     if (abortedByRateLimit) {
       break;
