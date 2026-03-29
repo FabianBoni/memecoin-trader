@@ -26,6 +26,9 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_SOL_USD_FALLBACK = 100;
 const SCOUT_SEED_CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
+const SCOUT_BATCH_PAUSE_MS = 75;
+const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 2;
+const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.25;
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
@@ -125,6 +128,24 @@ async function getParsedTransactionWithRetry(connection: Connection, signature: 
       delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
       onRetry: (delayMs, attempt) => {
         console.warn(`[SCOUT] RPC Retry getParsedTransaction ${signature.slice(0, 8)} in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+      },
+    },
+  );
+}
+
+async function getParsedTransactionsWithRetry(connection: Connection, signatures: string[]) {
+  if (signatures.length === 0) {
+    return [] as Array<ParsedTransactionResponse | null>;
+  }
+
+  return withRpcRetry(
+    () => connection.getParsedTransactions(signatures, {
+      maxSupportedTransactionVersion: 0,
+    }),
+    {
+      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${signatures.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
       },
     },
   );
@@ -737,6 +758,7 @@ async function collectTopTokenTraders(
   const initialSignatureTarget = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
   const signatureBatchLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT, initialSignatureTarget);
   const signatureScanCap = Math.max(env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP, initialSignatureTarget);
+  const parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   const traderStats = new Map<string, SeedTraderCandidate>();
   let beforeSignature: string | undefined;
@@ -755,52 +777,81 @@ async function collectTopTokenTraders(
       break;
     }
 
-    for (const signature of signatures) {
-      scannedSignatures += 1;
-      if (typeof signature.blockTime === 'number' && signature.blockTime < cutoffTimestampSec) {
-        reachedCutoff = true;
-        break;
+    for (let batchStart = 0; batchStart < signatures.length; batchStart += parsedTxBatchSize) {
+      const signatureBatch = signatures.slice(batchStart, batchStart + parsedTxBatchSize);
+      const eligibleBatch = signatureBatch.filter((signature) => {
+        scannedSignatures += 1;
+        if (typeof signature.blockTime === 'number' && signature.blockTime < cutoffTimestampSec) {
+          reachedCutoff = true;
+          return false;
+        }
+
+        return true;
+      });
+
+      if (eligibleBatch.length === 0) {
+        if (reachedCutoff) {
+          break;
+        }
+
+        continue;
       }
 
       try {
-        const tx = await getParsedTransactionWithRetry(connection, signature.signature);
-        if (!tx || tx.meta?.err) {
-          continue;
+        const parsedTransactions = await getParsedTransactionsWithRetry(
+          connection,
+          eligibleBatch.map((signature) => signature.signature),
+        );
+
+        for (let index = 0; index < eligibleBatch.length; index += 1) {
+          const signature = eligibleBatch[index]!;
+          const tx = parsedTransactions[index] ?? null;
+          if (!tx || tx.meta?.err) {
+            continue;
+          }
+
+          const signerAddress = getSignerAddress(tx);
+          if (!signerAddress) {
+            continue;
+          }
+
+          const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
+          if (tokenRawDelta === 0n) {
+            continue;
+          }
+
+          const solDelta = getWalletNativeSolDelta(tx, signerAddress);
+          const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+          if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
+            continue;
+          }
+
+          const existing = traderStats.get(signerAddress) ?? {
+            walletAddress: signerAddress,
+            tokenVolumeUsd: 0,
+            tokenTradeCount: 0,
+          };
+
+          existing.tokenVolumeUsd += tradeVolumeUsd;
+          existing.tokenTradeCount += 1;
+          if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
+            existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+          }
+
+          traderStats.set(signerAddress, existing);
         }
-
-        const signerAddress = getSignerAddress(tx);
-        if (!signerAddress) {
-          continue;
-        }
-
-        const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
-        if (tokenRawDelta === 0n) {
-          continue;
-        }
-
-        const solDelta = getWalletNativeSolDelta(tx, signerAddress);
-        const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
-        if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
-          continue;
-        }
-
-        const existing = traderStats.get(signerAddress) ?? {
-          walletAddress: signerAddress,
-          tokenVolumeUsd: 0,
-          tokenTradeCount: 0,
-        };
-
-        existing.tokenVolumeUsd += tradeVolumeUsd;
-        existing.tokenTradeCount += 1;
-        if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
-          existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
-        }
-
-        traderStats.set(signerAddress, existing);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        console.log(`[SCOUT] Ueberspringe Kandidaten-TX ${signature.signature.slice(0, 8)} wegen Fehler: ${message}`);
+        for (const signature of eligibleBatch) {
+          console.log(`[SCOUT] Ueberspringe Kandidaten-TX ${signature.signature.slice(0, 8)} wegen Fehler: ${message}`);
+        }
       }
+
+      if (reachedCutoff) {
+        break;
+      }
+
+      await sleep(SCOUT_BATCH_PAUSE_MS);
     }
 
     beforeSignature = signatures.at(-1)?.signature;
@@ -834,6 +885,12 @@ async function collectTopTokenTraders(
   const qualifiedSeedTraderCount = rankedTraders.filter(
     (trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
   ).length;
+
+  if (rankedTraders.length === 0 && scanAddress !== mintAddress) {
+    console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} ergab 0 Trader. Fallback auf Mint-Scan ${mintAddress.slice(0, 8)}...`);
+    return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice);
+  }
+
   console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}: ${scannedSignatures} Signaturen, ${rankedTraders.length} Trader, ${qualifiedSeedTraderCount} >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}.`);
 
   return rankedTraders.slice(0, TOP_TRADERS_PER_TOKEN);
@@ -853,51 +910,64 @@ async function evaluateWhaleCandidate(
   }
 
   const signatures = await connection.getSignaturesForAddress(walletPubKey, { limit: signatureLimit });
+  const parsedTxBatchSize = Math.max(1, env.SCOUT_PARSED_TX_BATCH_SIZE);
   const cutoffTimestampSec = Math.floor(Date.now() / 1000) - (env.SCOUT_WHALE_LOOKBACK_HOURS * 60 * 60);
   let estimatedVolumeUsd = 0;
   let qualifyingTradeCount = 0;
   let lastTradeAt: string | undefined;
   const distinctTokenMints = new Set<string>();
 
-  for (const signature of signatures) {
-    if (typeof signature.blockTime === 'number' && signature.blockTime < cutoffTimestampSec) {
-      break;
+  for (let batchStart = 0; batchStart < signatures.length; batchStart += parsedTxBatchSize) {
+    const signatureBatch = signatures.slice(batchStart, batchStart + parsedTxBatchSize);
+    const eligibleBatch = signatureBatch.filter((signature) => (
+      typeof signature.blockTime !== 'number' || signature.blockTime >= cutoffTimestampSec
+    ));
+
+    if (eligibleBatch.length === 0) {
+      if (signatureBatch.some((signature) => typeof signature.blockTime === 'number' && signature.blockTime < cutoffTimestampSec)) {
+        break;
+      }
+
+      continue;
     }
 
     try {
-      const tx = await connection.getParsedTransaction(signature.signature, {
-        maxSupportedTransactionVersion: 0,
-      });
-      if (!tx || tx.meta?.err) {
-        await sleep(250);
-        continue;
-      }
+      const parsedTransactions = await getParsedTransactionsWithRetry(
+        connection,
+        eligibleBatch.map((signature) => signature.signature),
+      );
 
-      const tradedMints = getWalletTradedMints(tx, walletAddress);
-      if (tradedMints.length === 0) {
-        await sleep(250);
-        continue;
-      }
+      for (let index = 0; index < eligibleBatch.length; index += 1) {
+        const signature = eligibleBatch[index]!;
+        const tx = parsedTransactions[index] ?? null;
+        if (!tx || tx.meta?.err) {
+          continue;
+        }
 
-      const solDelta = getWalletNativeSolDelta(tx, walletAddress);
-      const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
-      if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
-        await sleep(250);
-        continue;
-      }
+        const tradedMints = getWalletTradedMints(tx, walletAddress);
+        if (tradedMints.length === 0) {
+          continue;
+        }
 
-      estimatedVolumeUsd += tradeVolumeUsd;
-      qualifyingTradeCount += 1;
-      tradedMints.forEach((mint) => distinctTokenMints.add(mint));
-      if (!lastTradeAt && typeof signature.blockTime === 'number') {
-        lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+        const solDelta = getWalletNativeSolDelta(tx, walletAddress);
+        const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+        if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
+          continue;
+        }
+
+        estimatedVolumeUsd += tradeVolumeUsd;
+        qualifyingTradeCount += 1;
+        tradedMints.forEach((mint) => distinctTokenMints.add(mint));
+        if (!lastTradeAt && typeof signature.blockTime === 'number') {
+          lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[SCOUT] Wallet-Pruefung fuer ${walletAddress.slice(0, 8)} fehlgeschlagen: ${message}`);
     }
 
-    await sleep(250);
+    await sleep(SCOUT_BATCH_PAUSE_MS);
   }
 
   return {
@@ -1070,6 +1140,14 @@ async function scout() {
       const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
       console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
       const topTokenTraders = await collectTopTokenTraders(connection, mintAddress, seed.scanAddress, solUsdPrice);
+      const qualifiedSeedTraderCount = topTokenTraders.filter(
+        (trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
+      ).length;
+      const allowHighVolumeSeedFallback = seed.highVolumeEligible && qualifiedSeedTraderCount === 0;
+      const highVolumeSeedFallbackFloor = Math.max(
+        100,
+        env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR,
+      );
 
       for (let traderIndex = 0; traderIndex < topTokenTraders.length; traderIndex += 1) {
         const trader = topTokenTraders[traderIndex]!;
@@ -1089,9 +1167,17 @@ async function scout() {
           continue;
         }
 
-        if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
+        const allowFallbackTrader = allowHighVolumeSeedFallback
+          && traderIndex < HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT
+          && trader.tokenVolumeUsd >= highVolumeSeedFallbackFloor;
+
+        if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD && !allowFallbackTrader) {
           console.log(`[SCOUT] Ueberspringe ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} unter Mindestwert $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}.`);
           continue;
+        }
+
+        if (allowFallbackTrader) {
+          console.log(`[SCOUT] High-Volume-Seed-Fallback fuer ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} unter Standard-$${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}, aber Top-${HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT} auf starkem Seed.`);
         }
 
         if (evaluatedCandidates.has(walletAddress)) {

@@ -90,6 +90,7 @@ const envSchema = z.object({
   SCOUT_MIN_SEED_LIQUIDITY_USD: z.coerce.number().nonnegative().default(25000),
   SCOUT_MIN_SEED_TX_COUNT: z.coerce.number().int().nonnegative().default(100),
   SCOUT_MIN_SEED_TRADER_VOLUME_USD: z.coerce.number().nonnegative().default(1000),
+  SCOUT_PARSED_TX_BATCH_SIZE: z.coerce.number().int().positive().default(25),
   SCOUT_TOKEN_SIGNATURE_BATCH_LIMIT: z.coerce.number().int().positive().default(100),
   SCOUT_TOKEN_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(8),
   SCOUT_TOKEN_SIGNATURE_SCAN_CAP: z.coerce.number().int().positive().default(250),
