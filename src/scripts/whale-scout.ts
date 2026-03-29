@@ -48,6 +48,7 @@ const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 4;
 const HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES = 2;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.1;
+const HIGH_VOLUME_SEED_POOL_CANDIDATE_MIN_VOLUME_USD = 250;
 const JUPITER_V4_PROGRAM_ID = 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB';
 const JUPITER_V6_PROGRAM_ID = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
 const SCOUT_KNOWN_DEX_PROGRAM_IDS = new Set<string>([
@@ -1296,6 +1297,7 @@ async function collectTopTokenTraders(
   let reachedCutoff = false;
   let abortedByRateLimit = false;
   let rateLimitedBatchCount = 0;
+  let mintFallbackReason: string | null = null;
 
   while (scannedSignatures < signatureScanCap && !reachedCutoff && !abortedByRateLimit) {
     const remaining = signatureScanCap - scannedSignatures;
@@ -1455,7 +1457,15 @@ async function collectTopTokenTraders(
     const fallbackSeedTraderCount = [...traderStats.values()]
       .filter((trader) => trader.tokenVolumeUsd >= fallbackSeedTraderFloor)
       .length;
+    const poolUsableSeedTraderFloor = Math.max(
+      HIGH_VOLUME_SEED_POOL_CANDIDATE_MIN_VOLUME_USD,
+      fallbackSeedTraderFloor,
+    );
+    const poolUsableSeedTraderCount = [...traderStats.values()]
+      .filter((trader) => trader.tokenVolumeUsd >= poolUsableSeedTraderFloor)
+      .length;
     if (scanAddress !== mintAddress && scannedSignatures >= initialSignatureTarget && traderStats.size === 0) {
+      mintFallbackReason = `blieb nach ${scannedSignatures} Signaturen ohne Trader`;
       console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} blieb nach ${scannedSignatures} Signaturen ohne Trader. Wechsle frueh auf Mint-Scan ${mintAddress.slice(0, 8)}.`);
       break;
     }
@@ -1467,6 +1477,17 @@ async function collectTopTokenTraders(
     const usingExtendedHighVolumeScan = signatureScanCap > env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     const coveredBaseSeedWindow = scannedSignatures >= env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     if (usingExtendedHighVolumeScan && coveredBaseSeedWindow) {
+      if (scanAddress !== mintAddress) {
+        if (poolUsableSeedTraderCount === 0) {
+          mintFallbackReason = `lieferte nach Basisfenster keine brauchbaren Trader >= $${poolUsableSeedTraderFloor.toFixed(0)}`;
+          console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} liefert nach Basisfenster keine brauchbaren Trader >= $${poolUsableSeedTraderFloor.toFixed(0)}. Wechsle auf Mint-Scan ${mintAddress.slice(0, 8)}.`);
+          break;
+        }
+
+        console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} stoppt nach Basisfenster: ${poolUsableSeedTraderCount} Kandidaten >= $${poolUsableSeedTraderFloor.toFixed(0)} reichen fuer die Wallet-Pruefung.`);
+        break;
+      }
+
       const enoughQualifiedSeedTraderCandidates = qualifiedSeedTraderCount >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
       const enoughUsableSeedCandidates = qualifiedSeedTraderCount > 0
         && fallbackSeedTraderCount >= HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES;
@@ -1511,8 +1532,8 @@ async function collectTopTokenTraders(
     (trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
   ).length;
 
-  if (rankedTraders.length === 0 && scanAddress !== mintAddress && !abortedByRateLimit) {
-    console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} ergab 0 Trader. Fallback auf Mint-Scan ${mintAddress.slice(0, 8)}...`);
+  if ((rankedTraders.length === 0 || mintFallbackReason) && scanAddress !== mintAddress && !abortedByRateLimit) {
+    console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} ${mintFallbackReason ?? 'ergab 0 Trader'}. Fallback auf Mint-Scan ${mintAddress.slice(0, 8)}...`);
     return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice, tokenPriceUsd, signatureScanCapOverride);
   }
 
@@ -1904,7 +1925,11 @@ async function scout() {
         }
 
         if (allowFallbackTrader) {
-          console.log(`[SCOUT] High-Volume-Seed-Fallback fuer ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} unter Standard-$${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}, aber Top-${HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT} auf starkem Seed.`);
+          if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
+            console.log(`[SCOUT] High-Volume-Seed-Fallback fuer ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} unter Standard-$${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}, aber Top-${HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT} auf starkem Seed.`);
+          } else {
+            console.log(`[SCOUT] High-Volume-Seed-Zusatzkandidat fuer ${walletAddress.slice(0, 8)}: Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)} und Top-${HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT} auf starkem Seed, obwohl erst ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} gefunden wurden.`);
+          }
         }
 
         if (evaluatedCandidates.has(walletAddress)) {
