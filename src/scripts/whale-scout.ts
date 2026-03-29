@@ -2024,6 +2024,9 @@ async function scout() {
           dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
           cooldownMs: 24 * 60 * 60 * 1000,
         });
+
+        console.log(`[SCOUT] Seed ${mintAddress.slice(0, 8)} hat einen neuen Whale geliefert. Wechsle zum naechsten Seed.`);
+        break;
       }
     }
 
