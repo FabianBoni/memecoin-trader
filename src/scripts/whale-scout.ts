@@ -2,11 +2,13 @@ import path from 'path';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { fileURLToPath } from 'url';
 import { env, getReadOnlyRpcUrl } from '../config/env.js';
+import { DexscreenerClient } from '../clients/dexscreener.js';
 import { LiquidityScreenService } from '../services/liquidity-screen.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
+import type { DexPairSummary } from '../types/market.js';
 
 const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +19,8 @@ const FAST_SCOUT_WHALE_TARGET = 100;
 const MAX_NEW_WHALES_PER_RUN = 2;
 const MAX_CANDIDATES_PER_RUN = 12;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const DEFAULT_SOL_USD_FALLBACK = 100;
+const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 
 type ParsedTransactionResponse = Awaited<ReturnType<Connection['getParsedTransaction']>>;
@@ -86,6 +90,19 @@ function getBoostWeight(token: DexBoostToken): number {
 
 function lamportsToSol(lamports: number): number {
   return lamports / 1_000_000_000;
+}
+
+function getBestDexPriceUsd(pairs: DexPairSummary[]): number | null {
+  const bestPair = [...pairs]
+    .filter((pair) => Number.isFinite(Number(pair.priceUsd)) && Number(pair.priceUsd) > 0)
+    .sort((left, right) => (Number(right.liquidity?.usd) || 0) - (Number(left.liquidity?.usd) || 0))[0];
+
+  if (!bestPair) {
+    return null;
+  }
+
+  const priceUsd = Number(bestPair.priceUsd);
+  return Number.isFinite(priceUsd) && priceUsd > 0 ? priceUsd : null;
 }
 
 function getAccountKeyString(accountKey: unknown): string | undefined {
@@ -180,12 +197,27 @@ function getWalletTradedMints(parsedTx: ParsedTransactionResponse, walletAddress
 async function fetchSolUsdPrice(): Promise<number | null> {
   try {
     const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
-    const data = await response.json();
-    const price = Number(data?.data?.[SOL_MINT]?.price);
-    return Number.isFinite(price) && price > 0 ? price : null;
+    if (response.ok) {
+      const data = await response.json();
+      const price = Number(data?.data?.[SOL_MINT]?.price);
+      if (Number.isFinite(price) && price > 0) {
+        return price;
+      }
+    }
   } catch {
-    return null;
+    // Fall through to Dexscreener fallback.
   }
+
+  try {
+    const dexPriceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(SOL_MINT));
+    if (dexPriceUsd) {
+      return dexPriceUsd;
+    }
+  } catch {
+    // Fall through to conservative fallback.
+  }
+
+  return DEFAULT_SOL_USD_FALLBACK;
 }
 
 function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
@@ -366,8 +398,20 @@ async function scout() {
     const knownWhales = new Set(currentWhales.map((whale) => whale.address));
     const evaluatedCandidates = new Set<string>();
     const solUsdPrice = await fetchSolUsdPrice();
-    if (!solUsdPrice) {
-      throw new Error('SOL/USD Preis konnte fuer den Scout nicht geladen werden.');
+    if (!solUsdPrice || solUsdPrice <= 0) {
+      throw new Error('SOL/USD Preis konnte fuer den Scout auch ueber Fallbacks nicht geladen werden.');
+    }
+
+    if (solUsdPrice === DEFAULT_SOL_USD_FALLBACK) {
+      console.warn(`[SCOUT] SOL/USD Fallback aktiv (${DEFAULT_SOL_USD_FALLBACK}). Whale-Selektion laeuft konservativ weiter.`);
+      updateRuntimeStatus('scout', {
+        solUsdPriceFallback: DEFAULT_SOL_USD_FALLBACK,
+      });
+    } else {
+      updateRuntimeStatus('scout', {
+        solUsdPrice,
+        solUsdPriceFallback: null,
+      });
     }
 
     let addedCount = 0;
