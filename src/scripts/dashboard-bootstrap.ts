@@ -2,4 +2,4 @@ import { installPunycodeWarningFilter } from './install-punycode-warning-filter.
 
 installPunycodeWarningFilter();
 
-await import(new URL('./whale-tracker.ts', import.meta.url).href);
+await import(new URL('./dashboard.ts', import.meta.url).href);

@@ -13,6 +13,7 @@ import type { DexPairSummary } from '../types/market.js';
 const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
+const EMPTY_SCOUT_INTERVAL_MS = 60 * 1000;
 const FAST_SCOUT_INTERVAL_MS = 15 * 60 * 1000;
 const DEFAULT_SCOUT_INTERVAL_MS = 60 * 60 * 1000;
 const FAST_SCOUT_WHALE_TARGET = 100;
@@ -68,14 +69,22 @@ function isLikelySolanaMintAddress(value: unknown): value is string {
 
 function getScoutIntervalMs(): number {
   const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
+  if (whaleCount === 0) {
+    return EMPTY_SCOUT_INTERVAL_MS;
+  }
+
   return whaleCount < FAST_SCOUT_WHALE_TARGET ? FAST_SCOUT_INTERVAL_MS : DEFAULT_SCOUT_INTERVAL_MS;
 }
 
 function logNextScoutRun() {
   const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
-  const intervalMs = whaleCount < FAST_SCOUT_WHALE_TARGET ? FAST_SCOUT_INTERVAL_MS : DEFAULT_SCOUT_INTERVAL_MS;
+  const intervalMs = getScoutIntervalMs();
   const intervalMinutes = Math.round(intervalMs / 60_000);
-  console.log(`[SCOUT] Naechster Lauf in ${intervalMinutes} Minuten (Whales: ${whaleCount}/${FAST_SCOUT_WHALE_TARGET}).`);
+  const intervalLabel = intervalMs < 60_000
+    ? `${Math.round(intervalMs / 1000)} Sekunden`
+    : `${intervalMinutes} Minuten`;
+  const modeLabel = whaleCount === 0 ? 'keine gespeicherten Kandidaten' : `Whales: ${whaleCount}/${FAST_SCOUT_WHALE_TARGET}`;
+  console.log(`[SCOUT] Naechster Lauf in ${intervalLabel} (${modeLabel}).`);
 }
 
 function getBoostWeight(token: DexBoostToken): number {
