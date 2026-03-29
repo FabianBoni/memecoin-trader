@@ -964,6 +964,18 @@ async function openPaperTrade(
   console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert (${paperTradeRecord.entryPriceSource}).`);
 }
 
+function getLiveTradeBlockReason(whale: WhaleRecord): string | null {
+  if (whale.mode !== 'live') {
+    return 'candidate still in paper mode';
+  }
+
+  if (!whale.promotedAt) {
+    return 'candidate not yet validated for live auto-buy';
+  }
+
+  return null;
+}
+
 async function logDecision(
   whale: WhaleRecord,
   mint: string,
@@ -986,6 +998,24 @@ async function logDecision(
 
   if (whale.mode === 'paper') {
     await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    return;
+  }
+
+  const liveTradeBlockReason = getLiveTradeBlockReason(whale);
+
+  if (liveTradeBlockReason) {
+    console.log(`[BUY] ${mint.slice(0,6)} nicht live gehandelt: ${liveTradeBlockReason}. Signal wird nur als Paper-Trade gespiegelt.`);
+    updateRuntimeStatus('tracker', {
+      lastBlockedLiveSignalAt: new Date().toISOString(),
+      lastBlockedLiveWhale: whale.address,
+      lastBlockedLiveMint: mint,
+      lastBlockedLiveReason: liveTradeBlockReason,
+    });
+    await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    await sendTelegram(`🛑 <b>LIVE-BUY BLOCKIERT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGrund: <b>${liveTradeBlockReason}</b>\nAktion: Signal nur als Paper-Trade erfasst.`, {
+      dedupeKey: `live-buy-blocked:${whale.address}:${mint}:${liveTradeBlockReason}`,
+      cooldownMs: 60 * 60 * 1000,
+    });
     return;
   }
 

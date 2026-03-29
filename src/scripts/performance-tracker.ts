@@ -157,7 +157,7 @@ async function maybePromotePaperWhale(whaleAddress: string) {
   writeJsonFileSync(WHALE_FILE, promotedWhales);
 
   await sendTelegram(
-    `🏆 <b>WAL PROMOTED</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>`,
+    `🏆 <b>WAL VALIDIERT</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>\nStatus: <b>LIVE AUTO-BUY AKTIV</b>`,
     {
       dedupeKey: `whale-promoted:${whaleAddress}`,
       cooldownMs: 24 * 60 * 60 * 1000,

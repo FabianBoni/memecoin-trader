@@ -7,13 +7,18 @@ export interface WhaleRecord {
   promotedAt?: string | null;
   paperTrades?: number;
   liveTrades?: number;
+  estimatedVolumeUsd?: number;
+  qualifyingTradeCount?: number;
+  distinctTokenCount?: number;
+  lastScoutedAt?: string;
+  lastScoutedToken?: string;
 }
 
 function normalizeWhale(input: unknown): WhaleRecord | null {
   if (typeof input === 'string') {
     return {
       address: input,
-      mode: 'live',
+      mode: 'paper',
       promotedAt: null,
       paperTrades: 0,
       liveTrades: 0,
@@ -37,6 +42,11 @@ function normalizeWhale(input: unknown): WhaleRecord | null {
     promotedAt: typeof candidate.promotedAt === 'string' ? candidate.promotedAt : null,
     ...(Number.isFinite(Number(candidate.paperTrades)) ? { paperTrades: Number(candidate.paperTrades) } : { paperTrades: 0 }),
     ...(Number.isFinite(Number(candidate.liveTrades)) ? { liveTrades: Number(candidate.liveTrades) } : { liveTrades: 0 }),
+    ...(Number.isFinite(Number(candidate.estimatedVolumeUsd)) ? { estimatedVolumeUsd: Number(candidate.estimatedVolumeUsd) } : {}),
+    ...(Number.isFinite(Number(candidate.qualifyingTradeCount)) ? { qualifyingTradeCount: Number(candidate.qualifyingTradeCount) } : {}),
+    ...(Number.isFinite(Number(candidate.distinctTokenCount)) ? { distinctTokenCount: Number(candidate.distinctTokenCount) } : {}),
+    ...(typeof candidate.lastScoutedAt === 'string' ? { lastScoutedAt: candidate.lastScoutedAt } : {}),
+    ...(typeof candidate.lastScoutedToken === 'string' ? { lastScoutedToken: candidate.lastScoutedToken } : {}),
   };
 }
 

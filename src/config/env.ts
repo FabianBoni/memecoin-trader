@@ -82,6 +82,13 @@ const envSchema = z.object({
   MIN_REWARD_RISK_RATIO: z.coerce.number().positive().default(1.35),
   WHALE_SELL_TRIM_IGNORE_FRACTION_PCT: z.coerce.number().min(0).max(100).default(25),
   WHALE_PANIC_SELL_MIN_FRACTION_PCT: z.coerce.number().min(0).max(100).default(70),
+  SCOUT_BOOST_TOKEN_LIMIT: z.coerce.number().int().positive().default(5),
+  SCOUT_TOKEN_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(8),
+  SCOUT_WHALE_SIGNATURE_LIMIT: z.coerce.number().int().positive().default(20),
+  SCOUT_WHALE_LOOKBACK_HOURS: z.coerce.number().int().positive().default(24),
+  SCOUT_MIN_WHALE_VOLUME_USD: z.coerce.number().nonnegative().default(50000),
+  SCOUT_MIN_WHALE_TX_COUNT: z.coerce.number().int().positive().default(8),
+  SCOUT_MIN_WHALE_DISTINCT_TOKENS: z.coerce.number().int().positive().default(3),
   REQUIRE_EXPLICIT_GO: z
     .string()
     .optional()
