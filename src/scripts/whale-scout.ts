@@ -93,6 +93,7 @@ type ScoutSeedCandidate = {
   marketVolume24hUsd: number;
   marketLiquidityUsd: number;
   marketTxCount24h: number;
+  marketAvgTradeUsd: number;
   highVolumeEligible: boolean;
 };
 
@@ -259,6 +260,18 @@ function getPairTxCount24h(pair: DexPairSummary | null | undefined): number {
   return Math.max(0, Math.round(toFiniteNumber(pair.txns?.h24?.buys) + toFiniteNumber(pair.txns?.h24?.sells)));
 }
 
+function getAverageTradeUsd(volumeUsd: number, txCount: number): number {
+  if (txCount <= 0) {
+    return 0;
+  }
+
+  return volumeUsd / txCount;
+}
+
+function getPairAverageTradeUsd(pair: DexPairSummary | null | undefined): number {
+  return getAverageTradeUsd(getPairVolume24hUsd(pair), getPairTxCount24h(pair));
+}
+
 function getPairPriceUsd(pair: DexPairSummary | null | undefined): number {
   return pair ? toFiniteNumber(pair.priceUsd) : 0;
 }
@@ -267,6 +280,12 @@ function compareSeedMarketQuality(
   left: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
   right: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
 ): number {
+  const avgTradeDiff = getAverageTradeUsd(right.sourceMarketVolume24hUsd, right.sourceMarketTxCount24h)
+    - getAverageTradeUsd(left.sourceMarketVolume24hUsd, left.sourceMarketTxCount24h);
+  if (avgTradeDiff !== 0) {
+    return avgTradeDiff;
+  }
+
   const volumeDiff = right.sourceMarketVolume24hUsd - left.sourceMarketVolume24hUsd;
   if (volumeDiff !== 0) {
     return volumeDiff;
@@ -333,6 +352,7 @@ function qualifiesAsHighVolumeRawSeed(input: RawScoutSeedInput): boolean {
     marketVolume24hUsd: input.sourceMarketVolume24hUsd,
     marketLiquidityUsd: input.sourceMarketLiquidityUsd,
     marketTxCount24h: input.sourceMarketTxCount24h,
+    marketAvgTradeUsd: getAverageTradeUsd(input.sourceMarketVolume24hUsd, input.sourceMarketTxCount24h),
   });
 }
 
@@ -362,10 +382,11 @@ function pickBestScoutSeedPair(mintAddress: string, pairs: DexPairSummary[]): De
   })[0] ?? null;
 }
 
-function qualifiesAsHighVolumeSeed(seed: Pick<ScoutSeedCandidate, 'marketVolume24hUsd' | 'marketLiquidityUsd' | 'marketTxCount24h'>): boolean {
+function qualifiesAsHighVolumeSeed(seed: Pick<ScoutSeedCandidate, 'marketVolume24hUsd' | 'marketLiquidityUsd' | 'marketTxCount24h' | 'marketAvgTradeUsd'>): boolean {
   return seed.marketVolume24hUsd >= env.SCOUT_MIN_SEED_VOLUME_USD
     && seed.marketLiquidityUsd >= env.SCOUT_MIN_SEED_LIQUIDITY_USD
-    && seed.marketTxCount24h >= env.SCOUT_MIN_SEED_TX_COUNT;
+    && seed.marketTxCount24h >= env.SCOUT_MIN_SEED_TX_COUNT
+    && seed.marketAvgTradeUsd >= env.SCOUT_MIN_SEED_AVG_TRADE_USD;
 }
 
 function getCachedMigratedScoutSeed(mintAddress: string): MigratedSeedCheck | null {
@@ -1358,6 +1379,7 @@ async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSe
       marketVolume24hUsd: getPairVolume24hUsd(bestPair),
       marketLiquidityUsd: getPairLiquidityUsd(bestPair),
       marketTxCount24h: getPairTxCount24h(bestPair),
+      marketAvgTradeUsd: getPairAverageTradeUsd(bestPair),
       highVolumeEligible: false,
     };
     scoutSeed.highVolumeEligible = qualifiesAsHighVolumeSeed(scoutSeed);
@@ -1367,6 +1389,11 @@ async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSe
   return scoutSeeds.sort((left, right) => {
     if (left.highVolumeEligible !== right.highVolumeEligible) {
       return Number(right.highVolumeEligible) - Number(left.highVolumeEligible);
+    }
+
+    const avgTradeDiff = right.marketAvgTradeUsd - left.marketAvgTradeUsd;
+    if (avgTradeDiff !== 0) {
+      return avgTradeDiff;
     }
 
     const volumeDiff = right.marketVolume24hUsd - left.marketVolume24hUsd;
@@ -1424,6 +1451,10 @@ async function scout() {
     const migratedScoutSeeds = await buildScoutSeeds(seedInputsToCheck);
     const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
     const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && migratedScoutSeeds.length > 0;
+    const bestFallbackSeed = migratedScoutSeeds[0];
+    if (usingFallbackSeeds && bestFallbackSeed) {
+      console.log(`[SCOUT] Keine Seeds ueber High-Volume-Schwelle inkl. AvgTx >= $${env.SCOUT_MIN_SEED_AVG_TRADE_USD}. Nutze Fallback ab ${bestFallbackSeed.mintAddress.slice(0, 8)} (AvgTx ~$${bestFallbackSeed.marketAvgTradeUsd.toFixed(0)}, Vol24h ~$${bestFallbackSeed.marketVolume24hUsd.toFixed(0)}).`);
+    }
     const scoutSeeds = (usingFallbackSeeds ? migratedScoutSeeds : highVolumeScoutSeeds)
       .slice(0, env.SCOUT_BOOST_TOKEN_LIMIT);
 
@@ -1486,7 +1517,7 @@ async function scout() {
 
       const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
       const seedSignatureScanCap = getSeedSignatureScanCap(seed);
-      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h}${seedSignatureScanCap ? `, Scan-Cap ${seedSignatureScanCap}` : ''})...`);
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h}, AvgTx ~$${seed.marketAvgTradeUsd.toFixed(0)}${seedSignatureScanCap ? `, Scan-Cap ${seedSignatureScanCap}` : ''})...`);
       let topTokenTraders: SeedTraderCandidate[];
       try {
         topTokenTraders = await collectTopTokenTraders(
