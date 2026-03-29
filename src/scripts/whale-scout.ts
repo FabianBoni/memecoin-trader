@@ -35,6 +35,8 @@ const SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD = 10_000;
 const SCOUT_WALLET_EXPOSURE_SKEW_LIMIT = 5;
 const MIN_RELIABLE_SCOUT_SOL_DELTA = 0.01;
 const SCOUT_WHALE_ADAPTIVE_SIGNATURE_SCAN_CAP = 900;
+const SCOUT_DEEP_SCAN_MIN_QUICK_VOLUME_USD = 2_000;
+const SCOUT_DEEP_SCAN_MIN_SEED_VOLUME_USD = 500;
 const SPECIALIST_WHALE_VOLUME_FACTOR = 0.4;
 const SPECIALIST_WHALE_MIN_VOLUME_USD = 10_000;
 const SPECIALIST_WHALE_MIN_TRADE_MULTIPLIER = 2;
@@ -790,11 +792,29 @@ function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderC
   }
 
   const tradeTrigger = Math.max(4, Math.floor(env.SCOUT_MIN_WHALE_TX_COUNT / 2));
+  const strongVolumeSignal = stats.estimatedVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
+    || trader.tokenVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD;
+  if (strongVolumeSignal) {
+    return true;
+  }
 
-  return stats.estimatedVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
-    || trader.tokenVolumeUsd >= env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD
-    || stats.qualifyingTradeCount >= tradeTrigger
+  const tradeSignal = stats.qualifyingTradeCount >= tradeTrigger
     || trader.tokenTradeCount >= tradeTrigger;
+  if (!tradeSignal) {
+    return false;
+  }
+
+  const quickVolumeFloor = Math.max(
+    SCOUT_DEEP_SCAN_MIN_QUICK_VOLUME_USD,
+    env.SCOUT_DEEP_SCAN_TRIGGER_VOLUME_USD * 0.8,
+  );
+  const seedVolumeFloor = Math.max(
+    SCOUT_DEEP_SCAN_MIN_SEED_VOLUME_USD,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 0.5,
+  );
+
+  return stats.estimatedVolumeUsd >= quickVolumeFloor
+    || trader.tokenVolumeUsd >= seedVolumeFloor;
 }
 
 function shouldExtendedScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
