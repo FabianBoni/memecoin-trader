@@ -46,6 +46,7 @@ const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 4;
+const HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES = 2;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.1;
 const JUPITER_V4_PROGRAM_ID = 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB';
 const JUPITER_V6_PROGRAM_ID = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
@@ -1466,10 +1467,17 @@ async function collectTopTokenTraders(
     const usingExtendedHighVolumeScan = signatureScanCap > env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     const coveredBaseSeedWindow = scannedSignatures >= env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     if (usingExtendedHighVolumeScan && coveredBaseSeedWindow) {
-      const enoughTraderCandidates = traderStats.size >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
+      const enoughQualifiedSeedTraderCandidates = qualifiedSeedTraderCount >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
+      const enoughUsableSeedCandidates = qualifiedSeedTraderCount > 0
+        && fallbackSeedTraderCount >= HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES;
 
-      if (qualifiedSeedTraderCount > 0 && enoughTraderCandidates) {
-        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} und ${traderStats.size} Trader insgesamt reichen fuer die Kandidatenpruefung.`);
+      if (enoughQualifiedSeedTraderCandidates) {
+        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} reichen fuer die Kandidatenpruefung.`);
+        break;
+      }
+
+      if (enoughUsableSeedCandidates) {
+        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} plus ${fallbackSeedTraderCount} Kandidaten >= $${fallbackSeedTraderFloor.toFixed(0)} reichen fuer die Wallet-Pruefung.`);
         break;
       }
 
@@ -1861,7 +1869,8 @@ async function scout() {
       const qualifiedSeedTraderCount = topTokenTraders.filter(
         (trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD,
       ).length;
-      const allowHighVolumeSeedFallback = seed.highVolumeEligible && qualifiedSeedTraderCount === 0;
+      const allowHighVolumeSeedFallback = seed.highVolumeEligible
+        && qualifiedSeedTraderCount < HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
       const highVolumeSeedFallbackFloor = Math.max(
         100,
         env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR,
