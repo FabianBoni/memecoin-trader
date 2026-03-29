@@ -551,12 +551,13 @@ app.get('/whale/:address', async (req, res) => {
                 </div>
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-8">
+            <div class="grid grid-cols-1 md:grid-cols-6 gap-4 mb-8">
                 <div class="glass-card border-t-4 border-t-cyan-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">12h TX</h2><p class="text-3xl font-black">${txRows.length}</p></div>
                 <div class="glass-card border-t-4 border-t-emerald-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Live Bewertet</h2><p class="text-3xl font-black text-emerald-400">${liveSummary.evaluatedTrades}</p><p class="text-xs text-slate-500 mt-1">Win ${liveSummary.winRatePct === null ? 'n/a' : `${liveSummary.winRatePct.toFixed(0)}%`} · Avg ${formatPct(liveSummary.avgPnlPct)}</p></div>
                 <div class="glass-card border-t-4 border-t-amber-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Bewertet</h2><p class="text-3xl font-black text-amber-300">${paperSummary.evaluatedTrades}</p><p class="text-xs text-slate-500 mt-1">Win ${paperSummary.winRatePct === null ? 'n/a' : `${paperSummary.winRatePct.toFixed(0)}%`} · Avg ${formatPct(paperSummary.avgPnlPct)}</p></div>
                 <div class="glass-card border-t-4 border-t-rose-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Paper Verworfen</h2><p class="text-3xl font-black text-rose-300">${paperSummary.noPriceDiscards}</p><p class="text-xs text-slate-500 mt-1">Streak ${paperSummary.streak || 'n/a'}</p></div>
                 <div class="glass-card border-t-4 border-t-purple-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Entdeckt</h2><p class="text-sm font-bold text-slate-200 mt-2">${formatDateTime(whale?.discoveredAt)}</p></div>
+                <div class="glass-card border-t-4 border-t-sky-500"><h2 class="text-slate-400 text-xs font-bold uppercase mb-1">Seed Ranking</h2><p class="text-xl font-black text-sky-300">${Number.isFinite(Number(whale?.seedTraderRank)) ? `#${Number(whale?.seedTraderRank)}` : 'n/a'}</p><p class="text-xs text-slate-500 mt-1">${escapeHtml(shortenAddress(String(whale?.lastScoutedToken ?? 'n/a'), 8, 4))} · $${Number.isFinite(Number(whale?.seedTokenVolumeUsd)) ? Number(whale?.seedTokenVolumeUsd).toFixed(0) : 'n/a'}</p></div>
             </div>
 
             <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
@@ -866,6 +867,7 @@ app.get('/', (req, res) => {
                 <div>
                     <div class="font-mono text-sm text-slate-300">${renderWhaleLink(stat.address, `${stat.address.slice(0,8)}...`)}</div>
                     <div class="text-[11px] text-slate-500">Discovery: ${formatDateTime(stat.discoveredAt)} · Streak: ${stat.streak || 'n/a'} · Discards: ${stat.noPriceDiscards}</div>
+                    <div class="text-[11px] text-slate-500">Seed ${escapeHtml(shortenAddress(String(stat.lastScoutedToken ?? 'n/a'), 8, 4))} · Rank ${Number.isFinite(Number(stat.seedTraderRank)) ? `#${Number(stat.seedTraderRank)}` : 'n/a'} · Vol $${Number.isFinite(Number(stat.seedTokenVolumeUsd)) ? Number(stat.seedTokenVolumeUsd).toFixed(0) : 'n/a'} · Trades ${Number.isFinite(Number(stat.seedTokenTradeCount)) ? Number(stat.seedTokenTradeCount).toFixed(0) : 'n/a'}</div>
                 </div>
                 <div class="text-right">
                     <div class="text-xs font-bold text-amber-300">${stat.winRate === null ? 'n/a' : `${stat.winRate}%`} · Avg ${formatPct(stat.avgPnlPct)}</div>

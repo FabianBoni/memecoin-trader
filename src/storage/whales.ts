@@ -12,6 +12,10 @@ export interface WhaleRecord {
   distinctTokenCount?: number;
   lastScoutedAt?: string;
   lastScoutedToken?: string;
+  lastScoutedReason?: string;
+  seedTraderRank?: number;
+  seedTokenVolumeUsd?: number;
+  seedTokenTradeCount?: number;
 }
 
 function normalizeWhale(input: unknown): WhaleRecord | null {
@@ -47,6 +51,10 @@ function normalizeWhale(input: unknown): WhaleRecord | null {
     ...(Number.isFinite(Number(candidate.distinctTokenCount)) ? { distinctTokenCount: Number(candidate.distinctTokenCount) } : {}),
     ...(typeof candidate.lastScoutedAt === 'string' ? { lastScoutedAt: candidate.lastScoutedAt } : {}),
     ...(typeof candidate.lastScoutedToken === 'string' ? { lastScoutedToken: candidate.lastScoutedToken } : {}),
+    ...(typeof candidate.lastScoutedReason === 'string' ? { lastScoutedReason: candidate.lastScoutedReason } : {}),
+    ...(Number.isFinite(Number(candidate.seedTraderRank)) ? { seedTraderRank: Number(candidate.seedTraderRank) } : {}),
+    ...(Number.isFinite(Number(candidate.seedTokenVolumeUsd)) ? { seedTokenVolumeUsd: Number(candidate.seedTokenVolumeUsd) } : {}),
+    ...(Number.isFinite(Number(candidate.seedTokenTradeCount)) ? { seedTokenTradeCount: Number(candidate.seedTokenTradeCount) } : {}),
   };
 }
 

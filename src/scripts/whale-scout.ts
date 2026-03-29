@@ -19,6 +19,7 @@ const DEFAULT_SCOUT_INTERVAL_MS = 60 * 60 * 1000;
 const FAST_SCOUT_WHALE_TARGET = 100;
 const MAX_NEW_WHALES_PER_RUN = 2;
 const MAX_CANDIDATES_PER_RUN = 12;
+const TOP_TRADERS_PER_TOKEN = 10;
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_SOL_USD_FALLBACK = 100;
 const dexscreenerClient = new DexscreenerClient();
@@ -44,6 +45,13 @@ type ScoutCandidateStats = {
 type MigratedSeedCheck = {
   eligible: boolean;
   reason: string;
+};
+
+type SeedTraderCandidate = {
+  walletAddress: string;
+  tokenVolumeUsd: number;
+  tokenTradeCount: number;
+  lastTradeAt?: string;
 };
 
 // Hilfsfunktion für Pausen
@@ -203,6 +211,19 @@ function getWalletTradedMints(parsedTx: ParsedTransactionResponse, walletAddress
   return tradedMints;
 }
 
+function getWalletTokenRawDelta(parsedTx: ParsedTransactionResponse, walletAddress: string, mint: string): bigint {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  return postRaw - preRaw;
+}
+
 async function fetchSolUsdPrice(): Promise<number | null> {
   try {
     const response = await fetch(`https://api.jup.ag/price/v2?ids=${SOL_MINT}`);
@@ -274,22 +295,58 @@ async function checkMigratedScoutSeed(mintAddress: string): Promise<MigratedSeed
   }
 }
 
-async function collectCandidateSigners(connection: Connection, mintAddress: string): Promise<string[]> {
+async function collectTopTokenTraders(
+  connection: Connection,
+  mintAddress: string,
+  solUsdPrice: number,
+): Promise<SeedTraderCandidate[]> {
   const mintPubKey = new PublicKey(mintAddress);
-  const signatures = await connection.getSignaturesForAddress(mintPubKey, { limit: env.SCOUT_TOKEN_SIGNATURE_LIMIT });
-  const signers: string[] = [];
-  const seenSigners = new Set<string>();
+  const signatureLimit = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
+  const signatures = await connection.getSignaturesForAddress(mintPubKey, { limit: signatureLimit });
+  const traderStats = new Map<string, SeedTraderCandidate>();
 
   for (const signature of signatures) {
     try {
       const tx = await connection.getParsedTransaction(signature.signature, {
         maxSupportedTransactionVersion: 0,
       });
-      const signerAddress = getSignerAddress(tx);
-      if (signerAddress && !seenSigners.has(signerAddress)) {
-        seenSigners.add(signerAddress);
-        signers.push(signerAddress);
+      if (!tx || tx.meta?.err) {
+        await sleep(250);
+        continue;
       }
+
+      const signerAddress = getSignerAddress(tx);
+      if (!signerAddress) {
+        await sleep(250);
+        continue;
+      }
+
+      const tokenRawDelta = getWalletTokenRawDelta(tx, signerAddress, mintAddress);
+      if (tokenRawDelta === 0n) {
+        await sleep(250);
+        continue;
+      }
+
+      const solDelta = getWalletNativeSolDelta(tx, signerAddress);
+      const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+      if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
+        await sleep(250);
+        continue;
+      }
+
+      const existing = traderStats.get(signerAddress) ?? {
+        walletAddress: signerAddress,
+        tokenVolumeUsd: 0,
+        tokenTradeCount: 0,
+      };
+
+      existing.tokenVolumeUsd += tradeVolumeUsd;
+      existing.tokenTradeCount += 1;
+      if (!existing.lastTradeAt && typeof signature.blockTime === 'number') {
+        existing.lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
+      }
+
+      traderStats.set(signerAddress, existing);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.log(`[SCOUT] Ueberspringe Kandidaten-TX ${signature.signature.slice(0, 8)} wegen Fehler: ${message}`);
@@ -298,7 +355,21 @@ async function collectCandidateSigners(connection: Connection, mintAddress: stri
     await sleep(250);
   }
 
-  return signers;
+  return [...traderStats.values()]
+    .sort((left, right) => {
+      const volumeDiff = right.tokenVolumeUsd - left.tokenVolumeUsd;
+      if (volumeDiff !== 0) {
+        return volumeDiff;
+      }
+
+      const tradeCountDiff = right.tokenTradeCount - left.tokenTradeCount;
+      if (tradeCountDiff !== 0) {
+        return tradeCountDiff;
+      }
+
+      return Date.parse(right.lastTradeAt ?? '0') - Date.parse(left.lastTradeAt ?? '0');
+    })
+    .slice(0, TOP_TRADERS_PER_TOKEN);
 }
 
 async function evaluateWhaleCandidate(
@@ -449,13 +520,16 @@ async function scout() {
         lastMigratedSeedReason: migratedSeed.reason,
       });
 
-      console.log(`[SCOUT] Pruefe Kandidaten ueber migrierten Token ${mintAddress} (${migratedSeed.reason})...`);
-      const candidateSigners = await collectCandidateSigners(connection, mintAddress);
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} (${migratedSeed.reason})...`);
+      const topTokenTraders = await collectTopTokenTraders(connection, mintAddress, solUsdPrice);
 
-      for (const walletAddress of candidateSigners) {
+      for (let traderIndex = 0; traderIndex < topTokenTraders.length; traderIndex += 1) {
+        const trader = topTokenTraders[traderIndex]!;
         if (addedCount >= MAX_NEW_WHALES_PER_RUN || evaluatedCandidates.size >= MAX_CANDIDATES_PER_RUN) {
           break;
         }
+
+        const walletAddress = trader.walletAddress;
 
         if (knownWhales.has(walletAddress) || evaluatedCandidates.has(walletAddress)) {
           continue;
@@ -485,14 +559,18 @@ async function scout() {
           distinctTokenCount: candidateStats.distinctTokenCount,
           lastScoutedAt: discoveredAt,
           lastScoutedToken: mintAddress,
+          lastScoutedReason: migratedSeed.reason,
+          seedTraderRank: traderIndex + 1,
+          seedTokenVolumeUsd: Math.round(trader.tokenVolumeUsd),
+          seedTokenTradeCount: trader.tokenTradeCount,
         };
 
         currentWhales.push(newWhale);
         knownWhales.add(walletAddress);
         addedCount += 1;
 
-        console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${candidateStats.estimatedVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h.`);
-        await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${migratedSeed.reason})\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
+        console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${candidateStats.estimatedVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
+        await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${migratedSeed.reason})\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
           dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
           cooldownMs: 24 * 60 * 60 * 1000,
         });
