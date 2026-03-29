@@ -28,11 +28,14 @@ const SCOUT_SEED_CHECK_CACHE_TTL_MS = 10 * 60 * 1000;
 const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const SCOUT_BATCH_PAUSE_MS = 75;
 const SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN = 3;
+const SCOUT_TOKEN_PRICE_CACHE_TTL_MS = 60 * 1000;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 2;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.25;
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
+const scoutTokenUsdPriceCache = new Map<string, { expiresAt: number; priceUsd: number | null }>();
+const inFlightScoutTokenUsdPriceRequests = new Map<string, Promise<number | null>>();
 const limitScoutDirectRpc = createAsyncLimiter(1);
 let scoutDirectRpcNextAllowedAt = 0;
 
@@ -83,6 +86,7 @@ type ScoutSeedCandidate = {
   source: ScoutSeedSource;
   reason: string;
   boostWeight: number;
+  marketPriceUsd: number;
   marketVolume24hUsd: number;
   marketLiquidityUsd: number;
   marketTxCount24h: number;
@@ -252,6 +256,10 @@ function getPairTxCount24h(pair: DexPairSummary | null | undefined): number {
   return Math.max(0, Math.round(toFiniteNumber(pair.txns?.h24?.buys) + toFiniteNumber(pair.txns?.h24?.sells)));
 }
 
+function getPairPriceUsd(pair: DexPairSummary | null | undefined): number {
+  return pair ? toFiniteNumber(pair.priceUsd) : 0;
+}
+
 function compareSeedMarketQuality(
   left: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
   right: Pick<RawScoutSeedInput, 'sourceMarketVolume24hUsd' | 'sourceMarketLiquidityUsd' | 'sourceMarketTxCount24h' | 'boostWeight'>,
@@ -376,6 +384,58 @@ function setCachedMigratedScoutSeed(mintAddress: string, value: MigratedSeedChec
     expiresAt: Date.now() + SCOUT_SEED_CHECK_CACHE_TTL_MS,
     value,
   });
+}
+
+function getCachedTokenUsdPrice(mintAddress: string): number | null | undefined {
+  const cached = scoutTokenUsdPriceCache.get(mintAddress);
+  if (!cached) {
+    return undefined;
+  }
+
+  if (cached.expiresAt <= Date.now()) {
+    scoutTokenUsdPriceCache.delete(mintAddress);
+    return undefined;
+  }
+
+  return cached.priceUsd;
+}
+
+function setCachedTokenUsdPrice(mintAddress: string, priceUsd: number | null) {
+  scoutTokenUsdPriceCache.set(mintAddress, {
+    expiresAt: Date.now() + SCOUT_TOKEN_PRICE_CACHE_TTL_MS,
+    priceUsd,
+  });
+}
+
+async function fetchTokenUsdPrice(mintAddress: string): Promise<number | null> {
+  const cached = getCachedTokenUsdPrice(mintAddress);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const inFlight = inFlightScoutTokenUsdPriceRequests.get(mintAddress);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const request = (async () => {
+    try {
+      const priceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(mintAddress));
+      const resolvedPriceUsd = priceUsd && priceUsd > 0 ? priceUsd : null;
+      setCachedTokenUsdPrice(mintAddress, resolvedPriceUsd);
+      return resolvedPriceUsd;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[SCOUT] Token-Preis fuer ${mintAddress.slice(0, 8)} konnte nicht geladen werden: ${message}`);
+      setCachedTokenUsdPrice(mintAddress, null);
+      return null;
+    }
+  })().finally(() => {
+    inFlightScoutTokenUsdPriceRequests.delete(mintAddress);
+  });
+
+  inFlightScoutTokenUsdPriceRequests.set(mintAddress, request);
+  return request;
 }
 
 async function fetchBoostScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
@@ -665,6 +725,74 @@ function getWalletNativeSolDelta(parsedTx: ParsedTransactionResponse, walletAddr
   return lamportsToSol(postBalance - preBalance);
 }
 
+function getWalletTokenDeltaUi(parsedTx: ParsedTransactionResponse, walletAddress: string, mint: string): number | null {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  if (deltaRaw === 0n) {
+    return null;
+  }
+
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+  return Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+}
+
+function estimateSolExposureUsd(parsedTx: ParsedTransactionResponse, walletAddress: string, solUsdPrice: number): number {
+  const nativeSolExposure = Math.abs(getWalletNativeSolDelta(parsedTx, walletAddress) ?? 0);
+  const wrappedSolExposure = getWalletTokenDeltaUi(parsedTx, walletAddress, SOL_MINT) ?? 0;
+  const solExposure = Math.max(nativeSolExposure, wrappedSolExposure);
+  return solExposure > 0 ? solExposure * solUsdPrice : 0;
+}
+
+function estimateSeedTradeVolumeUsd(
+  parsedTx: ParsedTransactionResponse,
+  walletAddress: string,
+  mintAddress: string,
+  solUsdPrice: number,
+  tokenPriceUsd: number | null,
+): number {
+  const solExposureUsd = estimateSolExposureUsd(parsedTx, walletAddress, solUsdPrice);
+  const tokenDeltaUi = getWalletTokenDeltaUi(parsedTx, walletAddress, mintAddress) ?? 0;
+  const tokenExposureUsd = tokenPriceUsd && tokenPriceUsd > 0
+    ? tokenDeltaUi * tokenPriceUsd
+    : 0;
+
+  return Math.max(solExposureUsd, tokenExposureUsd);
+}
+
+async function estimateWalletTradeVolumeUsd(
+  parsedTx: ParsedTransactionResponse,
+  walletAddress: string,
+  tradedMints: string[],
+  solUsdPrice: number,
+): Promise<number> {
+  const solExposureUsd = estimateSolExposureUsd(parsedTx, walletAddress, solUsdPrice);
+  let tokenExposureUsd = 0;
+
+  for (const mint of new Set(tradedMints)) {
+    const tokenDeltaUi = getWalletTokenDeltaUi(parsedTx, walletAddress, mint);
+    if (!tokenDeltaUi || tokenDeltaUi <= 0) {
+      continue;
+    }
+
+    const tokenPriceUsd = await fetchTokenUsdPrice(mint);
+    if (!tokenPriceUsd || tokenPriceUsd <= 0) {
+      continue;
+    }
+
+    tokenExposureUsd = Math.max(tokenExposureUsd, tokenDeltaUi * tokenPriceUsd);
+  }
+
+  return Math.max(solExposureUsd, tokenExposureUsd);
+}
+
 function getWalletTradedMints(parsedTx: ParsedTransactionResponse, walletAddress: string): string[] {
   const postBalances = parsedTx?.meta?.postTokenBalances ?? [];
   const preBalances = parsedTx?.meta?.preTokenBalances ?? [];
@@ -768,6 +896,7 @@ async function collectTopTokenTraders(
   mintAddress: string,
   scanAddress: string,
   solUsdPrice: number,
+  tokenPriceUsd: number | null,
 ): Promise<SeedTraderCandidate[]> {
   const scanPubKey = new PublicKey(scanAddress);
   const initialSignatureTarget = Math.max(env.SCOUT_TOKEN_SIGNATURE_LIMIT, TOP_TRADERS_PER_TOKEN * 5);
@@ -875,8 +1004,13 @@ async function collectTopTokenTraders(
             continue;
           }
 
-          const solDelta = getWalletNativeSolDelta(tx, signerAddress);
-          const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+          const tradeVolumeUsd = estimateSeedTradeVolumeUsd(
+            tx,
+            signerAddress,
+            mintAddress,
+            solUsdPrice,
+            tokenPriceUsd,
+          );
           if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
             continue;
           }
@@ -961,7 +1095,7 @@ async function collectTopTokenTraders(
 
   if (rankedTraders.length === 0 && scanAddress !== mintAddress && !abortedByRateLimit) {
     console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} ergab 0 Trader. Fallback auf Mint-Scan ${mintAddress.slice(0, 8)}...`);
-    return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice);
+    return collectTopTokenTraders(connection, mintAddress, mintAddress, solUsdPrice, tokenPriceUsd);
   }
 
   console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)}: ${scannedSignatures} Signaturen, ${rankedTraders.length} Trader, ${qualifiedSeedTraderCount} >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)}${abortedByRateLimit ? ' (frueh beendet wegen RPC-Limit)' : ''}.`);
@@ -1062,8 +1196,12 @@ async function evaluateWhaleCandidate(
           continue;
         }
 
-        const solDelta = getWalletNativeSolDelta(tx, walletAddress);
-        const tradeVolumeUsd = solDelta === null ? 0 : Math.abs(solDelta) * solUsdPrice;
+        const tradeVolumeUsd = await estimateWalletTradeVolumeUsd(
+          tx,
+          walletAddress,
+          tradedMints,
+          solUsdPrice,
+        );
         if (!Number.isFinite(tradeVolumeUsd) || tradeVolumeUsd <= 0) {
           continue;
         }
@@ -1149,6 +1287,7 @@ async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSe
       source: seedInput.source,
       reason: migratedSeed.reason,
       boostWeight: seedInput.boostWeight,
+      marketPriceUsd: getPairPriceUsd(bestPair),
       marketVolume24hUsd: getPairVolume24hUsd(bestPair),
       marketLiquidityUsd: getPairLiquidityUsd(bestPair),
       marketTxCount24h: getPairTxCount24h(bestPair),
@@ -1282,7 +1421,13 @@ async function scout() {
       console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h})...`);
       let topTokenTraders: SeedTraderCandidate[];
       try {
-        topTokenTraders = await collectTopTokenTraders(connection, mintAddress, seed.scanAddress, solUsdPrice);
+        topTokenTraders = await collectTopTokenTraders(
+          connection,
+          mintAddress,
+          seed.scanAddress,
+          solUsdPrice,
+          seed.marketPriceUsd > 0 ? seed.marketPriceUsd : null,
+        );
       } catch (error) {
         if (isSolanaRpcRateLimitError(error)) {
           await backOffAfterScoutRateLimit(`Seed-Scan ${mintAddress.slice(0, 8)} via ${seed.scanAddress.slice(0, 8)}`);
