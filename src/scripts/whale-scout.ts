@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { env, getReadOnlyRpcUrl } from '../config/env.js';
 import { DexscreenerClient } from '../clients/dexscreener.js';
 import { LiquidityScreenService } from '../services/liquidity-screen.js';
-import { isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
+import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
@@ -33,6 +33,8 @@ const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.25;
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
+const limitScoutDirectRpc = createAsyncLimiter(1);
+let scoutDirectRpcNextAllowedAt = 0;
 
 type ParsedTransactionResponse = Awaited<ReturnType<Connection['getParsedTransaction']>>;
 
@@ -109,8 +111,31 @@ async function backOffAfterScoutRateLimit(scope: string) {
     return;
   }
 
+  scoutDirectRpcNextAllowedAt = Math.max(
+    scoutDirectRpcNextAllowedAt,
+    Date.now() + env.SCOUT_RATE_LIMIT_COOLDOWN_MS,
+  );
   console.warn(`[SCOUT] RPC-Limit bei ${scope}. Pausiere ${env.SCOUT_RATE_LIMIT_COOLDOWN_MS}ms.`);
   await sleep(env.SCOUT_RATE_LIMIT_COOLDOWN_MS);
+}
+
+async function runScoutDirectRpc<T>(scope: string, operation: () => Promise<T>): Promise<T> {
+  return limitScoutDirectRpc(async () => {
+    const waitMs = Math.max(0, scoutDirectRpcNextAllowedAt - Date.now());
+    if (waitMs > 0) {
+      console.log(`[SCOUT] RPC-Pacer wartet ${waitMs}ms vor ${scope}.`);
+      await sleep(waitMs);
+    }
+
+    try {
+      return await operation();
+    } finally {
+      scoutDirectRpcNextAllowedAt = Math.max(
+        scoutDirectRpcNextAllowedAt,
+        Date.now() + env.SCOUT_RPC_MIN_INTERVAL_MS,
+      );
+    }
+  });
 }
 
 async function getSignaturesForAddressWithRetry(
@@ -119,7 +144,10 @@ async function getSignaturesForAddressWithRetry(
   options: Parameters<Connection['getSignaturesForAddress']>[1],
 ) {
   return withRpcRetry(
-    () => connection.getSignaturesForAddress(address, options),
+    () => runScoutDirectRpc(
+      `getSignaturesForAddress ${address.toBase58().slice(0, 8)}`,
+      () => connection.getSignaturesForAddress(address, options),
+    ),
     {
       delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
       onRetry: (delayMs, attempt) => {
@@ -801,9 +829,12 @@ async function collectTopTokenTraders(
 
       try {
         const parsedTransactions = await withRpcRetry(
-          () => connection.getParsedTransactions(
-            eligibleBatch.map((signature) => signature.signature),
-            { maxSupportedTransactionVersion: 0 },
+          () => runScoutDirectRpc(
+            `getParsedTransactions batch(${eligibleBatch.length})`,
+            () => connection.getParsedTransactions(
+              eligibleBatch.map((signature) => signature.signature),
+              { maxSupportedTransactionVersion: 0 },
+            ),
           ),
           {
             delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
@@ -990,9 +1021,12 @@ async function evaluateWhaleCandidate(
 
     try {
       const parsedTransactions = await withRpcRetry(
-        () => connection.getParsedTransactions(
-          eligibleBatch.map((signature) => signature.signature),
-          { maxSupportedTransactionVersion: 0 },
+        () => runScoutDirectRpc(
+          `getParsedTransactions batch(${eligibleBatch.length})`,
+          () => connection.getParsedTransactions(
+            eligibleBatch.map((signature) => signature.signature),
+            { maxSupportedTransactionVersion: 0 },
+          ),
         ),
         {
           delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,

@@ -101,6 +101,7 @@ const envSchema = z.object({
   SCOUT_MIN_WHALE_VOLUME_USD: z.coerce.number().nonnegative().default(50000),
   SCOUT_MIN_WHALE_TX_COUNT: z.coerce.number().int().positive().default(8),
   SCOUT_MIN_WHALE_DISTINCT_TOKENS: z.coerce.number().int().positive().default(3),
+  SCOUT_RPC_MIN_INTERVAL_MS: z.coerce.number().int().nonnegative().default(500),
   SCOUT_RATE_LIMIT_COOLDOWN_MS: z.coerce.number().int().nonnegative().default(4000),
   SCOUT_REJECT_COOLDOWN_MINUTES: z.coerce.number().int().positive().default(180),
   REQUIRE_EXPLICIT_GO: z
