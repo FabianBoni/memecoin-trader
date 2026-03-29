@@ -1070,6 +1070,31 @@ function getWalletTokenRawDelta(parsedTx: ParsedTransactionResponse, walletAddre
   return postRaw - preRaw;
 }
 
+function isLikelySeedTraderWallet(
+  parsedTx: ParsedTransactionResponse,
+  walletAddress: string,
+  mint: string,
+): boolean {
+  if (!isOnCurveAddress(walletAddress)) {
+    return false;
+  }
+
+  if (getWalletTokenRawDelta(parsedTx, walletAddress, mint) === 0n) {
+    return false;
+  }
+
+  if (getWalletSolExposure(parsedTx, walletAddress) >= MIN_RELIABLE_SCOUT_SOL_DELTA) {
+    return true;
+  }
+
+  const signerAddress = getSignerAddress(parsedTx);
+  if (signerAddress === walletAddress) {
+    return true;
+  }
+
+  return hasKnownDexProgram(parsedTx) && getWalletTradedMints(parsedTx, walletAddress).length >= 2;
+}
+
 function isOnCurveAddress(address: string): boolean {
   try {
     return PublicKey.isOnCurve(new PublicKey(address).toBytes());
@@ -1094,7 +1119,7 @@ function getSeedTraderAddresses(parsedTx: ParsedTransactionResponse, mint: strin
   }
 
   const ownersWithDelta = [...candidateOwners]
-    .filter((owner) => isOnCurveAddress(owner))
+    .filter((owner) => isLikelySeedTraderWallet(parsedTx, owner, mint))
     .map((owner) => ({ owner, rawDelta: getWalletTokenRawDelta(parsedTx, owner, mint) }))
     .filter((entry) => entry.rawDelta !== 0n)
     .sort((left, right) => {
@@ -1113,7 +1138,7 @@ function getSeedTraderAddresses(parsedTx: ParsedTransactionResponse, mint: strin
   }
 
   const signerAddress = getSignerAddress(parsedTx);
-  if (!signerAddress || !isOnCurveAddress(signerAddress)) {
+  if (!signerAddress || !isLikelySeedTraderWallet(parsedTx, signerAddress, mint)) {
     return [];
   }
 
