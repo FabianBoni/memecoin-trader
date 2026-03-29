@@ -48,7 +48,9 @@ const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 4;
 const HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES = 2;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.1;
-const HIGH_VOLUME_SEED_POOL_CANDIDATE_MIN_VOLUME_USD = 250;
+const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_USD = 500;
+const HIGH_VOLUME_SEED_POOL_CANDIDATE_MIN_VOLUME_USD = HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_USD;
+const HIGH_VOLUME_SEED_WEAK_SIGNAL_SCAN_CAP = 200;
 const JUPITER_V4_PROGRAM_ID = 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB';
 const JUPITER_V6_PROGRAM_ID = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
 const SCOUT_KNOWN_DEX_PROGRAM_IDS = new Set<string>([
@@ -1451,6 +1453,7 @@ async function collectTopTokenTraders(
       .filter((trader) => trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD)
       .length;
     const fallbackSeedTraderFloor = Math.max(
+      HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_USD,
       100,
       env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR,
     );
@@ -1485,6 +1488,12 @@ async function collectTopTokenTraders(
         }
 
         console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} stoppt nach Basisfenster: ${poolUsableSeedTraderCount} Kandidaten >= $${poolUsableSeedTraderFloor.toFixed(0)} reichen fuer die Wallet-Pruefung.`);
+        break;
+      }
+
+      const coveredWeakSignalMintWindow = scannedSignatures >= Math.min(signatureScanCap, HIGH_VOLUME_SEED_WEAK_SIGNAL_SCAN_CAP);
+      if (coveredWeakSignalMintWindow && qualifiedSeedTraderCount === 0 && fallbackSeedTraderCount === 0) {
+        console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach ${scannedSignatures} Signaturen: kein Trader >= $${fallbackSeedTraderFloor.toFixed(0)} auf starkem Seed.`);
         break;
       }
 
@@ -1893,6 +1902,7 @@ async function scout() {
       const allowHighVolumeSeedFallback = seed.highVolumeEligible
         && qualifiedSeedTraderCount < HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
       const highVolumeSeedFallbackFloor = Math.max(
+        HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_USD,
         100,
         env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR,
       );
