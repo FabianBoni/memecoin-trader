@@ -4,6 +4,8 @@ import { fileURLToPath } from 'url';
 import { env, getReadOnlyRpcUrl } from '../config/env.js';
 import { DexscreenerClient } from '../clients/dexscreener.js';
 import { LiquidityScreenService } from '../services/liquidity-screen.js';
+import { getPumpAmmProgramId, getPumpProgramId } from '../solana/pumpfun.js';
+import { RAYDIUM_AMM_V4_PROGRAM_IDS } from '../solana/raydium.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
@@ -29,11 +31,23 @@ const SCOUT_RPC_RETRY_DELAYS_MS = [400, 900, 1800];
 const SCOUT_BATCH_PAUSE_MS = 75;
 const SCOUT_MAX_RATE_LIMIT_BATCHES_PER_SCAN = 3;
 const SCOUT_TOKEN_PRICE_CACHE_TTL_MS = 60 * 1000;
+const SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD = 10_000;
+const SCOUT_WALLET_EXPOSURE_SKEW_LIMIT = 5;
+const MIN_RELIABLE_SCOUT_SOL_DELTA = 0.01;
 const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
 const HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT = 4;
 const HIGH_VOLUME_SEED_FALLBACK_MIN_VOLUME_FACTOR = 0.1;
+const JUPITER_V4_PROGRAM_ID = 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB';
+const JUPITER_V6_PROGRAM_ID = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+const SCOUT_KNOWN_DEX_PROGRAM_IDS = new Set<string>([
+  getPumpProgramId(),
+  getPumpAmmProgramId(),
+  ...RAYDIUM_AMM_V4_PROGRAM_IDS,
+  JUPITER_V4_PROGRAM_ID,
+  JUPITER_V6_PROGRAM_ID,
+]);
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
 const scoutSeedCheckCache = new Map<string, { expiresAt: number; value: MigratedSeedCheck }>();
@@ -226,9 +240,17 @@ function lamportsToSol(lamports: number): number {
   return lamports / 1_000_000_000;
 }
 
-function getBestDexPriceUsd(pairs: DexPairSummary[]): number | null {
+function getBestDexPriceUsd(
+  pairs: DexPairSummary[],
+  options?: { minLiquidityUsd?: number; requireSolana?: boolean },
+): number | null {
+  const minLiquidityUsd = options?.minLiquidityUsd ?? 0;
+  const requireSolana = options?.requireSolana ?? false;
   const bestPair = [...pairs]
-    .filter((pair) => Number.isFinite(Number(pair.priceUsd)) && Number(pair.priceUsd) > 0)
+    .filter((pair) => (!requireSolana || pair.chainId === 'solana')
+      && Number.isFinite(Number(pair.priceUsd))
+      && Number(pair.priceUsd) > 0
+      && getPairLiquidityUsd(pair) >= minLiquidityUsd)
     .sort((left, right) => (Number(right.liquidity?.usd) || 0) - (Number(left.liquidity?.usd) || 0))[0];
 
   if (!bestPair) {
@@ -444,7 +466,10 @@ async function fetchTokenUsdPrice(mintAddress: string): Promise<number | null> {
 
   const request = (async () => {
     try {
-      const priceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(mintAddress));
+      const priceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(mintAddress), {
+        minLiquidityUsd: SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD,
+        requireSolana: true,
+      });
       const resolvedPriceUsd = priceUsd && priceUsd > 0 ? priceUsd : null;
       setCachedTokenUsdPrice(mintAddress, resolvedPriceUsd);
       return resolvedPriceUsd;
@@ -781,10 +806,34 @@ function getWalletTokenDeltaUi(parsedTx: ParsedTransactionResponse, walletAddres
   return Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
 }
 
-function estimateSolExposureUsd(parsedTx: ParsedTransactionResponse, walletAddress: string, solUsdPrice: number): number {
+function getWalletSignedTokenDeltaUi(parsedTx: ParsedTransactionResponse, walletAddress: string, mint: string): number | null {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  if (deltaRaw === 0n) {
+    return null;
+  }
+
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+  const absoluteUi = Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+  return deltaRaw < 0n ? -absoluteUi : absoluteUi;
+}
+
+function getWalletSolExposure(parsedTx: ParsedTransactionResponse, walletAddress: string): number {
   const nativeSolExposure = Math.abs(getWalletNativeSolDelta(parsedTx, walletAddress) ?? 0);
   const wrappedSolExposure = getWalletTokenDeltaUi(parsedTx, walletAddress, SOL_MINT) ?? 0;
-  const solExposure = Math.max(nativeSolExposure, wrappedSolExposure);
+  return Math.max(nativeSolExposure, wrappedSolExposure);
+}
+
+function estimateSolExposureUsd(parsedTx: ParsedTransactionResponse, walletAddress: string, solUsdPrice: number): number {
+  const solExposure = getWalletSolExposure(parsedTx, walletAddress);
   return solExposure > 0 ? solExposure * solUsdPrice : 0;
 }
 
@@ -810,12 +859,19 @@ async function estimateWalletTradeVolumeUsd(
   tradedMints: string[],
   solUsdPrice: number,
 ): Promise<number> {
+  const uniqueMints = [...new Set(tradedMints)];
   const solExposureUsd = estimateSolExposureUsd(parsedTx, walletAddress, solUsdPrice);
-  let tokenExposureUsd = 0;
+  const hasReliableSolExposure = getWalletSolExposure(parsedTx, walletAddress) >= MIN_RELIABLE_SCOUT_SOL_DELTA;
+  if (!hasReliableSolExposure && (uniqueMints.length < 2 || !hasKnownDexProgram(parsedTx))) {
+    return 0;
+  }
 
-  for (const mint of new Set(tradedMints)) {
-    const tokenDeltaUi = getWalletTokenDeltaUi(parsedTx, walletAddress, mint);
-    if (!tokenDeltaUi || tokenDeltaUi <= 0) {
+  let maxIncomingTokenExposureUsd = 0;
+  let maxOutgoingTokenExposureUsd = 0;
+
+  for (const mint of uniqueMints) {
+    const tokenDeltaUi = getWalletSignedTokenDeltaUi(parsedTx, walletAddress, mint);
+    if (!tokenDeltaUi || tokenDeltaUi === 0) {
       continue;
     }
 
@@ -824,10 +880,77 @@ async function estimateWalletTradeVolumeUsd(
       continue;
     }
 
-    tokenExposureUsd = Math.max(tokenExposureUsd, tokenDeltaUi * tokenPriceUsd);
+    const tokenExposureUsd = Math.abs(tokenDeltaUi) * tokenPriceUsd;
+    if (!Number.isFinite(tokenExposureUsd) || tokenExposureUsd <= 0) {
+      continue;
+    }
+
+    if (tokenDeltaUi > 0) {
+      maxIncomingTokenExposureUsd = Math.max(maxIncomingTokenExposureUsd, tokenExposureUsd);
+    } else {
+      maxOutgoingTokenExposureUsd = Math.max(maxOutgoingTokenExposureUsd, tokenExposureUsd);
+    }
   }
 
-  return Math.max(solExposureUsd, tokenExposureUsd);
+  const matchedTokenExposureUsd = maxIncomingTokenExposureUsd > 0 && maxOutgoingTokenExposureUsd > 0
+    ? Math.min(maxIncomingTokenExposureUsd, maxOutgoingTokenExposureUsd)
+    : 0;
+
+  if (solExposureUsd > 0 && matchedTokenExposureUsd > 0) {
+    const smallerExposureUsd = Math.min(solExposureUsd, matchedTokenExposureUsd);
+    const largerExposureUsd = Math.max(solExposureUsd, matchedTokenExposureUsd);
+    if (smallerExposureUsd > 0 && (largerExposureUsd / smallerExposureUsd) > SCOUT_WALLET_EXPOSURE_SKEW_LIMIT) {
+      return smallerExposureUsd;
+    }
+  }
+
+  return Math.max(solExposureUsd, matchedTokenExposureUsd);
+}
+
+function getInstructionProgramId(instruction: unknown, accountKeys: unknown[]): string | null {
+  if (!instruction || typeof instruction !== 'object') {
+    return null;
+  }
+
+  if ('programId' in instruction) {
+    return getAccountKeyString((instruction as { programId?: unknown }).programId) ?? null;
+  }
+
+  if ('programIdIndex' in instruction) {
+    const programIdIndex = (instruction as { programIdIndex?: unknown }).programIdIndex;
+    if (typeof programIdIndex === 'number' && programIdIndex >= 0 && programIdIndex < accountKeys.length) {
+      return getAccountKeyString(accountKeys[programIdIndex]) ?? null;
+    }
+  }
+
+  return null;
+}
+
+function hasKnownDexProgram(parsedTx: ParsedTransactionResponse): boolean {
+  const accountKeys = (parsedTx?.transaction.message as { accountKeys?: unknown[] } | undefined)?.accountKeys ?? [];
+  const topLevelInstructions = (parsedTx?.transaction.message as { instructions?: unknown[] } | undefined)?.instructions ?? [];
+
+  for (const instruction of topLevelInstructions) {
+    const programId = getInstructionProgramId(instruction, accountKeys);
+    if (programId && SCOUT_KNOWN_DEX_PROGRAM_IDS.has(programId)) {
+      return true;
+    }
+  }
+
+  const innerInstructionGroups = parsedTx?.meta?.innerInstructions ?? [];
+  for (const group of innerInstructionGroups) {
+    const instructions = Array.isArray((group as { instructions?: unknown[] }).instructions)
+      ? (group as { instructions: unknown[] }).instructions
+      : [];
+    for (const instruction of instructions) {
+      const programId = getInstructionProgramId(instruction, accountKeys);
+      if (programId && SCOUT_KNOWN_DEX_PROGRAM_IDS.has(programId)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 function getWalletTradedMints(parsedTx: ParsedTransactionResponse, walletAddress: string): string[] {
@@ -936,7 +1059,10 @@ async function fetchSolUsdPrice(): Promise<number | null> {
   }
 
   try {
-    const dexPriceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(SOL_MINT));
+    const dexPriceUsd = getBestDexPriceUsd(await dexscreenerClient.searchTokenPairs(SOL_MINT), {
+      minLiquidityUsd: SCOUT_MIN_TOKEN_PRICE_LIQUIDITY_USD,
+      requireSolana: true,
+    });
     if (dexPriceUsd) {
       return dexPriceUsd;
     }
