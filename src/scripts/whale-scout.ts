@@ -42,6 +42,17 @@ const SPECIALIST_WHALE_VOLUME_FACTOR = 0.4;
 const SPECIALIST_WHALE_MIN_VOLUME_USD = 10_000;
 const SPECIALIST_WHALE_MIN_TRADE_MULTIPLIER = 2;
 const SPECIALIST_WHALE_MIN_SEED_VOLUME_USD = 1_500;
+const NEAR_HIGH_VOLUME_FALLBACK_SEED_VOLUME_FACTOR = 0.6;
+const NEAR_HIGH_VOLUME_FALLBACK_SEED_LIQUIDITY_FACTOR = 0.8;
+const NEAR_HIGH_VOLUME_FALLBACK_SEED_TX_FACTOR = 0.75;
+const NEAR_HIGH_VOLUME_FALLBACK_SEED_AVG_TRADE_FACTOR = 0.85;
+const PAPER_WHALE_MIN_AVG_TRADE_USD = 250;
+const PAPER_WHALE_FALLBACK_MIN_AVG_TRADE_USD = 400;
+const PAPER_WHALE_SPECIALIST_MIN_AVG_TRADE_USD = 500;
+const PAPER_WHALE_FALLBACK_MIN_SEED_VOLUME_FACTOR = 1.5;
+const PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR = 1.35;
+const PAPER_WHALE_SPECIALIST_MIN_SEED_SHARE = 0.2;
+const PAPER_WHALE_SPECIALIST_MIN_SEED_AVG_TRADE_FACTOR = 1.25;
 const HIGH_VOLUME_SEED_DEEP_SCAN_VOLUME_USD = 2_500_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_TX_COUNT = 20_000;
 const HIGH_VOLUME_SEED_DEEP_SCAN_CAP = 450;
@@ -791,6 +802,177 @@ function buildWhaleRejectReason(stats: ScoutCandidateStats): string {
   return reasons.join(', ');
 }
 
+function getCandidateAverageTradeUsd(stats: ScoutCandidateStats): number {
+  if (stats.qualifyingTradeCount <= 0) {
+    return 0;
+  }
+
+  return stats.estimatedVolumeUsd / stats.qualifyingTradeCount;
+}
+
+function getPaperWhaleAvgTradeFloorUsd(): number {
+  return Math.max(
+    PAPER_WHALE_MIN_AVG_TRADE_USD,
+    env.SCOUT_MIN_SEED_AVG_TRADE_USD * 2,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 0.25,
+  );
+}
+
+function getFallbackPaperWhaleAvgTradeFloorUsd(): number {
+  return Math.max(
+    PAPER_WHALE_FALLBACK_MIN_AVG_TRADE_USD,
+    getPaperWhaleAvgTradeFloorUsd() * 1.6,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 0.4,
+  );
+}
+
+function getSpecialistPaperWhaleAvgTradeFloorUsd(): number {
+  return Math.max(
+    PAPER_WHALE_SPECIALIST_MIN_AVG_TRADE_USD,
+    getPaperWhaleAvgTradeFloorUsd() * 2,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 0.5,
+  );
+}
+
+function qualifiesAsNearHighVolumeFallbackSeed(seed: ScoutSeedCandidate): boolean {
+  const fallbackVolumeFloor = Math.max(
+    50_000,
+    env.SCOUT_MIN_SEED_VOLUME_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_VOLUME_FACTOR,
+  );
+  const fallbackLiquidityFloor = Math.max(
+    15_000,
+    env.SCOUT_MIN_SEED_LIQUIDITY_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_LIQUIDITY_FACTOR,
+  );
+  const fallbackTxFloor = Math.max(
+    60,
+    Math.floor(env.SCOUT_MIN_SEED_TX_COUNT * NEAR_HIGH_VOLUME_FALLBACK_SEED_TX_FACTOR),
+  );
+  const fallbackAvgTradeFloor = Math.max(
+    100,
+    env.SCOUT_MIN_SEED_AVG_TRADE_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_AVG_TRADE_FACTOR,
+  );
+
+  return seed.marketVolume24hUsd >= fallbackVolumeFloor
+    && seed.marketLiquidityUsd >= fallbackLiquidityFloor
+    && seed.marketTxCount24h >= fallbackTxFloor
+    && seed.marketAvgTradeUsd >= fallbackAvgTradeFloor;
+}
+
+function qualifiesAsEstablishedPaperWhale(
+  stats: ScoutCandidateStats,
+  trader: SeedTraderCandidate,
+  seed: ScoutSeedCandidate,
+): boolean {
+  if (!qualifiesAsEstablishedWhale(stats)) {
+    return false;
+  }
+
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
+  const standardAvgTradeFloor = getPaperWhaleAvgTradeFloorUsd();
+  if (avgTradeUsd < standardAvgTradeFloor) {
+    return false;
+  }
+
+  if (!seed.highVolumeEligible) {
+    return stats.distinctTokenCount >= (env.SCOUT_MIN_WHALE_DISTINCT_TOKENS + 1)
+      && trader.tokenVolumeUsd >= Math.max(
+        SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
+        env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * PAPER_WHALE_FALLBACK_MIN_SEED_VOLUME_FACTOR,
+      )
+      && avgTradeUsd >= getFallbackPaperWhaleAvgTradeFloorUsd();
+  }
+
+  if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
+    return stats.estimatedVolumeUsd >= (env.SCOUT_MIN_WHALE_VOLUME_USD * PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR)
+      && stats.qualifyingTradeCount >= (env.SCOUT_MIN_WHALE_TX_COUNT + 1)
+      && avgTradeUsd >= getFallbackPaperWhaleAvgTradeFloorUsd();
+  }
+
+  if (stats.distinctTokenCount <= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS && avgTradeUsd < (standardAvgTradeFloor * 1.5)) {
+    return false;
+  }
+
+  return true;
+}
+
+function buildPaperWhaleRejectReason(
+  stats: ScoutCandidateStats,
+  trader: SeedTraderCandidate,
+  seed: ScoutSeedCandidate,
+): string {
+  const reasons: string[] = [];
+  const baseReason = buildWhaleRejectReason(stats);
+  if (baseReason) {
+    reasons.push(baseReason);
+  }
+
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
+  const avgTradeFloor = (!seed.highVolumeEligible || trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD)
+    ? getFallbackPaperWhaleAvgTradeFloorUsd()
+    : getPaperWhaleAvgTradeFloorUsd();
+  if (avgTradeUsd < avgTradeFloor) {
+    reasons.push(`avgTrade ${avgTradeUsd.toFixed(0)}/${avgTradeFloor.toFixed(0)}`);
+  }
+
+  const narrowWalletAvgTradeFloor = getPaperWhaleAvgTradeFloorUsd() * 1.5;
+  if (seed.highVolumeEligible
+    && trader.tokenVolumeUsd >= env.SCOUT_MIN_SEED_TRADER_VOLUME_USD
+    && stats.distinctTokenCount <= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS
+    && avgTradeUsd < narrowWalletAvgTradeFloor) {
+    reasons.push(`narrow-wallet avgTrade ${avgTradeUsd.toFixed(0)}/${narrowWalletAvgTradeFloor.toFixed(0)}`);
+  }
+
+  if (!seed.highVolumeEligible && stats.distinctTokenCount < (env.SCOUT_MIN_WHALE_DISTINCT_TOKENS + 1)) {
+    reasons.push(`fallback-tokens ${stats.distinctTokenCount}/${env.SCOUT_MIN_WHALE_DISTINCT_TOKENS + 1}`);
+  }
+
+  if (!seed.highVolumeEligible && trader.tokenVolumeUsd < Math.max(
+    SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * PAPER_WHALE_FALLBACK_MIN_SEED_VOLUME_FACTOR,
+  )) {
+    reasons.push(`fallback-seed-volume ${trader.tokenVolumeUsd.toFixed(0)}/${Math.max(
+      SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
+      env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * PAPER_WHALE_FALLBACK_MIN_SEED_VOLUME_FACTOR,
+    ).toFixed(0)}`);
+  }
+
+  if (seed.highVolumeEligible && trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
+    const strongerVolumeFloor = env.SCOUT_MIN_WHALE_VOLUME_USD * PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR;
+    if (stats.estimatedVolumeUsd < strongerVolumeFloor) {
+      reasons.push(`fallback-volume ${stats.estimatedVolumeUsd.toFixed(0)}/${strongerVolumeFloor.toFixed(0)}`);
+    }
+
+    const strongerTradeFloor = env.SCOUT_MIN_WHALE_TX_COUNT + 1;
+    if (stats.qualifyingTradeCount < strongerTradeFloor) {
+      reasons.push(`fallback-trades ${stats.qualifyingTradeCount}/${strongerTradeFloor}`);
+    }
+  }
+
+  const specialistVolumeFloor = Math.max(
+    SPECIALIST_WHALE_MIN_VOLUME_USD,
+    env.SCOUT_MIN_WHALE_VOLUME_USD * SPECIALIST_WHALE_VOLUME_FACTOR,
+  );
+  const specialistTradeFloor = Math.max(
+    env.SCOUT_MIN_WHALE_TX_COUNT + 2,
+    env.SCOUT_MIN_WHALE_TX_COUNT * SPECIALIST_WHALE_MIN_TRADE_MULTIPLIER,
+  );
+  const specialistSeedVolumeFloor = Math.max(
+    SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 2,
+  );
+  const specialistSeedShare = trader.tokenVolumeUsd / Math.max(stats.estimatedVolumeUsd, 1);
+  if (seed.highVolumeEligible
+    && stats.estimatedVolumeUsd >= specialistVolumeFloor
+    && stats.qualifyingTradeCount >= specialistTradeFloor
+    && trader.tokenVolumeUsd >= specialistSeedVolumeFloor
+    && avgTradeUsd >= getSpecialistPaperWhaleAvgTradeFloorUsd()
+    && specialistSeedShare < PAPER_WHALE_SPECIALIST_MIN_SEED_SHARE) {
+    reasons.push(`specialist-seed-share ${(specialistSeedShare * 100).toFixed(0)}/${(PAPER_WHALE_SPECIALIST_MIN_SEED_SHARE * 100).toFixed(0)}%`);
+  }
+
+  return reasons.join(', ') || 'quality gate';
+}
+
 function shouldDeepScanCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
   if (stats.estimatedVolumeUsd <= 0) {
     return false;
@@ -1216,7 +1398,11 @@ function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
     && stats.distinctTokenCount >= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS;
 }
 
-function qualifiesAsSpecialistPaperWhale(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
+function qualifiesAsSpecialistPaperWhale(
+  stats: ScoutCandidateStats,
+  trader: SeedTraderCandidate,
+  seed: ScoutSeedCandidate,
+): boolean {
   const specialistVolumeFloor = Math.max(
     SPECIALIST_WHALE_MIN_VOLUME_USD,
     env.SCOUT_MIN_WHALE_VOLUME_USD * SPECIALIST_WHALE_VOLUME_FACTOR,
@@ -1227,17 +1413,28 @@ function qualifiesAsSpecialistPaperWhale(stats: ScoutCandidateStats, trader: See
   );
   const specialistSeedVolumeFloor = Math.max(
     SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
-    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 1.5,
+    env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 2,
   );
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
+  const seedShare = trader.tokenVolumeUsd / Math.max(stats.estimatedVolumeUsd, 1);
 
-  return stats.estimatedVolumeUsd >= specialistVolumeFloor
+  return seed.highVolumeEligible
+    && seed.marketAvgTradeUsd >= (env.SCOUT_MIN_SEED_AVG_TRADE_USD * PAPER_WHALE_SPECIALIST_MIN_SEED_AVG_TRADE_FACTOR)
+    && stats.estimatedVolumeUsd >= specialistVolumeFloor
     && stats.qualifyingTradeCount >= specialistTradeFloor
     && stats.distinctTokenCount >= 1
-    && trader.tokenVolumeUsd >= specialistSeedVolumeFloor;
+    && trader.tokenVolumeUsd >= specialistSeedVolumeFloor
+    && avgTradeUsd >= getSpecialistPaperWhaleAvgTradeFloorUsd()
+    && seedShare >= PAPER_WHALE_SPECIALIST_MIN_SEED_SHARE;
 }
 
-function qualifiesAsPaperWhaleCandidate(stats: ScoutCandidateStats, trader: SeedTraderCandidate): boolean {
-  return qualifiesAsEstablishedWhale(stats) || qualifiesAsSpecialistPaperWhale(stats, trader);
+function qualifiesAsPaperWhaleCandidate(
+  stats: ScoutCandidateStats,
+  trader: SeedTraderCandidate,
+  seed: ScoutSeedCandidate,
+): boolean {
+  return qualifiesAsEstablishedPaperWhale(stats, trader, seed)
+    || qualifiesAsSpecialistPaperWhale(stats, trader, seed);
 }
 
 function getSeedSignatureScanCap(seed: ScoutSeedCandidate): number | undefined {
@@ -1811,12 +2008,13 @@ async function scout() {
     const seedInputsToCheck = scoutSeedInputs.slice(0, Math.max(env.SCOUT_SEED_CHECK_LIMIT, env.SCOUT_BOOST_TOKEN_LIMIT));
     const migratedScoutSeeds = await buildScoutSeeds(seedInputsToCheck);
     const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
-    const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && migratedScoutSeeds.length > 0;
-    const bestFallbackSeed = migratedScoutSeeds[0];
+    const fallbackScoutSeeds = migratedScoutSeeds.filter((seed) => qualifiesAsNearHighVolumeFallbackSeed(seed));
+    const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && fallbackScoutSeeds.length > 0;
+    const bestFallbackSeed = fallbackScoutSeeds[0];
     if (usingFallbackSeeds && bestFallbackSeed) {
-      console.log(`[SCOUT] Keine Seeds ueber High-Volume-Schwelle inkl. AvgTx >= $${env.SCOUT_MIN_SEED_AVG_TRADE_USD}. Nutze Fallback ab ${bestFallbackSeed.mintAddress.slice(0, 8)} (AvgTx ~$${bestFallbackSeed.marketAvgTradeUsd.toFixed(0)}, Vol24h ~$${bestFallbackSeed.marketVolume24hUsd.toFixed(0)}).`);
+      console.log(`[SCOUT] Keine Seeds ueber High-Volume-Schwelle inkl. AvgTx >= $${env.SCOUT_MIN_SEED_AVG_TRADE_USD}. Nutze nur starke Near-Threshold-Fallbacks ab ${bestFallbackSeed.mintAddress.slice(0, 8)} (AvgTx ~$${bestFallbackSeed.marketAvgTradeUsd.toFixed(0)}, Vol24h ~$${bestFallbackSeed.marketVolume24hUsd.toFixed(0)}).`);
     }
-    const scoutSeeds = (usingFallbackSeeds ? migratedScoutSeeds : highVolumeScoutSeeds)
+    const scoutSeeds = (usingFallbackSeeds ? fallbackScoutSeeds : highVolumeScoutSeeds)
       .slice(0, env.SCOUT_BOOST_TOKEN_LIMIT);
 
     if (migratedScoutSeeds.length === 0) {
@@ -1832,8 +2030,21 @@ async function scout() {
       return;
     }
 
+    if (highVolumeScoutSeeds.length === 0 && fallbackScoutSeeds.length === 0) {
+      console.warn(`[SCOUT] Kein migrierter Seed ist stark genug fuer Whale-Discovery. Fallback erfordert aktuell etwa >= $${Math.max(50_000, env.SCOUT_MIN_SEED_VOLUME_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_VOLUME_FACTOR).toFixed(0)} Vol24h, >= $${Math.max(15_000, env.SCOUT_MIN_SEED_LIQUIDITY_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_LIQUIDITY_FACTOR).toFixed(0)} Liq, >= ${Math.max(60, Math.floor(env.SCOUT_MIN_SEED_TX_COUNT * NEAR_HIGH_VOLUME_FALLBACK_SEED_TX_FACTOR))} TX und AvgTx >= $${Math.max(100, env.SCOUT_MIN_SEED_AVG_TRADE_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_AVG_TRADE_FACTOR).toFixed(0)}.`);
+      updateRuntimeStatus('scout', {
+        state: 'idle',
+        lastSuccessAt: new Date().toISOString(),
+        lastAddedCount: 0,
+        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        migratedSeedCount: migratedScoutSeeds.length,
+        highVolumeSeedCount: highVolumeScoutSeeds.length,
+      });
+      return;
+    }
+
     if (usingFallbackSeeds) {
-      console.warn(`[SCOUT] Kein migrierter Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze beste verfuegbare Seeds als Fallback.`);
+      console.warn(`[SCOUT] Kein migrierter Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze nur Near-Threshold-Fallback-Seeds statt beliebiger Restkandidaten.`);
     }
 
     const currentWhales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
@@ -1955,7 +2166,7 @@ async function scout() {
         }
 
         let candidateStats = quickStats;
-        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader, seed)
           && env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT > env.SCOUT_WHALE_SIGNATURE_LIMIT
           && shouldDeepScanCandidate(candidateStats, trader)) {
           console.log(`[SCOUT] Vertiefe Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Quick-Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
@@ -1967,7 +2178,7 @@ async function scout() {
           ) ?? candidateStats;
         }
 
-        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader, seed)
           && env.SCOUT_WHALE_EXTENDED_SIGNATURE_LIMIT > env.SCOUT_WHALE_DEEP_SIGNATURE_LIMIT
           && shouldExtendedScanCandidate(candidateStats, trader)) {
           console.log(`[SCOUT] Erweitere Wallet-Pruefung fuer ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}.`);
@@ -1980,18 +2191,20 @@ async function scout() {
         }
 
         const specialistPaperWhale = !qualifiesAsEstablishedWhale(candidateStats)
-          && qualifiesAsSpecialistPaperWhale(candidateStats, trader);
+          && qualifiesAsSpecialistPaperWhale(candidateStats, trader, seed);
 
-        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader)) {
-          const rejectReason = buildWhaleRejectReason(candidateStats);
+        if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader, seed)) {
+          const rejectReason = buildPaperWhaleRejectReason(candidateStats, trader, seed);
+          const avgTradeUsd = getCandidateAverageTradeUsd(candidateStats);
+          const seedSharePct = (trader.tokenVolumeUsd / Math.max(candidateStats.estimatedVolumeUsd, 1)) * 100;
           rememberRejectedCandidate(rejectedCandidates, walletAddress, rejectReason, candidateStats, mintAddress, trader);
           rejectedCandidatesDirty = true;
-          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount} (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
+          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${avgTradeUsd.toFixed(0)}, SeedShare ${seedSharePct.toFixed(0)}% (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
           continue;
         }
 
         if (specialistPaperWhale) {
-          console.log(`[SCOUT] Akzeptiere spezialisierten Paper-Wal ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
+          console.log(`[SCOUT] Akzeptiere spezialisierten Paper-Wal ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${getCandidateAverageTradeUsd(candidateStats).toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
         }
 
         const discoveredAt = new Date().toISOString();
