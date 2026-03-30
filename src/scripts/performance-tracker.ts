@@ -6,6 +6,7 @@ import {
   appendWhaleTradeDiscard,
   appendWhaleTradeMetric,
   readWhaleStats,
+  writeWhaleStats,
   type WhaleTradeMetricInput,
   type WhaleTradeMode,
 } from '../storage/whale-stats.js';
@@ -18,6 +19,13 @@ const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const PAPER_PERF_FILE = path.resolve(SCRIPT_DIR, '../data/paper-performance.json');
 const PAPER_TRADES_FILE = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 const LEGACY_HISTORY_LIMIT = Math.max(env.PAPER_PROMOTION_MIN_TRADES, env.LIVE_ELIMINATION_MIN_TRADES, 12);
+const PAPER_HARD_REJECTION_MAX_WIN_RATE_PCT = 20;
+const PAPER_HARD_REJECTION_MAX_AVG_PNL_PCT = -10;
+const PAPER_HARD_REJECTION_MAX_MEDIAN_PNL_PCT = -5;
+const PAPER_EXTENDED_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 2, 16);
+const PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT = 35;
+const PAPER_EXTENDED_REJECTION_MAX_AVG_PNL_PCT = -2;
+const PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT = -0.5;
 
 export interface WhalePerformanceInput extends WhaleTradeMetricInput {
   discardReason?: string | null;
@@ -134,6 +142,30 @@ function isPaperPromotionReady(summary: ReturnType<typeof getModeMetrics>): bool
     && (summary.medianPnlPct ?? Number.NEGATIVE_INFINITY) >= env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT;
 }
 
+function shouldRejectPaperWhale(summary: ReturnType<typeof getModeMetrics>): boolean {
+  if (summary.evaluatedTrades < env.PAPER_PROMOTION_MIN_TRADES) {
+    return false;
+  }
+
+  const winRatePct = summary.winRatePct ?? 0;
+  const avgPnlPct = summary.avgPnlPct ?? 0;
+  const medianPnlPct = summary.medianPnlPct ?? 0;
+
+  const hardReject = winRatePct <= PAPER_HARD_REJECTION_MAX_WIN_RATE_PCT
+    && (avgPnlPct <= PAPER_HARD_REJECTION_MAX_AVG_PNL_PCT || medianPnlPct <= PAPER_HARD_REJECTION_MAX_MEDIAN_PNL_PCT);
+  if (hardReject) {
+    return true;
+  }
+
+  if (summary.evaluatedTrades < PAPER_EXTENDED_REVIEW_TRADES) {
+    return false;
+  }
+
+  return winRatePct <= PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT
+    && avgPnlPct <= PAPER_EXTENDED_REJECTION_MAX_AVG_PNL_PCT
+    && medianPnlPct <= PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT;
+}
+
 async function maybeFinalizePaperWhale(whaleAddress: string) {
   const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
   const whale = whales.find((item) => item.address === whaleAddress);
@@ -163,12 +195,20 @@ async function maybeFinalizePaperWhale(whaleAddress: string) {
     return;
   }
 
+  if (!shouldRejectPaperWhale(summary)) {
+    return;
+  }
+
   const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
   writeJsonFileSync(WHALE_FILE, remainingWhales);
 
   const paperData = readLegacyPerformance(PAPER_PERF_FILE);
   delete paperData[whaleAddress];
   writeLegacyPerformance(PAPER_PERF_FILE, paperData);
+
+  const whaleStats = readWhaleStats();
+  delete whaleStats[whaleAddress];
+  writeWhaleStats(whaleStats);
 
   const paperTrades = readJsonFileSync<Record<string, { whale?: string }>>(PAPER_TRADES_FILE, {});
   const filteredPaperTrades = Object.fromEntries(
