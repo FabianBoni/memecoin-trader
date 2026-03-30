@@ -71,6 +71,33 @@ function formatSolAmount(value: unknown): string {
   return parsed >= 0.1 ? parsed.toFixed(3) : parsed.toFixed(4);
 }
 
+function formatUsdAmount(value: unknown): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 'n/a';
+  }
+
+  return `$${parsed >= 1000 ? parsed.toFixed(0) : parsed.toFixed(2)}`;
+}
+
+function formatPct(value: unknown, digits = 1): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 'n/a';
+  }
+
+  return `${parsed.toFixed(digits)}%`;
+}
+
+function formatMetric(value: unknown, digits = 2): string {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 'n/a';
+  }
+
+  return parsed.toFixed(digits);
+}
+
 function getExecutedBuySizeSol(executionReceipt: any, fallbackSol: number): number {
   if (executionReceipt?.inputMint === SOL_MINT) {
     const quotedLamports = Number(executionReceipt.inputAmount);
@@ -251,6 +278,7 @@ const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
 const inFlightSignatures = new Set<string>();
 const recentWhaleSignals = new Map<string, number>();
+const recentWhaleSignalSuppressionLogs = new Map<string, number>();
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null; source: MarketEntryPriceSource }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 let activePriceRequests = 0;
@@ -582,6 +610,26 @@ function pruneRecentWhaleSignals() {
   }
 }
 
+function pruneRecentWhaleSignalSuppressionLogs() {
+  const cutoff = Date.now() - WHALE_SIGNAL_COOLDOWN_MS;
+  for (const [signalKey, seenAt] of recentWhaleSignalSuppressionLogs.entries()) {
+    if (seenAt < cutoff) {
+      recentWhaleSignalSuppressionLogs.delete(signalKey);
+    }
+  }
+}
+
+function logSuppressedWhaleSignal(whaleAddress: string, mint: string, side: 'buy' | 'sell') {
+  pruneRecentWhaleSignalSuppressionLogs();
+  const signalKey = `${whaleAddress}:${mint}:${side}`;
+  if (recentWhaleSignalSuppressionLogs.has(signalKey)) {
+    return;
+  }
+
+  recentWhaleSignalSuppressionLogs.set(signalKey, Date.now());
+  console.log(`[TRACKER] Doppelte ${side === 'buy' ? 'Buy' : 'Sell'}-Erkennung fuer ${whaleAddress.slice(0,8)} ${mint.slice(0,6)} unterdrueckt.`);
+}
+
 function markWhaleSignalProcessed(whaleAddress: string, mint: string, side: 'buy' | 'sell'): boolean {
   pruneRecentWhaleSignals();
   const signalKey = `${whaleAddress}:${mint}:${side}`;
@@ -601,6 +649,12 @@ type WhalePerformanceProfile = {
   tier: 'test' | 'caution' | 'standard' | 'elite' | 'blocked';
   sourceMode: 'paper' | 'live';
 };
+
+function formatPerformanceLabel(positionProfile: WhalePerformanceProfile): string {
+  return positionProfile.winRate === null
+    ? `${positionProfile.sampleSize} Trades (${positionProfile.sourceMode})`
+    : `${formatPct(positionProfile.winRate, 0)} Win / Avg ${formatPct(positionProfile.avgPnlPct, 1)} aus ${positionProfile.sampleSize} ${positionProfile.sourceMode}`;
+}
 
 type PositionSizingDecision = {
   executable: boolean;
@@ -1149,11 +1203,9 @@ async function logDecision(
 
   const entryDecision = await evaluateEntryDecision(whale, mint, parsedTx);
 
-  const winRateLabel = positionProfile.winRate === null
-    ? `${positionProfile.sampleSize} Trades (${positionProfile.sourceMode})`
-    : `${positionProfile.winRate.toFixed(0)}% / Avg ${positionProfile.avgPnlPct?.toFixed(1) ?? 'n/a'}% aus ${positionProfile.sampleSize} ${positionProfile.sourceMode}`;
+  const performanceLabel = formatPerformanceLabel(positionProfile);
 
-  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'} avg=${positionProfile.avgPnlPct ?? 'n/a'} liq=${entryDecision.liquidityUsd ?? 'n/a'} ext=${entryDecision.priceExtensionPct ?? 'n/a'} rr=${entryDecision.rewardRiskRatio ?? 'n/a'} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}`);
+  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} perf=${performanceLabel} liq=${formatUsdAmount(entryDecision.liquidityUsd)} ext=${formatPct(entryDecision.priceExtensionPct, 1)} rr=${formatMetric(entryDecision.rewardRiskRatio, 2)} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}`);
 
   if (!entryDecision.allowed) {
     console.log(`[BUY] ${mint.slice(0,6)} uebersprungen: ${entryDecision.rejectionReasons.join(' | ')}`);
@@ -1257,7 +1309,7 @@ async function logDecision(
     const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     const activeCount = Object.keys(persistedTrades).length;
 
-    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}%</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nExecution: <b>${executionMode}</b>${entryDecision.dexId ? ` via ${entryDecision.dexId}` : ''}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}%</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${formatPerformanceLabel(positionProfile)}\nModus: ${positionProfile.tier}\nExecution: <b>${executionMode}</b>${entryDecision.dexId ? ` via ${entryDecision.dexId}` : ''}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
       cooldownMs: 300_000,
       priority: true,
@@ -1441,7 +1493,7 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
             const soldFractionPct = preAmt > 0 ? Math.min(100, Math.max(0, ((preAmt - postAmt) / preAmt) * 100)) : 100;
 
             if (!markWhaleSignalProcessed(currentWhale.address, tokenSold.mint, 'sell')) {
-              console.log(`[TRACKER] Doppelte Sell-Erkennung fuer ${currentWhale.address.slice(0,8)} ${tokenSold.mint.slice(0,6)} unterdrueckt.`);
+              logSuppressedWhaleSignal(currentWhale.address, tokenSold.mint, 'sell');
               return;
             }
 
@@ -1479,7 +1531,7 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
     }
 
     if (!markWhaleSignalProcessed(currentWhale.address, tokenChange.mint, 'buy')) {
-      console.log(`[TRACKER] Doppelte Buy-Erkennung fuer ${currentWhale.address.slice(0,8)} ${tokenChange.mint.slice(0,6)} unterdrueckt.`);
+      logSuppressedWhaleSignal(currentWhale.address, tokenChange.mint, 'buy');
       return;
     }
 

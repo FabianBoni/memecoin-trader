@@ -767,7 +767,7 @@ function rememberRejectedCandidate(
     lastRejectedAt: rejectedAt.toISOString(),
     rejectUntil: new Date(rejectedAt.getTime() + env.SCOUT_REJECT_COOLDOWN_MINUTES * 60_000).toISOString(),
     lastRejectReason: rejectReason,
-    estimatedVolumeUsd: Math.round(stats.estimatedVolumeUsd),
+    estimatedVolumeUsd: Math.round(getCandidateEffectiveVolumeUsd(stats, trader)),
     qualifyingTradeCount: stats.qualifyingTradeCount,
     distinctTokenCount: stats.distinctTokenCount,
     lastSeedToken: mintAddress,
@@ -784,11 +784,25 @@ function clearRejectedCandidate(store: RejectedScoutCandidateStore, walletAddres
   return true;
 }
 
-function buildWhaleRejectReason(stats: ScoutCandidateStats): string {
-  const reasons: string[] = [];
+function getCandidateEffectiveVolumeUsd(stats: ScoutCandidateStats, trader?: SeedTraderCandidate): number {
+  return Math.max(stats.estimatedVolumeUsd, trader?.tokenVolumeUsd ?? 0, 0);
+}
 
-  if (stats.estimatedVolumeUsd < env.SCOUT_MIN_WHALE_VOLUME_USD) {
-    reasons.push(`volume ${stats.estimatedVolumeUsd.toFixed(0)}/${env.SCOUT_MIN_WHALE_VOLUME_USD}`);
+function getCandidateSeedShare(stats: ScoutCandidateStats, trader: SeedTraderCandidate): number {
+  const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(stats, trader);
+  if (effectiveVolumeUsd <= 0 || trader.tokenVolumeUsd <= 0) {
+    return 0;
+  }
+
+  return Math.min(1, trader.tokenVolumeUsd / effectiveVolumeUsd);
+}
+
+function buildWhaleRejectReason(stats: ScoutCandidateStats, trader?: SeedTraderCandidate): string {
+  const reasons: string[] = [];
+  const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(stats, trader);
+
+  if (effectiveVolumeUsd < env.SCOUT_MIN_WHALE_VOLUME_USD) {
+    reasons.push(`volume ${effectiveVolumeUsd.toFixed(0)}/${env.SCOUT_MIN_WHALE_VOLUME_USD}`);
   }
 
   if (stats.qualifyingTradeCount < env.SCOUT_MIN_WHALE_TX_COUNT) {
@@ -802,12 +816,12 @@ function buildWhaleRejectReason(stats: ScoutCandidateStats): string {
   return reasons.join(', ');
 }
 
-function getCandidateAverageTradeUsd(stats: ScoutCandidateStats): number {
+function getCandidateAverageTradeUsd(stats: ScoutCandidateStats, trader?: SeedTraderCandidate): number {
   if (stats.qualifyingTradeCount <= 0) {
     return 0;
   }
 
-  return stats.estimatedVolumeUsd / stats.qualifyingTradeCount;
+  return getCandidateEffectiveVolumeUsd(stats, trader) / stats.qualifyingTradeCount;
 }
 
 function getPaperWhaleAvgTradeFloorUsd(): number {
@@ -863,11 +877,13 @@ function qualifiesAsEstablishedPaperWhale(
   trader: SeedTraderCandidate,
   seed: ScoutSeedCandidate,
 ): boolean {
-  if (!qualifiesAsEstablishedWhale(stats)) {
+  const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(stats, trader);
+
+  if (!qualifiesAsEstablishedWhale(stats, trader)) {
     return false;
   }
 
-  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats, trader);
   const standardAvgTradeFloor = getPaperWhaleAvgTradeFloorUsd();
   if (avgTradeUsd < standardAvgTradeFloor) {
     return false;
@@ -883,7 +899,7 @@ function qualifiesAsEstablishedPaperWhale(
   }
 
   if (trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
-    return stats.estimatedVolumeUsd >= (env.SCOUT_MIN_WHALE_VOLUME_USD * PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR)
+    return effectiveVolumeUsd >= (env.SCOUT_MIN_WHALE_VOLUME_USD * PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR)
       && stats.qualifyingTradeCount >= (env.SCOUT_MIN_WHALE_TX_COUNT + 1)
       && avgTradeUsd >= getFallbackPaperWhaleAvgTradeFloorUsd();
   }
@@ -901,12 +917,13 @@ function buildPaperWhaleRejectReason(
   seed: ScoutSeedCandidate,
 ): string {
   const reasons: string[] = [];
-  const baseReason = buildWhaleRejectReason(stats);
+  const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(stats, trader);
+  const baseReason = buildWhaleRejectReason(stats, trader);
   if (baseReason) {
     reasons.push(baseReason);
   }
 
-  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats, trader);
   const avgTradeFloor = (!seed.highVolumeEligible || trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD)
     ? getFallbackPaperWhaleAvgTradeFloorUsd()
     : getPaperWhaleAvgTradeFloorUsd();
@@ -938,8 +955,8 @@ function buildPaperWhaleRejectReason(
 
   if (seed.highVolumeEligible && trader.tokenVolumeUsd < env.SCOUT_MIN_SEED_TRADER_VOLUME_USD) {
     const strongerVolumeFloor = env.SCOUT_MIN_WHALE_VOLUME_USD * PAPER_WHALE_WEAK_SEED_CANDIDATE_VOLUME_FACTOR;
-    if (stats.estimatedVolumeUsd < strongerVolumeFloor) {
-      reasons.push(`fallback-volume ${stats.estimatedVolumeUsd.toFixed(0)}/${strongerVolumeFloor.toFixed(0)}`);
+    if (effectiveVolumeUsd < strongerVolumeFloor) {
+      reasons.push(`fallback-volume ${effectiveVolumeUsd.toFixed(0)}/${strongerVolumeFloor.toFixed(0)}`);
     }
 
     const strongerTradeFloor = env.SCOUT_MIN_WHALE_TX_COUNT + 1;
@@ -960,9 +977,9 @@ function buildPaperWhaleRejectReason(
     SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
     env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 2,
   );
-  const specialistSeedShare = trader.tokenVolumeUsd / Math.max(stats.estimatedVolumeUsd, 1);
+  const specialistSeedShare = getCandidateSeedShare(stats, trader);
   if (seed.highVolumeEligible
-    && stats.estimatedVolumeUsd >= specialistVolumeFloor
+    && effectiveVolumeUsd >= specialistVolumeFloor
     && stats.qualifyingTradeCount >= specialistTradeFloor
     && trader.tokenVolumeUsd >= specialistSeedVolumeFloor
     && avgTradeUsd >= getSpecialistPaperWhaleAvgTradeFloorUsd()
@@ -1392,8 +1409,8 @@ async function fetchSolUsdPrice(): Promise<number | null> {
   return DEFAULT_SOL_USD_FALLBACK;
 }
 
-function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats): boolean {
-  return stats.estimatedVolumeUsd >= env.SCOUT_MIN_WHALE_VOLUME_USD
+function qualifiesAsEstablishedWhale(stats: ScoutCandidateStats, trader?: SeedTraderCandidate): boolean {
+  return getCandidateEffectiveVolumeUsd(stats, trader) >= env.SCOUT_MIN_WHALE_VOLUME_USD
     && stats.qualifyingTradeCount >= env.SCOUT_MIN_WHALE_TX_COUNT
     && stats.distinctTokenCount >= env.SCOUT_MIN_WHALE_DISTINCT_TOKENS;
 }
@@ -1403,6 +1420,7 @@ function qualifiesAsSpecialistPaperWhale(
   trader: SeedTraderCandidate,
   seed: ScoutSeedCandidate,
 ): boolean {
+  const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(stats, trader);
   const specialistVolumeFloor = Math.max(
     SPECIALIST_WHALE_MIN_VOLUME_USD,
     env.SCOUT_MIN_WHALE_VOLUME_USD * SPECIALIST_WHALE_VOLUME_FACTOR,
@@ -1415,12 +1433,12 @@ function qualifiesAsSpecialistPaperWhale(
     SPECIALIST_WHALE_MIN_SEED_VOLUME_USD,
     env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 2,
   );
-  const avgTradeUsd = getCandidateAverageTradeUsd(stats);
-  const seedShare = trader.tokenVolumeUsd / Math.max(stats.estimatedVolumeUsd, 1);
+  const avgTradeUsd = getCandidateAverageTradeUsd(stats, trader);
+  const seedShare = getCandidateSeedShare(stats, trader);
 
   return seed.highVolumeEligible
     && seed.marketAvgTradeUsd >= (env.SCOUT_MIN_SEED_AVG_TRADE_USD * PAPER_WHALE_SPECIALIST_MIN_SEED_AVG_TRADE_FACTOR)
-    && stats.estimatedVolumeUsd >= specialistVolumeFloor
+    && effectiveVolumeUsd >= specialistVolumeFloor
     && stats.qualifyingTradeCount >= specialistTradeFloor
     && stats.distinctTokenCount >= 1
     && trader.tokenVolumeUsd >= specialistSeedVolumeFloor
@@ -2190,22 +2208,25 @@ async function scout() {
           ) ?? candidateStats;
         }
 
-        const specialistPaperWhale = !qualifiesAsEstablishedWhale(candidateStats)
+        const specialistPaperWhale = !qualifiesAsEstablishedWhale(candidateStats, trader)
           && qualifiesAsSpecialistPaperWhale(candidateStats, trader, seed);
 
         if (!qualifiesAsPaperWhaleCandidate(candidateStats, trader, seed)) {
           const rejectReason = buildPaperWhaleRejectReason(candidateStats, trader, seed);
-          const avgTradeUsd = getCandidateAverageTradeUsd(candidateStats);
-          const seedSharePct = (trader.tokenVolumeUsd / Math.max(candidateStats.estimatedVolumeUsd, 1)) * 100;
+          const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(candidateStats, trader);
+          const avgTradeUsd = getCandidateAverageTradeUsd(candidateStats, trader);
+          const seedSharePct = getCandidateSeedShare(candidateStats, trader) * 100;
           rememberRejectedCandidate(rejectedCandidates, walletAddress, rejectReason, candidateStats, mintAddress, trader);
           rejectedCandidatesDirty = true;
-          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${avgTradeUsd.toFixed(0)}, SeedShare ${seedSharePct.toFixed(0)}% (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
+          console.log(`[SCOUT] Verwerfe ${walletAddress.slice(0, 8)}: Vol $${effectiveVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${avgTradeUsd.toFixed(0)}, SeedShare ${seedSharePct.toFixed(0)}% (${rejectReason}). Cooldown ${env.SCOUT_REJECT_COOLDOWN_MINUTES}m.`);
           continue;
         }
 
         if (specialistPaperWhale) {
-          console.log(`[SCOUT] Akzeptiere spezialisierten Paper-Wal ${walletAddress.slice(0, 8)}: Vol $${candidateStats.estimatedVolumeUsd.toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${getCandidateAverageTradeUsd(candidateStats).toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
+          console.log(`[SCOUT] Akzeptiere spezialisierten Paper-Wal ${walletAddress.slice(0, 8)}: Vol $${getCandidateEffectiveVolumeUsd(candidateStats, trader).toFixed(0)}, Trades ${candidateStats.qualifyingTradeCount}, Tokens ${candidateStats.distinctTokenCount}, AvgTrade $${getCandidateAverageTradeUsd(candidateStats, trader).toFixed(0)}, Seed-Vol $${trader.tokenVolumeUsd.toFixed(0)}.`);
         }
+
+        const effectiveVolumeUsd = getCandidateEffectiveVolumeUsd(candidateStats, trader);
 
         const discoveredAt = new Date().toISOString();
         const newWhale: WhaleRecord = {
@@ -2215,7 +2236,7 @@ async function scout() {
           promotedAt: null,
           paperTrades: 0,
           liveTrades: 0,
-          estimatedVolumeUsd: Math.round(candidateStats.estimatedVolumeUsd),
+          estimatedVolumeUsd: Math.round(effectiveVolumeUsd),
           qualifyingTradeCount: candidateStats.qualifyingTradeCount,
           distinctTokenCount: candidateStats.distinctTokenCount,
           lastScoutedAt: discoveredAt,
@@ -2232,8 +2253,8 @@ async function scout() {
         addedCount += 1;
         writeJsonFileSync(WHALE_FILE, currentWhales);
 
-        console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${candidateStats.estimatedVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
-        await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${seed.reason})\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${candidateStats.estimatedVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
+  console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${effectiveVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
+  await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${seed.reason})\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${effectiveVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
           dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
           cooldownMs: 24 * 60 * 60 * 1000,
         });
