@@ -4,6 +4,7 @@ import type { TokenSecurityScreen } from "../types/token.js";
 import type { ExecutionMode, TradePlan } from "../types/trade.js";
 import { nowIso } from "../utils/time.js";
 import { getExposureSummary } from "./exposure.js";
+import { suggestExecutionModeForPool } from "./execution-routing.js";
 
 function makePlanId(): string {
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
@@ -20,7 +21,7 @@ export class TradePlanService {
     tokenAddress: string,
     requestedPositionSol: number,
     screen: TokenSecurityScreen,
-    executionMode: ExecutionMode = "raydium-sdk",
+    executionMode?: ExecutionMode,
   ): Promise<TradePlan> {
     const exposure = await getExposureSummary(riskConfig.maxOpenExposureSol);
     const blockingReasons: string[] = [];
@@ -58,11 +59,13 @@ export class TradePlanService {
       notes.push(`Position clipped from ${requestedPositionSol} SOL to ${finalPositionSol} SOL by risk limits.`);
     }
 
+    const resolvedExecutionMode = executionMode ?? suggestExecutionModeForPool(screen.liquidity?.pool ?? null);
+
     const plan: TradePlan = {
       planId: makePlanId(),
       createdAt: nowIso(),
       tokenAddress,
-      executionMode,
+      executionMode: resolvedExecutionMode,
       requestedPositionSol: roundSol(requestedPositionSol),
       allowedPositionSol: roundSol(allowedPositionSol),
       currentOpenExposureSol: roundSol(exposure.currentOpenExposureSol),
@@ -90,6 +93,14 @@ export class TradePlanService {
 
     if (verifiedDexId) {
       plan.dexId = verifiedDexId;
+    }
+
+    if (resolvedExecutionMode === "raydium-sdk" && verifiedDexId && !verifiedDexId.toLowerCase().includes("raydium")) {
+      plan.notes.push(`Execution mode raydium-sdk was requested, but the verified pool dex is ${verifiedDexId}.`);
+    }
+
+    if (resolvedExecutionMode === "pumpfun-amm" && verifiedDexId && verifiedDexId.toLowerCase() !== "pumpfun-amm" && verifiedDexId.toLowerCase() !== "pumpswap") {
+      plan.notes.push(`Execution mode pumpfun-amm was requested, but the verified pool dex is ${verifiedDexId}.`);
     }
 
     if (!verifiedPoolAddress) {

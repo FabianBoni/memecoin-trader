@@ -1,22 +1,43 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
-import { VersionedTransaction, Connection } from "@solana/web3.js";
+import { pathToFileURL } from "node:url";
+import {
+  AddressLookupTableAccount,
+  Connection,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
+} from "@solana/web3.js";
 import { env, MissingConfigError } from "../config/env.js";
-import { JitoClient } from "../clients/jito.js";
+import { JitoClient, resolveJitoTipLamports } from "../clients/jito.js";
 import { JupiterClient } from "../clients/jupiter.js";
 import { HeliusClient } from "../clients/helius.js";
+import { PumpAmmExecutionService } from "../services/pump-amm-execution.js";
 import { RaydiumExecutionService } from "../services/raydium-execution.js";
 import { loadTradePlans } from "../storage/trades.js";
-import type { TradePlan } from "../types/trade.js";
+import type { ExecutionMode, TradePlan } from "../types/trade.js";
 import { loadExecutionWallet } from "../wallet.js";
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
+const MEMO_PROGRAM_ID = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+const JITO_DONT_FRONT_ACCOUNT = new PublicKey("jitodontfront111111111111111111111111111111");
+
+interface ExecutionQuoteSummary {
+  inAmount: string;
+  outAmount: string;
+  otherAmountThreshold: string;
+  slippageBps: number;
+  priceImpactPct?: string;
+  routePlan?: unknown[];
+}
 
 interface ExecutionReceipt {
   txid?: string;
   confirmed: boolean;
-  quote: Awaited<ReturnType<JupiterClient["getQuote"]>>;
+  quote: ExecutionQuoteSummary;
   inputMint: string;
   outputMint: string;
   inputAmount: string;
@@ -30,6 +51,16 @@ interface ExecutionReceipt {
 }
 
 type JupiterQuoteResponse = Awaited<ReturnType<JupiterClient["getQuote"]>>;
+
+interface AugmentedTransactionResult {
+  transaction: VersionedTransaction;
+  serializedTransactionBase64: string;
+  tipLamports?: number;
+  tipAccount?: string;
+  dontFrontProtected: boolean;
+  augmented: boolean;
+  augmentationError?: string;
+}
 
 function solToLamportsString(sol: number): string {
   return String(Math.round(sol * 1_000_000_000));
@@ -45,6 +76,148 @@ function sleep(ms: number) {
 
 function amountToUiAmount(amount: bigint, decimals: number): number {
   return Number(amount) / 10 ** decimals;
+}
+
+function toExecutionQuoteSummary(quote: JupiterQuoteResponse): ExecutionQuoteSummary {
+  return {
+    inAmount: quote.inAmount,
+    outAmount: quote.outAmount,
+    otherAmountThreshold: quote.otherAmountThreshold,
+    slippageBps: quote.slippageBps,
+    ...(quote.priceImpactPct !== undefined ? { priceImpactPct: quote.priceImpactPct } : {}),
+    ...(quote.routePlan !== undefined ? { routePlan: quote.routePlan } : {}),
+  };
+}
+
+function buildDirectQuoteSummary(params: {
+  amountInRaw: string;
+  amountOutRaw: string;
+  minAmountOutRaw: string;
+  slippageBps: number;
+}): ExecutionQuoteSummary {
+  return {
+    inAmount: params.amountInRaw,
+    outAmount: params.amountOutRaw,
+    otherAmountThreshold: params.minAmountOutRaw,
+    slippageBps: params.slippageBps,
+    routePlan: [],
+  };
+}
+
+async function resolveAddressLookupTableAccounts(
+  connection: Connection,
+  transaction: VersionedTransaction,
+): Promise<AddressLookupTableAccount[]> {
+  const lookups = transaction.message.addressTableLookups ?? [];
+  if (lookups.length === 0) {
+    return [];
+  }
+
+  const responses = await Promise.all(
+    lookups.map(async (lookup) => {
+      const account = await connection.getAddressLookupTable(lookup.accountKey, { commitment: "confirmed" });
+      if (!account.value) {
+        throw new Error(`Address lookup table ${lookup.accountKey.toBase58()} was not found.`);
+      }
+      return account.value;
+    }),
+  );
+
+  return responses;
+}
+
+function buildDontFrontInstruction(): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: MEMO_PROGRAM_ID,
+    keys: [
+      {
+        pubkey: JITO_DONT_FRONT_ACCOUNT,
+        isSigner: false,
+        isWritable: false,
+      },
+    ],
+    data: Buffer.from("jito-dont-front"),
+  });
+}
+
+function chooseRandomTipAccount(tipAccounts: string[]): string {
+  const index = Math.floor(Math.random() * tipAccounts.length);
+  return tipAccounts[index]!;
+}
+
+async function augmentTransactionForJito(params: {
+  connection: Connection;
+  jitoClient: JitoClient;
+  transaction: VersionedTransaction;
+  wallet: ReturnType<typeof loadExecutionWallet>;
+  tipLamports?: number;
+  addDontFrontProtection: boolean;
+}): Promise<AugmentedTransactionResult> {
+  try {
+    const lookupTableAccounts = await resolveAddressLookupTableAccounts(params.connection, params.transaction);
+    const message = TransactionMessage.decompile(params.transaction.message, {
+      addressLookupTableAccounts: lookupTableAccounts,
+    });
+    const extraInstructions: TransactionInstruction[] = [];
+    let tipAccount: string | undefined;
+
+    if (params.addDontFrontProtection) {
+      extraInstructions.push(buildDontFrontInstruction());
+    }
+
+    if (params.tipLamports !== undefined && params.tipLamports > 0) {
+      const tipAccounts = await params.jitoClient.getTipAccounts();
+      if (tipAccounts.length === 0) {
+        throw new Error("Jito did not return any tip accounts.");
+      }
+
+      tipAccount = chooseRandomTipAccount(tipAccounts);
+      extraInstructions.push(SystemProgram.transfer({
+        fromPubkey: params.wallet.publicKey,
+        toPubkey: new PublicKey(tipAccount),
+        lamports: params.tipLamports,
+      }));
+    }
+
+    if (extraInstructions.length === 0) {
+      params.transaction.sign([params.wallet]);
+      return {
+        transaction: params.transaction,
+        serializedTransactionBase64: Buffer.from(params.transaction.serialize()).toString("base64"),
+        dontFrontProtected: false,
+        augmented: false,
+      };
+    }
+
+    const rebuiltMessage = new TransactionMessage({
+      payerKey: message.payerKey,
+      recentBlockhash: message.recentBlockhash,
+      instructions: [...message.instructions, ...extraInstructions],
+    }).compileToV0Message(lookupTableAccounts);
+
+    const rebuiltTransaction = new VersionedTransaction(rebuiltMessage);
+    rebuiltTransaction.sign([params.wallet]);
+
+    return {
+      transaction: rebuiltTransaction,
+      serializedTransactionBase64: Buffer.from(rebuiltTransaction.serialize()).toString("base64"),
+      ...(params.tipLamports !== undefined ? { tipLamports: params.tipLamports } : {}),
+      ...(tipAccount ? { tipAccount } : {}),
+      dontFrontProtected: params.addDontFrontProtection,
+      augmented: true,
+    };
+  } catch (error) {
+    params.transaction.sign([params.wallet]);
+
+    return {
+      transaction: params.transaction,
+      serializedTransactionBase64: Buffer.from(params.transaction.serialize()).toString("base64"),
+      ...(params.tipLamports !== undefined ? { tipLamports: params.tipLamports } : {}),
+      dontFrontProtected: false,
+      augmented: false,
+      augmentationError: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 function getEffectiveMaxSlippageBps(plan: TradePlan, isSellOrder: boolean): number {
@@ -198,7 +371,7 @@ async function buildExecutionReceipt(params: {
   connection: Connection;
   signature: string;
   walletAddress: string;
-  quote: JupiterQuoteResponse;
+  quote: ExecutionQuoteSummary;
   inputMint: string;
   outputMint: string;
 }): Promise<ExecutionReceipt> {
@@ -266,7 +439,7 @@ async function findLandedReceiptAfterExpiry(params: {
   connection: Connection;
   signature: string;
   walletAddress: string;
-  quote: JupiterQuoteResponse;
+  quote: ExecutionQuoteSummary;
   inputMint: string;
   outputMint: string;
 }): Promise<ExecutionReceipt | null> {
@@ -282,6 +455,114 @@ async function findLandedReceiptAfterExpiry(params: {
   }
 
   return null;
+}
+
+async function logJitoBundleDiagnostics(jitoClient: JitoClient, bundleId: string) {
+  try {
+    const inflightStatus = await jitoClient.getFirstInflightBundleStatus(bundleId);
+    if (inflightStatus) {
+      console.warn(`[JITO] Bundle ${bundleId} Status: ${inflightStatus.status}${inflightStatus.landedSlot !== null ? ` @ slot ${inflightStatus.landedSlot}` : ""}.`);
+      return;
+    }
+
+    const landedStatuses = await jitoClient.getBundleStatuses([bundleId]);
+    const landedStatus = landedStatuses[0];
+    if (landedStatus) {
+      console.warn(`[JITO] Bundle ${bundleId} landed im Slot ${landedStatus.slot} (${landedStatus.confirmationStatus ?? "unknown"}).`);
+      return;
+    }
+
+    console.warn(`[JITO] Keine Bundle-Diagnose fuer ${bundleId} verfuegbar.`);
+  } catch (error) {
+    console.warn(`[JITO] Bundle-Diagnose fuer ${bundleId} fehlgeschlagen: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function confirmSubmittedTransaction(params: {
+  connection: Connection;
+  signature: string;
+  recentBlockhash: string;
+  lastValidBlockHeight?: number;
+  walletAddress: string;
+  quote: ExecutionQuoteSummary;
+  inputMint: string;
+  outputMint: string;
+  jitoClient?: JitoClient;
+  jitoBundleId?: string;
+}): Promise<ExecutionReceipt> {
+  try {
+    if (params.lastValidBlockHeight !== undefined) {
+      await params.connection.confirmTransaction({
+        signature: params.signature,
+        blockhash: params.recentBlockhash,
+        lastValidBlockHeight: params.lastValidBlockHeight,
+      }, "confirmed");
+    } else {
+      await params.connection.confirmTransaction(params.signature, "confirmed");
+    }
+  } catch (confirmError) {
+    if (!isBlockheightExceededError(confirmError)) {
+      if (params.jitoClient && params.jitoBundleId) {
+        await logJitoBundleDiagnostics(params.jitoClient, params.jitoBundleId);
+      }
+      throw confirmError;
+    }
+
+    const landedReceipt = await findLandedReceiptAfterExpiry({
+      connection: params.connection,
+      signature: params.signature,
+      walletAddress: params.walletAddress,
+      quote: params.quote,
+      inputMint: params.inputMint,
+      outputMint: params.outputMint,
+    });
+
+    if (landedReceipt?.confirmed) {
+      console.warn(`Confirmation window expired for ${params.signature}, but the transaction was found on-chain.`);
+      return landedReceipt;
+    }
+
+    if (params.jitoClient && params.jitoBundleId) {
+      await logJitoBundleDiagnostics(params.jitoClient, params.jitoBundleId);
+    }
+
+    throw confirmError;
+  }
+
+  return buildExecutionReceipt({
+    connection: params.connection,
+    signature: params.signature,
+    walletAddress: params.walletAddress,
+    quote: params.quote,
+    inputMint: params.inputMint,
+    outputMint: params.outputMint,
+  });
+}
+
+async function broadcastTransactionViaRpc(params: {
+  connection: Connection;
+  transaction: VersionedTransaction;
+  lastValidBlockHeight?: number;
+  walletAddress: string;
+  quote: ExecutionQuoteSummary;
+  inputMint: string;
+  outputMint: string;
+}): Promise<ExecutionReceipt> {
+  const rawTx = params.transaction.serialize();
+  const txid = await params.connection.sendRawTransaction(rawTx, { skipPreflight: true });
+  console.log("🚀 Transaction sent via RPC! TXID:", txid);
+  console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
+
+  return confirmSubmittedTransaction({
+    connection: params.connection,
+    signature: txid,
+    recentBlockhash: params.transaction.message.recentBlockhash,
+    walletAddress: params.walletAddress,
+    quote: params.quote,
+    inputMint: params.inputMint,
+    outputMint: params.outputMint,
+    ...(params.lastValidBlockHeight !== undefined ? { lastValidBlockHeight: params.lastValidBlockHeight } : {}),
+  });
 }
 
 function isLikelyPlanFilePath(input: string): boolean {
@@ -314,7 +595,180 @@ async function loadPlan(input: string): Promise<TradePlan> {
   return plan;
 }
 
-export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt | undefined> {
+async function executePreparedTransaction(params: {
+  plan: TradePlan;
+  mode: ExecutionMode;
+  transaction: VersionedTransaction;
+  quote: ExecutionQuoteSummary;
+  inputMint: string;
+  outputMint: string;
+  walletAddress: string;
+  lastValidBlockHeight?: number;
+  priorityFeeLamports?: number;
+  priorityFeeSol?: number;
+  debug?: Record<string, unknown>;
+}): Promise<ExecutionReceipt | undefined> {
+  const connection = new Connection(process.env.HELIUS_RPC_URL || "https://api.mainnet-beta.solana.com", "confirmed");
+  const jitoClient = new JitoClient();
+  const wallet = loadExecutionWallet();
+  const tipLamports = resolveJitoTipLamports();
+  const augmented = await augmentTransactionForJito({
+    connection,
+    jitoClient,
+    transaction: params.transaction,
+    wallet,
+    ...(tipLamports !== undefined ? { tipLamports } : {}),
+    addDontFrontProtection: true,
+  });
+
+  if (augmented.augmentationError) {
+    console.warn(`[JITO] Inline tip/dontfront augmentation skipped for ${params.mode}: ${augmented.augmentationError}`);
+  }
+
+  if (!params.plan.dryRun) {
+    console.warn("\n!!! BROADCASTING LIVE TRANSACTION !!!\n");
+
+    try {
+      let jitoSubmission:
+        | Awaited<ReturnType<JitoClient["submitTransaction"]>>
+        | null = null;
+
+      try {
+        jitoSubmission = await jitoClient.submitTransaction(augmented.serializedTransactionBase64, { bundleOnly: true });
+        console.log(
+          `[JITO] Private send accepted via ${jitoSubmission.endpoint}. Signature: ${jitoSubmission.signature}${jitoSubmission.bundleId ? ` | bundle ${jitoSubmission.bundleId}` : ""}${augmented.tipLamports ? ` | tip ${augmented.tipLamports}` : ""}${augmented.tipAccount ? ` -> ${augmented.tipAccount}` : ""}${augmented.dontFrontProtected ? " | dontfront" : ""}`,
+        );
+      } catch (jitoSubmitError) {
+        console.warn(`[JITO] Private send fehlgeschlagen. Fallback auf oeffentlichen RPC-Broadcast: ${jitoSubmitError instanceof Error ? jitoSubmitError.message : String(jitoSubmitError)}`);
+      }
+
+      if (!jitoSubmission) {
+        return await broadcastTransactionViaRpc({
+          connection,
+          transaction: augmented.transaction,
+          walletAddress: params.walletAddress,
+          quote: params.quote,
+          inputMint: params.inputMint,
+          outputMint: params.outputMint,
+          ...(params.lastValidBlockHeight !== undefined ? { lastValidBlockHeight: params.lastValidBlockHeight } : {}),
+        });
+      }
+
+      const receipt = await confirmSubmittedTransaction({
+        connection,
+        signature: jitoSubmission.signature,
+        recentBlockhash: augmented.transaction.message.recentBlockhash,
+        walletAddress: params.walletAddress,
+        quote: params.quote,
+        inputMint: params.inputMint,
+        outputMint: params.outputMint,
+        jitoClient,
+        ...(params.lastValidBlockHeight !== undefined ? { lastValidBlockHeight: params.lastValidBlockHeight } : {}),
+        ...(jitoSubmission.bundleId ? { jitoBundleId: jitoSubmission.bundleId } : {}),
+      });
+
+      console.log(`🚀 ${params.mode} transaction sent via Jito! TXID:`, jitoSubmission.signature);
+      console.log("🔗 View on Solscan: https://solscan.io/tx/" + jitoSubmission.signature);
+      if (jitoSubmission.bundleId) {
+        console.log(`[JITO] Bundle-ID: ${jitoSubmission.bundleId}`);
+      }
+
+      return receipt;
+    } catch (error) {
+      console.error("Broadcast failed:", error);
+      throw error;
+    }
+  }
+
+  const simulation = await connection.simulateTransaction(augmented.transaction, { sigVerify: false });
+  const preparedJitoTransaction = jitoClient.prepareTransaction(augmented.serializedTransactionBase64, { bundleOnly: true });
+
+  console.log(JSON.stringify({
+    mode: params.mode,
+    plan: params.plan,
+    priorityFeeLamports: params.priorityFeeLamports,
+    priorityFeeSol: params.priorityFeeSol,
+    maxPriorityFeeSol: env.MAX_PRIORITY_FEE_SOL,
+    quote: params.quote,
+    simulation,
+    preparedJitoTransaction,
+    jitoAugmentation: {
+      augmented: augmented.augmented,
+      ...(augmented.tipLamports !== undefined ? { tipLamports: augmented.tipLamports } : {}),
+      ...(augmented.tipAccount ? { tipAccount: augmented.tipAccount } : {}),
+      dontFrontProtected: augmented.dontFrontProtected,
+      ...(augmented.augmentationError ? { augmentationError: augmented.augmentationError } : {}),
+    },
+    ...(params.debug ?? {}),
+  }, null, 2));
+}
+
+async function executeRaydium(plan: TradePlan, priorityFeeLamports?: number, priorityFeeSol?: number) {
+  if (plan.executionMode !== "raydium-sdk") {
+    throw new Error(`Plan ${plan.planId} is not marked for raydium-sdk execution.`);
+  }
+
+  const executionService = new RaydiumExecutionService();
+  const preparedExecution = await executionService.prepareExecutionForPlan(plan, {
+    ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+  });
+  const transaction = VersionedTransaction.deserialize(Buffer.from(preparedExecution.serializedTransactionBase64, "base64"));
+
+  return executePreparedTransaction({
+    plan,
+    mode: "raydium-sdk",
+    transaction,
+    quote: buildDirectQuoteSummary({
+      amountInRaw: preparedExecution.quote.amountInRaw,
+      amountOutRaw: preparedExecution.quote.amountOutRaw,
+      minAmountOutRaw: preparedExecution.quote.minAmountOutRaw,
+      slippageBps: plan.maxSlippageBps,
+    }),
+    inputMint: preparedExecution.quote.inputMint,
+    outputMint: preparedExecution.quote.outputMint,
+    walletAddress: preparedExecution.ownerPublicKey,
+    lastValidBlockHeight: preparedExecution.lastValidBlockHeight,
+    ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+    ...(priorityFeeSol !== undefined ? { priorityFeeSol } : {}),
+    debug: { preparedExecution },
+  });
+}
+
+async function executePumpAmm(plan: TradePlan, priorityFeeLamports?: number, priorityFeeSol?: number) {
+  if (plan.executionMode !== "pumpfun-amm") {
+    throw new Error(`Plan ${plan.planId} is not marked for pumpfun-amm execution.`);
+  }
+
+  const executionService = new PumpAmmExecutionService();
+  const preparedExecution = await executionService.prepareExecutionForPlan(plan, {
+    ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+  });
+  const transaction = VersionedTransaction.deserialize(Buffer.from(preparedExecution.serializedTransactionBase64, "base64"));
+
+  return executePreparedTransaction({
+    plan,
+    mode: "pumpfun-amm",
+    transaction,
+    quote: buildDirectQuoteSummary({
+      amountInRaw: preparedExecution.quote.amountInRaw,
+      amountOutRaw: preparedExecution.quote.amountOutRaw,
+      minAmountOutRaw: preparedExecution.quote.minAmountOutRaw,
+      slippageBps: plan.maxSlippageBps,
+    }),
+    inputMint: preparedExecution.quote.inputMint,
+    outputMint: preparedExecution.quote.outputMint,
+    walletAddress: preparedExecution.ownerPublicKey,
+    lastValidBlockHeight: preparedExecution.lastValidBlockHeight,
+    ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+    ...(priorityFeeSol !== undefined ? { priorityFeeSol } : {}),
+    debug: { preparedExecution },
+  });
+}
+
+export async function executeJupiter(
+  plan: TradePlan,
+  precomputedPriority?: { priorityFeeLamports?: number; priorityFeeSol?: number },
+): Promise<ExecutionReceipt | undefined> {
   if (plan.executionMode !== "jupiter") {
     throw new Error(`Plan ${plan.planId} is not marked for jupiter execution.`);
   }
@@ -323,9 +777,10 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
   console.log("Loaded execution wallet public key:", wallet.publicKey.toBase58());
 
   const jupiter = new JupiterClient();
-  const helius = new HeliusClient();
-  const priorityFeeLamports = await helius.getPriorityFeeEstimate([plan.tokenAddress]);
-  const priorityFeeSol = priorityFeeLamports !== undefined ? lamportsToSol(priorityFeeLamports) : undefined;
+  const priorityFeeLamports = precomputedPriority?.priorityFeeLamports
+    ?? await new HeliusClient().getPriorityFeeEstimate([plan.tokenAddress]);
+  const priorityFeeSol = precomputedPriority?.priorityFeeSol
+    ?? (priorityFeeLamports !== undefined ? lamportsToSol(priorityFeeLamports) : undefined);
 
   if (priorityFeeSol !== undefined && priorityFeeSol > env.MAX_PRIORITY_FEE_SOL) {
     throw new Error(
@@ -398,83 +853,43 @@ export async function executeJupiter(plan: TradePlan): Promise<ExecutionReceipt 
   const swap = await jupiter.buildSwap(swapParams);
 
   const transaction = VersionedTransaction.deserialize(Buffer.from(swap.swapTransaction, "base64"));
-  transaction.sign([wallet]);
-
-  // --- START MANUAL PATCH ---
-  if (!plan.dryRun) {
-    console.warn("\n!!! BROADCASTING LIVE TRANSACTION !!!\n");
-    const rpcUrl = process.env.HELIUS_RPC_URL || "https://api.mainnet-beta.solana.com";
-    const connection = new Connection(rpcUrl, "confirmed");
-    const rawTx = transaction.serialize();
-
-    try {
-      const txid = await connection.sendRawTransaction(rawTx, { skipPreflight: true });
-      try {
-        if (swap.lastValidBlockHeight !== undefined) {
-          await connection.confirmTransaction({
-            signature: txid,
-            blockhash: transaction.message.recentBlockhash,
-            lastValidBlockHeight: swap.lastValidBlockHeight,
-          }, "confirmed");
-        } else {
-          await connection.confirmTransaction(txid, "confirmed");
-        }
-      } catch (confirmError) {
-        if (!isBlockheightExceededError(confirmError)) {
-          throw confirmError;
-        }
-
-        const landedReceipt = await findLandedReceiptAfterExpiry({
-          connection,
-          signature: txid,
-          walletAddress: wallet.publicKey.toBase58(),
-          quote,
-          inputMint: quoteInputMint,
-          outputMint: quoteOutputMint,
-        });
-
-        if (landedReceipt?.confirmed) {
-          console.warn(`Confirmation window expired for ${txid}, but the transaction was found on-chain.`);
-          console.log("🚀 Transaction sent! TXID:", txid);
-          console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
-          return landedReceipt;
-        }
-
-        throw confirmError;
-      }
-      console.log("🚀 Transaction sent! TXID:", txid);
-      console.log("🔗 View on Solscan: https://solscan.io/tx/" + txid);
-      return await buildExecutionReceipt({
-        connection,
-        signature: txid,
-        walletAddress: wallet.publicKey.toBase58(),
-        quote,
-        inputMint: quoteInputMint,
-        outputMint: quoteOutputMint,
-      });
-    } catch (e) {
-      console.error("Broadcast failed:", e);
-      throw e;
-    }
-  }
-  // --- END MANUAL PATCH ---
-
-  const heliusConnection = new RaydiumExecutionService()["connection"];
-  const simulation = await heliusConnection.simulateTransaction(transaction, { sigVerify: false });
-
-  const jitoClient = new JitoClient();
-  const preparedBundle = await jitoClient.submitBundle([Buffer.from(transaction.serialize()).toString("base64")]);
-
-  console.log(JSON.stringify({
-    mode: "jupiter",
+  return executePreparedTransaction({
     plan,
-    priorityFeeLamports,
-    priorityFeeSol,
-    maxPriorityFeeSol: env.MAX_PRIORITY_FEE_SOL,
-    quote,
-    simulation,
-    preparedBundle,
-  }, null, 2));
+    mode: "jupiter",
+    transaction,
+    quote: toExecutionQuoteSummary(quote),
+    inputMint: quoteInputMint,
+    outputMint: quoteOutputMint,
+    walletAddress: wallet.publicKey.toBase58(),
+    ...(swap.lastValidBlockHeight !== undefined ? { lastValidBlockHeight: swap.lastValidBlockHeight } : {}),
+    ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+    ...(priorityFeeSol !== undefined ? { priorityFeeSol } : {}),
+  });
+}
+
+export async function executeTradePlan(plan: TradePlan): Promise<ExecutionReceipt | undefined> {
+  const helius = new HeliusClient();
+  const priorityFeeLamports = await helius.getPriorityFeeEstimate([plan.tokenAddress]);
+  const priorityFeeSol = priorityFeeLamports !== undefined ? lamportsToSol(priorityFeeLamports) : undefined;
+
+  if (priorityFeeSol !== undefined && priorityFeeSol > env.MAX_PRIORITY_FEE_SOL) {
+    throw new Error(
+      `Trade aborted: Priority fee ${priorityFeeSol} exceeds safety limit ${env.MAX_PRIORITY_FEE_SOL}`,
+    );
+  }
+
+  switch (plan.executionMode) {
+    case "pumpfun-amm":
+      return executePumpAmm(plan, priorityFeeLamports, priorityFeeSol);
+    case "raydium-sdk":
+      return executeRaydium(plan, priorityFeeLamports, priorityFeeSol);
+    case "jupiter":
+    default:
+      return executeJupiter(plan, {
+        ...(priorityFeeLamports !== undefined ? { priorityFeeLamports } : {}),
+        ...(priorityFeeSol !== undefined ? { priorityFeeSol } : {}),
+      });
+  }
 }
 
 async function main() {
@@ -487,31 +902,18 @@ async function main() {
 
   const plan = await loadPlan(planInput);
 
-  if (plan.executionMode === "jupiter") {
-    await executeJupiter(plan);
-    return;
-  }
-
-  if (isLikelyPlanFilePath(planInput)) {
-    throw new Error("Raydium execution from direct plan file is not supported yet. Use a stored planId.");
-  }
-
-  const executionService = new RaydiumExecutionService();
-  const jitoClient = new JitoClient();
-
-  const preparedExecution = await executionService.prepareExecution(planInput);
-  const preparedBundle = await jitoClient.submitBundle([preparedExecution.serializedTransactionBase64]);
-
-  console.log(JSON.stringify({ preparedExecution, preparedBundle }, null, 2));
+  await executeTradePlan(plan);
 }
 
-// main().catch((error: unknown) => {
-//  if (error instanceof MissingConfigError) {
-//    console.error(`Configuration error: ${error.message}`);
-//    process.exit(2);
-//  }
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    if (error instanceof MissingConfigError) {
+      console.error(`Configuration error: ${error.message}`);
+      process.exit(2);
+    }
 
-//  const message = error instanceof Error ? error.message : "Unknown error";
-//  console.error(`Trade execution failed: ${message}`);
-//  process.exit(1);
-// });
+    const message = error instanceof Error ? error.message : "Unknown error";
+    console.error(`Trade execution failed: ${message}`);
+    process.exit(1);
+  });
+}

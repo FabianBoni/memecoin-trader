@@ -14,7 +14,7 @@ export interface RiskConfig {
   dryRun: boolean;
 }
 
-export type ExecutionMode = "raydium-sdk" | "jupiter";
+export type ExecutionMode = "raydium-sdk" | "pumpfun-amm" | "jupiter";
 
 export interface TradePlan {
   planId: string;
@@ -30,6 +30,9 @@ export interface TradePlan {
   remainingExposureCapacitySol: number;
   finalPositionSol: number;
   maxSlippageBps: number;
+  inputMint?: string;
+  outputMint?: string;
+  amount?: string;
   stopLossPct: number;
   takeProfitPct: number;
   takeProfitSellFraction: number;

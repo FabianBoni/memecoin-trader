@@ -3,6 +3,19 @@ import path from "node:path";
 import { MissingConfigError } from "../config/env.js";
 import { TokenScreenService } from "../services/token-screen.js";
 import { TradePlanService } from "../services/trade-plan.js";
+import type { ExecutionMode } from "../types/trade.js";
+
+function parseExecutionMode(raw: string | undefined): ExecutionMode | undefined {
+  if (!raw || raw === "auto") {
+    return undefined;
+  }
+
+  if (raw === "jupiter" || raw === "raydium-sdk" || raw === "pumpfun-amm") {
+    return raw;
+  }
+
+  throw new Error(`Unsupported execution mode: ${raw}`);
+}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -12,11 +25,11 @@ async function main() {
   const tokenAddress = positionalArgs[0];
   const requestedPositionSolRaw = positionalArgs[1] ?? "0.3";
   const requestedPositionSol = Number(requestedPositionSolRaw);
-  const executionModeRaw = positionalArgs[2] ?? "raydium-sdk";
-  const executionMode = executionModeRaw === "jupiter" ? "jupiter" : "raydium-sdk";
+  const executionModeRaw = positionalArgs[2] ?? "auto";
+  const executionMode = parseExecutionMode(executionModeRaw);
 
   if (!tokenAddress) {
-    console.error("Usage: npm run plan:trade -- <TOKEN_MINT_ADDRESS> [REQUESTED_POSITION_SOL] [raydium-sdk|jupiter] [--live]");
+    console.error("Usage: npm run plan:trade -- <TOKEN_MINT_ADDRESS> [REQUESTED_POSITION_SOL] [auto|raydium-sdk|pumpfun-amm|jupiter] [--live]");
     process.exit(1);
   }
 

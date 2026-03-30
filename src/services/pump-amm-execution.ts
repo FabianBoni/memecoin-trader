@@ -1,3 +1,11 @@
+import BN from "bn.js";
+import {
+  OnlinePumpAmmSdk,
+  PUMP_AMM_SDK,
+  buyQuoteInput as quotePumpBuyQuoteInput,
+  sellBaseInput as quotePumpSellBaseInput,
+} from "@pump-fun/pump-swap-sdk";
+import { NATIVE_MINT } from "@solana/spl-token";
 import {
   ComputeBudgetProgram,
   Connection,
@@ -5,41 +13,21 @@ import {
   TransactionMessage,
   VersionedTransaction,
 } from "@solana/web3.js";
-import BN from "bn.js";
-import { Liquidity, Token, TokenAmount, TxVersion } from "@raydium-io/raydium-sdk";
 import { env, getHeliusRpcUrl } from "../config/env.js";
-import { HeliusClient } from "../clients/helius.js";
-import { ExecutionGateService } from "./execution-gate.js";
 import { loadTradePlans } from "../storage/trades.js";
-import type { ExecutionMode, TradePlan } from "../types/trade.js";
-import { getWalletTokenAccounts, getWrappedSolMint } from "../solana/token-accounts.js";
-import { quoteRaydiumSwap } from "../solana/raydium-quote.js";
-import { resolveRaydiumPoolKeys } from "../solana/raydium-pool-keys.js";
+import type { TradePlan } from "../types/trade.js";
+import { ExecutionGateService } from "./execution-gate.js";
+import type { PreparedExecution } from "./raydium-execution.js";
 import { loadExecutionWallet } from "../wallet.js";
 
-const DIRECT_EXECUTION_COMPUTE_UNIT_LIMIT = 400_000;
-
-export interface PreparedExecution {
-  plan: TradePlan;
-  ownerPublicKey: string;
-  rpcUrl: string;
-  dryRun: boolean;
-  instructionsSummary: string[];
-  serializedTransactionBase64: string;
-  executionMode: ExecutionMode;
-  lastValidBlockHeight: number;
-  warnings: string[];
-  quote: {
-    inputMint: string;
-    outputMint: string;
-    amountInRaw: string;
-    amountOutRaw: string;
-    minAmountOutRaw: string;
-  };
-}
+const DIRECT_EXECUTION_COMPUTE_UNIT_LIMIT = 450_000;
 
 function solToLamports(sol: number): BN {
   return new BN(Math.round(sol * 1_000_000_000));
+}
+
+function slippageBpsToPct(slippageBps: number): number {
+  return Math.max(0.1, slippageBps / 100);
 }
 
 function buildPriorityFeeInstructions(priorityFeeLamports?: number) {
@@ -64,10 +52,10 @@ function buildWarnings(dryRun: boolean): string[] {
     : [];
 }
 
-export class RaydiumExecutionService {
+export class PumpAmmExecutionService {
   private readonly gate = new ExecutionGateService();
   private readonly connection = new Connection(getHeliusRpcUrl(), "confirmed");
-  private readonly heliusClient = new HeliusClient();
+  private readonly sdk = new OnlinePumpAmmSdk(this.connection);
 
   async getPlan(planId: string): Promise<TradePlan> {
     const plans = await loadTradePlans();
@@ -93,48 +81,60 @@ export class RaydiumExecutionService {
     const wallet = loadExecutionWallet();
     const owner = wallet.publicKey;
     const tokenMint = new PublicKey(plan.tokenAddress);
-    const inputMint = getWrappedSolMint();
-    const outputMint = tokenMint;
+    const poolKey = new PublicKey(plan.poolAddress);
+    const swapState = await this.sdk.swapSolanaState(poolKey, owner);
+    const slippagePct = slippageBpsToPct(plan.maxSlippageBps);
+    const quoteInLamports = solToLamports(plan.finalPositionSol);
 
-    const { poolKeys, poolInfo } = await resolveRaydiumPoolKeys(this.heliusClient, plan.poolAddress);
-    const quote = quoteRaydiumSwap({
-      poolKeys,
-      poolInfo,
-      inputMint: inputMint.toBase58(),
-      outputMint: outputMint.toBase58(),
-      amountInSol: plan.finalPositionSol,
-      slippageBps: plan.maxSlippageBps,
-    });
+    let inputMint = NATIVE_MINT;
+    let outputMint = tokenMint;
+    let amountOutRaw: string;
+    let minAmountOutRaw: string;
+    let swapInstructions;
 
-    const tokenAccounts = await getWalletTokenAccounts(this.heliusClient, owner);
-    const tokenIn = new Token(poolKeys.programId, inputMint, 9);
-    const tokenOut = new Token(poolKeys.programId, outputMint, poolKeys.baseMint.equals(outputMint) ? poolKeys.baseDecimals : poolKeys.quoteDecimals);
+    if (swapState.pool.baseMint.equals(tokenMint) && swapState.pool.quoteMint.equals(NATIVE_MINT)) {
+      const quote = quotePumpBuyQuoteInput({
+        quote: quoteInLamports,
+        slippage: slippagePct,
+        baseReserve: swapState.poolBaseAmount,
+        quoteReserve: swapState.poolQuoteAmount,
+        globalConfig: swapState.globalConfig,
+        baseMintAccount: swapState.baseMintAccount,
+        baseMint: swapState.baseMint,
+        coinCreator: swapState.pool.coinCreator,
+        creator: swapState.pool.creator,
+        feeConfig: swapState.feeConfig,
+      });
 
-    const amountIn = new TokenAmount(tokenIn, solToLamports(plan.finalPositionSol));
-    const amountOut = new TokenAmount(tokenOut, new BN(quote.minAmountOutRaw));
+      amountOutRaw = quote.base.toString();
+      minAmountOutRaw = quote.base.toString();
+      swapInstructions = await PUMP_AMM_SDK.buyQuoteInput(swapState, quoteInLamports, slippagePct);
+    } else if (swapState.pool.baseMint.equals(NATIVE_MINT) && swapState.pool.quoteMint.equals(tokenMint)) {
+      const quote = quotePumpSellBaseInput({
+        base: quoteInLamports,
+        slippage: slippagePct,
+        baseReserve: swapState.poolBaseAmount,
+        quoteReserve: swapState.poolQuoteAmount,
+        globalConfig: swapState.globalConfig,
+        baseMintAccount: swapState.baseMintAccount,
+        baseMint: swapState.baseMint,
+        coinCreator: swapState.pool.coinCreator,
+        creator: swapState.pool.creator,
+        feeConfig: swapState.feeConfig,
+      });
 
-    const built = await Liquidity.makeSwapInstructionSimple({
-      connection: this.connection,
-      poolKeys: poolKeys as any,
-      userKeys: {
-        tokenAccounts: tokenAccounts as any,
-        owner,
-        payer: owner,
-      },
-      amountIn,
-      amountOut,
-      fixedSide: "in",
-      config: {
-        bypassAssociatedCheck: false,
-        checkCreateATAOwner: true,
-      },
-      makeTxVersion: TxVersion.V0,
-      lookupTableCache: {},
-    } as any);
+      amountOutRaw = quote.uiQuote.toString();
+      minAmountOutRaw = quote.minQuote.toString();
+      swapInstructions = await PUMP_AMM_SDK.sellBaseInput(swapState, quoteInLamports, slippagePct);
+    } else {
+      throw new Error(
+        `Pump AMM pool ${plan.poolAddress} does not expose a SOL/token orientation for ${plan.tokenAddress}.`,
+      );
+    }
 
     const allInstructions = [
       ...buildPriorityFeeInstructions(options?.priorityFeeLamports),
-      ...built.innerTransactions.flatMap((tx: any) => tx.instructions ?? []),
+      ...swapInstructions,
     ];
     const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
     const messageV0 = new TransactionMessage({
@@ -151,15 +151,15 @@ export class RaydiumExecutionService {
       ownerPublicKey: owner.toBase58(),
       rpcUrl: getHeliusRpcUrl(),
       dryRun: env.DRY_RUN,
-      executionMode: "raydium-sdk",
+      executionMode: "pumpfun-amm",
       lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
       warnings: buildWarnings(env.DRY_RUN),
       quote: {
         inputMint: inputMint.toBase58(),
         outputMint: outputMint.toBase58(),
-        amountInRaw: quote.amountInRaw,
-        amountOutRaw: quote.amountOutRaw,
-        minAmountOutRaw: quote.minAmountOutRaw,
+        amountInRaw: quoteInLamports.toString(),
+        amountOutRaw,
+        minAmountOutRaw,
       },
       instructionsSummary: allInstructions.map((ix, index) => `ix[${index}] program=${ix.programId.toBase58()} dataLen=${ix.data.length}`),
       serializedTransactionBase64: Buffer.from(transaction.serialize()).toString("base64"),

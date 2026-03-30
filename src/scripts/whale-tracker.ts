@@ -7,13 +7,15 @@ import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from "../config/env.js";
 import { riskConfig } from '../config/risk.js';
 import { TokenScreenService } from '../services/token-screen.js';
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
-import { getWhaleModeSummary } from '../storage/whale-stats.js';
+import { getWhaleModeSummary, type WhaleModeSummary } from '../storage/whale-stats.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
 import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import type { DexPairSummary } from '../types/market.js';
 import type { TokenSecurityScreen } from '../types/token.js';
+import type { ExecutionMode, TradePlan } from '../types/trade.js';
+import { chooseHotExecutionMode } from '../services/execution-routing.js';
 import { sendTelegram } from "./telegram-notifier.js";
 
 const PRIMARY_RPC_URL = getHeliusRpcUrl();
@@ -42,6 +44,14 @@ const TRACKER_RPC_CONCURRENCY = 2;
 const TRACKER_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
 const MIN_SOL_RESERVE = Number(process.env.MIN_SOL_RESERVE || '0.05');
 const MIN_RELIABLE_WHALE_SOL_DELTA = 0.01;
+const PAPER_SIGNAL_BLOCK_MIN_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES, 8);
+const PAPER_SIGNAL_BLOCK_EXTENDED_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 2, 16);
+const PAPER_SIGNAL_BLOCK_MAX_WIN_RATE_PCT = 35;
+const PAPER_SIGNAL_BLOCK_MAX_AVG_PNL_PCT = 0;
+const PAPER_SIGNAL_BLOCK_MAX_MEDIAN_PNL_PCT = 0.25;
+const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_WIN_RATE_PCT = 45;
+const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_AVG_PNL_PCT = 0.5;
+const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_MEDIAN_PNL_PCT = 0.25;
 type MarketEntryPriceSource = Extract<PaperTradeRecord['entryPriceSource'], 'market-snapshot' | 'dexscreener-snapshot'>;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
@@ -118,42 +128,86 @@ function getBuySlippageLadder(mint: string): number[] {
 async function executeBuyWithRetry(params: {
   mint: string;
   positionSol: number;
+  preferredExecutionMode?: ExecutionMode;
+  poolAddress?: string | null;
+  dexId?: string | null;
 }) {
-  const { executeJupiter } = await import('./execute-trade.js');
+  const { executeTradePlan } = await import('./execute-trade.js');
   const slippageLadder = getBuySlippageLadder(params.mint);
+  const executionModes: ExecutionMode[] = params.preferredExecutionMode
+    && params.preferredExecutionMode !== 'jupiter'
+    && params.poolAddress
+    ? [params.preferredExecutionMode, 'jupiter']
+    : ['jupiter'];
   let lastError: unknown;
+
+  const buildExecutionPlan = (executionMode: ExecutionMode, maxSlippageBps: number): TradePlan => ({
+    planId: `AUTO-${Date.now()}-${executionMode}-${maxSlippageBps}`,
+    createdAt: new Date().toISOString(),
+    tokenAddress: params.mint,
+    ...(params.poolAddress ? { poolAddress: params.poolAddress } : {}),
+    ...(params.dexId ? { dexId: params.dexId } : {}),
+    executionMode,
+    requestedPositionSol: params.positionSol,
+    allowedPositionSol: params.positionSol,
+    currentOpenExposureSol: 0,
+    projectedOpenExposureSol: params.positionSol,
+    remainingExposureCapacitySol: params.positionSol,
+    finalPositionSol: params.positionSol,
+    maxSlippageBps,
+    stopLossPct: riskConfig.stopLossPct,
+    takeProfitPct: riskConfig.takeProfitPct,
+    takeProfitSellFraction: riskConfig.takeProfitSellFraction,
+    dryRun: false,
+    requiresGo: false,
+    screenPassed: true,
+    executable: true,
+    blockingReasons: [],
+    notes: ['auto-generated live whale buy'],
+  });
 
   for (let attemptIndex = 0; attemptIndex < slippageLadder.length; attemptIndex += 1) {
     const maxSlippageBps = slippageLadder[attemptIndex];
+    if (maxSlippageBps === undefined) {
+      continue;
+    }
 
-    try {
-      console.log(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} mit ${maxSlippageBps} bps.`);
-      const receipt = await executeJupiter({
-        planId: `AUTO-${Date.now()}-A${attemptIndex + 1}`,
-        tokenAddress: params.mint,
-        finalPositionSol: params.positionSol,
-        maxSlippageBps,
-        executionMode: 'jupiter',
-        dryRun: false,
-      } as any);
+    for (let modeIndex = 0; modeIndex < executionModes.length; modeIndex += 1) {
+      const executionMode = executionModes[modeIndex]!;
+      const isDirectFallback = executionMode !== 'jupiter';
 
-      if (!receipt?.confirmed) {
-        throw new Error(`Buy execution returned without on-chain confirmation for ${params.mint}.`);
+      try {
+        console.log(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} mit ${maxSlippageBps} bps via ${executionMode}.`);
+        const receipt = await executeTradePlan(buildExecutionPlan(executionMode, maxSlippageBps));
+
+        if (!receipt?.confirmed) {
+          throw new Error(`Buy execution returned without on-chain confirmation for ${params.mint}.`);
+        }
+
+        return { receipt, maxSlippageBps, attempts: attemptIndex + 1, executionMode };
+      } catch (error) {
+        lastError = error;
+        console.error(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} via ${executionMode} fehlgeschlagen:`, error);
+
+        const hasModeFallback = modeIndex < executionModes.length - 1;
+        if (hasModeFallback && isDirectFallback) {
+          console.warn(`[BUY] Direkter Pfad ${executionMode} fehlgeschlagen. Fallback auf Jupiter fuer ${params.mint.slice(0,6)} im selben Versuch.`);
+          continue;
+        }
+
+        const canRetry = attemptIndex < slippageLadder.length - 1;
+        if (!canRetry) {
+          break;
+        }
+
+        if (!isSlippageExceededError(error) && !shouldSuppressBuyFailureTelegram(error)) {
+          break;
+        }
       }
+    }
 
-      return { receipt, maxSlippageBps, attempts: attemptIndex + 1 };
-    } catch (error) {
-      lastError = error;
-      console.error(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} fehlgeschlagen:`, error);
-
-      const canRetry = attemptIndex < slippageLadder.length - 1;
-      if (!canRetry) {
-        break;
-      }
-
-      if (!isSlippageExceededError(error) && !shouldSuppressBuyFailureTelegram(error)) {
-        break;
-      }
+    if (lastError && !isSlippageExceededError(lastError) && !shouldSuppressBuyFailureTelegram(lastError)) {
+      break;
     }
   }
 
@@ -544,7 +598,7 @@ type WhalePerformanceProfile = {
   winRate: number | null;
   avgPnlPct: number | null;
   medianPnlPct: number | null;
-  tier: 'test' | 'caution' | 'standard' | 'elite';
+  tier: 'test' | 'caution' | 'standard' | 'elite' | 'blocked';
   sourceMode: 'paper' | 'live';
 };
 
@@ -573,6 +627,9 @@ type EntryDecision = {
   priceExtensionPct: number | null;
   expectedNetProfitPct: number | null;
   rewardRiskRatio: number | null;
+  poolAddress: string | null;
+  dexId: string | null;
+  preferredExecutionMode: ExecutionMode;
   rejectionReasons: string[];
   notes: string[];
 };
@@ -595,6 +652,60 @@ function logSizingConfiguration() {
   });
 }
 
+function shouldBlockPaperSignals(summary: WhaleModeSummary): boolean {
+  if (summary.evaluatedTrades < PAPER_SIGNAL_BLOCK_MIN_TRADES) {
+    return false;
+  }
+
+  const winRate = summary.winRatePct;
+  const avgPnlPct = summary.avgPnlPct;
+  const medianPnlPct = summary.medianPnlPct ?? avgPnlPct;
+  if (winRate === null || avgPnlPct === null || medianPnlPct === null) {
+    return false;
+  }
+
+  const clearlyWeak = winRate < PAPER_SIGNAL_BLOCK_MAX_WIN_RATE_PCT
+    && avgPnlPct <= PAPER_SIGNAL_BLOCK_MAX_AVG_PNL_PCT
+    && medianPnlPct <= PAPER_SIGNAL_BLOCK_MAX_MEDIAN_PNL_PCT;
+  if (clearlyWeak) {
+    return true;
+  }
+
+  return summary.evaluatedTrades >= PAPER_SIGNAL_BLOCK_EXTENDED_TRADES
+    && winRate < PAPER_SIGNAL_BLOCK_EXTENDED_MAX_WIN_RATE_PCT
+    && avgPnlPct <= PAPER_SIGNAL_BLOCK_EXTENDED_MAX_AVG_PNL_PCT
+    && medianPnlPct <= PAPER_SIGNAL_BLOCK_EXTENDED_MAX_MEDIAN_PNL_PCT;
+}
+
+function getPaperSignalBlockReason(profile: WhalePerformanceProfile): string | null {
+  if (profile.sourceMode !== 'paper' || profile.tier !== 'blocked') {
+    return null;
+  }
+
+  const winRate = profile.winRate;
+  const avgPnlPct = profile.avgPnlPct;
+  const medianPnlPct = profile.medianPnlPct ?? avgPnlPct;
+  if (winRate === null || avgPnlPct === null || medianPnlPct === null) {
+    return 'Paper-Wal ist nach Historie blockiert.';
+  }
+
+  const blockProfile = profile.sampleSize >= PAPER_SIGNAL_BLOCK_EXTENDED_TRADES
+    ? {
+        minTrades: PAPER_SIGNAL_BLOCK_EXTENDED_TRADES,
+        maxWinRate: PAPER_SIGNAL_BLOCK_EXTENDED_MAX_WIN_RATE_PCT,
+        maxAvgPnl: PAPER_SIGNAL_BLOCK_EXTENDED_MAX_AVG_PNL_PCT,
+        maxMedianPnl: PAPER_SIGNAL_BLOCK_EXTENDED_MAX_MEDIAN_PNL_PCT,
+      }
+    : {
+        minTrades: PAPER_SIGNAL_BLOCK_MIN_TRADES,
+        maxWinRate: PAPER_SIGNAL_BLOCK_MAX_WIN_RATE_PCT,
+        maxAvgPnl: PAPER_SIGNAL_BLOCK_MAX_AVG_PNL_PCT,
+        maxMedianPnl: PAPER_SIGNAL_BLOCK_MAX_MEDIAN_PNL_PCT,
+      };
+
+  return `Paper-Wal pausiert: ${profile.sampleSize} Trades, Win-Rate ${winRate.toFixed(0)}% <= ${blockProfile.maxWinRate.toFixed(0)}%, Avg ${avgPnlPct.toFixed(2)}% <= ${blockProfile.maxAvgPnl.toFixed(2)}%, Median ${medianPnlPct.toFixed(2)}% <= ${blockProfile.maxMedianPnl.toFixed(2)}%.`;
+}
+
 function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
   try {
     const liveSummary = getWhaleModeSummary(whale.address, 'live');
@@ -613,6 +724,10 @@ function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
       }
     } else if (summary.evaluatedTrades >= 3) {
       tier = (summary.avgPnlPct ?? 0) < 0 ? 'caution' : 'standard';
+    }
+
+    if (sourceMode === 'paper' && shouldBlockPaperSignals(summary)) {
+      tier = 'blocked';
     }
 
     return {
@@ -825,6 +940,9 @@ async function evaluateEntryDecision(
 ): Promise<EntryDecision> {
   const rejectionReasons: string[] = [];
   const notes: string[] = [];
+  let poolAddress: string | null = null;
+  let dexId: string | null = null;
+  let preferredExecutionMode: ExecutionMode = 'jupiter';
   const marketEntry = await fetchEntryPriceUsd(mint);
   const marketEntryPriceUsd = marketEntry.price;
   const whaleEntry = await inferEntryPriceFromWhaleTransaction({ ...(parsedTx !== undefined ? { parsedTx } : {}), whaleAddress: whale.address, mint });
@@ -880,6 +998,14 @@ async function evaluateEntryDecision(
           rejectionReasons.push(`Token-Screen fehlgeschlagen: ${(screen.reasons[0] ?? 'unbekannt').slice(0, 160)}`);
         }
       }
+      poolAddress = screen.liquidity?.pool?.pairAddress ?? null;
+      dexId = screen.liquidity?.pool?.dexId ?? null;
+      preferredExecutionMode = chooseHotExecutionMode({
+        mint,
+        dexId,
+        liquidityUsd,
+        whaleBuySizeSol,
+      });
       if (screen.warnings.length > 0) {
         notes.push(screen.warnings[0]!);
       }
@@ -904,6 +1030,9 @@ async function evaluateEntryDecision(
     priceExtensionPct,
     expectedNetProfitPct,
     rewardRiskRatio,
+    poolAddress,
+    dexId,
+    preferredExecutionMode,
     rejectionReasons,
     notes,
   };
@@ -1003,13 +1132,28 @@ async function logDecision(
   signature?: string,
 ) {
   const positionProfile = getPositionSizeProfile(whale);
+  const paperSignalBlockReason = whale.mode === 'paper'
+    ? getPaperSignalBlockReason(positionProfile)
+    : null;
+
+  if (paperSignalBlockReason) {
+    console.log(`[BUY] ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} blockiert: ${paperSignalBlockReason}`);
+    updateRuntimeStatus('tracker', {
+      lastBlockedPaperSignalAt: new Date().toISOString(),
+      lastBlockedPaperWhale: whale.address,
+      lastBlockedPaperMint: mint,
+      lastBlockedPaperReason: paperSignalBlockReason,
+    });
+    return;
+  }
+
   const entryDecision = await evaluateEntryDecision(whale, mint, parsedTx);
 
   const winRateLabel = positionProfile.winRate === null
     ? `${positionProfile.sampleSize} Trades (${positionProfile.sourceMode})`
     : `${positionProfile.winRate.toFixed(0)}% / Avg ${positionProfile.avgPnlPct?.toFixed(1) ?? 'n/a'}% aus ${positionProfile.sampleSize} ${positionProfile.sourceMode}`;
 
-  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'} avg=${positionProfile.avgPnlPct ?? 'n/a'} liq=${entryDecision.liquidityUsd ?? 'n/a'} ext=${entryDecision.priceExtensionPct ?? 'n/a'} rr=${entryDecision.rewardRiskRatio ?? 'n/a'}`);
+  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} sample=${positionProfile.sampleSize} winRate=${positionProfile.winRate ?? 'n/a'} avg=${positionProfile.avgPnlPct ?? 'n/a'} liq=${entryDecision.liquidityUsd ?? 'n/a'} ext=${entryDecision.priceExtensionPct ?? 'n/a'} rr=${entryDecision.rewardRiskRatio ?? 'n/a'} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}`);
 
   if (!entryDecision.allowed) {
     console.log(`[BUY] ${mint.slice(0,6)} uebersprungen: ${entryDecision.rejectionReasons.join(' | ')}`);
@@ -1046,9 +1190,12 @@ async function logDecision(
       return;
     }
 
-    const { receipt: executionReceipt, maxSlippageBps, attempts } = await executeBuyWithRetry({
+    const { receipt: executionReceipt, maxSlippageBps, attempts, executionMode } = await executeBuyWithRetry({
       mint,
       positionSol: sizingDecision.positionSol,
+      preferredExecutionMode: entryDecision.preferredExecutionMode,
+      poolAddress: entryDecision.poolAddress,
+      dexId: entryDecision.dexId,
     });
 
     const entryPrice = executionReceipt?.fillPriceUsd ?? entryDecision.marketEntryPriceUsd ?? entryDecision.entryPrice;
@@ -1095,6 +1242,9 @@ async function logDecision(
       takeProfitTaken: false,
       whaleBuySizeSol: entryDecision.whaleBuySizeSol ?? null,
       liquidityUsd: entryDecision.liquidityUsd ?? null,
+      dexId: entryDecision.dexId ?? null,
+      poolAddress: entryDecision.poolAddress ?? null,
+      executionMode,
       priceExtensionPct: entryDecision.priceExtensionPct ?? null,
       expectedNetProfitPct: entryDecision.expectedNetProfitPct ?? null,
       rewardRiskRatio: entryDecision.rewardRiskRatio ?? null,
@@ -1107,7 +1257,7 @@ async function logDecision(
     const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     const activeCount = Object.keys(persistedTrades).length;
 
-    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}%</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}%</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${winRateLabel}\nModus: ${positionProfile.tier}\nExecution: <b>${executionMode}</b>${entryDecision.dexId ? ` via ${entryDecision.dexId}` : ''}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
       cooldownMs: 300_000,
       priority: true,
