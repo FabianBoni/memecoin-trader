@@ -64,12 +64,14 @@ const HIGH_VOLUME_SEED_POOL_CANDIDATE_MIN_VOLUME_USD = HIGH_VOLUME_SEED_FALLBACK
 const HIGH_VOLUME_SEED_WEAK_SIGNAL_SCAN_CAP = 200;
 const JUPITER_V4_PROGRAM_ID = 'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB';
 const JUPITER_V6_PROGRAM_ID = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+const ORCA_WHIRLPOOL_PROGRAM_ID = 'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc';
 const SCOUT_KNOWN_DEX_PROGRAM_IDS = new Set<string>([
   getPumpProgramId(),
   getPumpAmmProgramId(),
   ...RAYDIUM_AMM_V4_PROGRAM_IDS,
   JUPITER_V4_PROGRAM_ID,
   JUPITER_V6_PROGRAM_ID,
+  ORCA_WHIRLPOOL_PROGRAM_ID,
 ]);
 const dexscreenerClient = new DexscreenerClient();
 const liquidityScreenService = new LiquidityScreenService();
@@ -459,9 +461,22 @@ function getNonSolTokenAddress(pair: DexPairSummary): string | null {
   return null;
 }
 
-function isPumpSwapMarketSeedPair(pair: DexPairSummary): boolean {
+function normalizeScoutDexId(dexId?: string): string | undefined {
+  const normalized = dexId?.trim().toLowerCase();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function isSupportedScoutMarketDexId(dexId?: string): boolean {
+  const normalized = normalizeScoutDexId(dexId);
+  return normalized === 'pumpfun-amm'
+    || normalized === 'pumpswap'
+    || (normalized?.includes('raydium') ?? false)
+    || (normalized?.includes('orca') ?? false);
+}
+
+function isSupportedScoutMarketPair(pair: DexPairSummary): boolean {
   return pair.chainId === 'solana'
-    && (pair.dexId === 'pumpswap' || pair.dexId === 'pumpfun-amm')
+    && isSupportedScoutMarketDexId(pair.dexId)
     && typeof pair.pairAddress === 'string'
     && pair.pairAddress.trim().length > 0
     && getNonSolTokenAddress(pair) !== null;
@@ -482,7 +497,7 @@ function isScoutPairMatch(pair: DexPairSummary, mintAddress: string): boolean {
 }
 
 function pickBestScoutSeedPair(mintAddress: string, pairs: DexPairSummary[]): DexPairSummary | null {
-  const matchingPairs = pairs.filter((pair) => isScoutPairMatch(pair, mintAddress));
+  const matchingPairs = pairs.filter((pair) => isScoutPairMatch(pair, mintAddress) && isSupportedScoutMarketDexId(pair.dexId));
   if (matchingPairs.length === 0) {
     return null;
   }
@@ -609,7 +624,7 @@ async function fetchBoostScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
 }
 
 async function fetchMarketScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
-  const marketQueries = ['pump', 'pumpswap'];
+  const marketQueries = ['pump', 'pumpswap', 'raydium', 'orca'];
   const settledResults = await Promise.allSettled(marketQueries.map((query) => dexscreenerClient.searchPairs(query)));
   const candidates = new Map<string, RawScoutSeedInput>();
 
@@ -621,7 +636,7 @@ async function fetchMarketScoutSeedInputs(): Promise<RawScoutSeedInput[]> {
     }
 
     for (const pair of result.value) {
-      if (!isPumpSwapMarketSeedPair(pair)) {
+      if (!isSupportedScoutMarketPair(pair)) {
         continue;
       }
 
@@ -1992,7 +2007,7 @@ async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSe
 }
 
 async function scout() {
-  console.log('[SCOUT] Starte Whale-Suche ueber migrierte Seed-Tokens...');
+  console.log('[SCOUT] Starte Whale-Suche ueber qualifizierte Seed-Tokens...');
   const rejectedCandidates = readRejectedCandidateStore();
   let rejectedCandidatesDirty = pruneRejectedCandidateStore(rejectedCandidates);
   updateRuntimeStatus('scout', {
@@ -2024,9 +2039,9 @@ async function scout() {
     }
 
     const seedInputsToCheck = scoutSeedInputs.slice(0, Math.max(env.SCOUT_SEED_CHECK_LIMIT, env.SCOUT_BOOST_TOKEN_LIMIT));
-    const migratedScoutSeeds = await buildScoutSeeds(seedInputsToCheck);
-    const highVolumeScoutSeeds = migratedScoutSeeds.filter((seed) => seed.highVolumeEligible);
-    const fallbackScoutSeeds = migratedScoutSeeds.filter((seed) => qualifiesAsNearHighVolumeFallbackSeed(seed));
+    const eligibleScoutSeeds = await buildScoutSeeds(seedInputsToCheck);
+    const highVolumeScoutSeeds = eligibleScoutSeeds.filter((seed) => seed.highVolumeEligible);
+    const fallbackScoutSeeds = eligibleScoutSeeds.filter((seed) => qualifiesAsNearHighVolumeFallbackSeed(seed));
     const usingFallbackSeeds = highVolumeScoutSeeds.length === 0 && fallbackScoutSeeds.length > 0;
     const bestFallbackSeed = fallbackScoutSeeds[0];
     if (usingFallbackSeeds && bestFallbackSeed) {
@@ -2035,13 +2050,14 @@ async function scout() {
     const scoutSeeds = (usingFallbackSeeds ? fallbackScoutSeeds : highVolumeScoutSeeds)
       .slice(0, env.SCOUT_BOOST_TOKEN_LIMIT);
 
-    if (migratedScoutSeeds.length === 0) {
-      console.log('[SCOUT] Keine migrierten Seeds mit Marktinformationen verfuegbar.');
+    if (eligibleScoutSeeds.length === 0) {
+      console.log('[SCOUT] Keine scoutbaren Seeds mit Marktinformationen verfuegbar.');
       updateRuntimeStatus('scout', {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
         whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        eligibleSeedCount: 0,
         migratedSeedCount: 0,
         highVolumeSeedCount: 0,
       });
@@ -2049,20 +2065,21 @@ async function scout() {
     }
 
     if (highVolumeScoutSeeds.length === 0 && fallbackScoutSeeds.length === 0) {
-      console.warn(`[SCOUT] Kein migrierter Seed ist stark genug fuer Whale-Discovery. Fallback erfordert aktuell etwa >= $${Math.max(50_000, env.SCOUT_MIN_SEED_VOLUME_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_VOLUME_FACTOR).toFixed(0)} Vol24h, >= $${Math.max(15_000, env.SCOUT_MIN_SEED_LIQUIDITY_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_LIQUIDITY_FACTOR).toFixed(0)} Liq, >= ${Math.max(60, Math.floor(env.SCOUT_MIN_SEED_TX_COUNT * NEAR_HIGH_VOLUME_FALLBACK_SEED_TX_FACTOR))} TX und AvgTx >= $${Math.max(100, env.SCOUT_MIN_SEED_AVG_TRADE_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_AVG_TRADE_FACTOR).toFixed(0)}.`);
+      console.warn(`[SCOUT] Kein scoutbarer Seed ist stark genug fuer Whale-Discovery. Fallback erfordert aktuell etwa >= $${Math.max(50_000, env.SCOUT_MIN_SEED_VOLUME_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_VOLUME_FACTOR).toFixed(0)} Vol24h, >= $${Math.max(15_000, env.SCOUT_MIN_SEED_LIQUIDITY_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_LIQUIDITY_FACTOR).toFixed(0)} Liq, >= ${Math.max(60, Math.floor(env.SCOUT_MIN_SEED_TX_COUNT * NEAR_HIGH_VOLUME_FALLBACK_SEED_TX_FACTOR))} TX und AvgTx >= $${Math.max(100, env.SCOUT_MIN_SEED_AVG_TRADE_USD * NEAR_HIGH_VOLUME_FALLBACK_SEED_AVG_TRADE_FACTOR).toFixed(0)}.`);
       updateRuntimeStatus('scout', {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
         whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
-        migratedSeedCount: migratedScoutSeeds.length,
+        eligibleSeedCount: eligibleScoutSeeds.length,
+        migratedSeedCount: eligibleScoutSeeds.length,
         highVolumeSeedCount: highVolumeScoutSeeds.length,
       });
       return;
     }
 
     if (usingFallbackSeeds) {
-      console.warn(`[SCOUT] Kein migrierter Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze nur Near-Threshold-Fallback-Seeds statt beliebiger Restkandidaten.`);
+      console.warn(`[SCOUT] Kein scoutbarer Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze nur Near-Threshold-Fallback-Seeds statt beliebiger Restkandidaten.`);
     }
 
     const currentWhales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
@@ -2087,7 +2104,7 @@ async function scout() {
 
     let addedCount = 0;
     let cooldownSkippedCandidates = 0;
-    const migratedSeedCount = migratedScoutSeeds.length;
+    const eligibleSeedCount = eligibleScoutSeeds.length;
     const highVolumeSeedCount = highVolumeScoutSeeds.length;
 
     for (const seed of scoutSeeds) {
@@ -2098,6 +2115,8 @@ async function scout() {
       const mintAddress = seed.mintAddress;
       updateRuntimeStatus('scout', {
         lastToken: mintAddress,
+        lastEligibleSeedToken: mintAddress,
+        lastEligibleSeedReason: seed.reason,
         lastMigratedSeedToken: mintAddress,
         lastMigratedSeedReason: seed.reason,
         lastSeedMarketVolumeUsd: Math.round(seed.marketVolume24hUsd),
@@ -2107,7 +2126,7 @@ async function scout() {
 
       const seedModeLabel = seed.highVolumeEligible ? 'high-volume' : 'fallback';
       const seedSignatureScanCap = getSeedSignatureScanCap(seed);
-      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber migrierten Token ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h}, AvgTx ~$${seed.marketAvgTradeUsd.toFixed(0)}${seedSignatureScanCap ? `, Scan-Cap ${seedSignatureScanCap}` : ''})...`);
+      console.log(`[SCOUT] Pruefe Top-${TOP_TRADERS_PER_TOKEN}-Trader ueber Seed ${mintAddress} via ${seed.scanAddress} (${seed.reason}, source ${seed.source}, ${seedModeLabel}, Vol24h ~$${seed.marketVolume24hUsd.toFixed(0)}, Liq ~$${seed.marketLiquidityUsd.toFixed(0)}, Tx ${seed.marketTxCount24h}, AvgTx ~$${seed.marketAvgTradeUsd.toFixed(0)}${seedSignatureScanCap ? `, Scan-Cap ${seedSignatureScanCap}` : ''})...`);
       let topTokenTraders: SeedTraderCandidate[];
       try {
         topTokenTraders = await collectTopTokenTraders(
@@ -2254,7 +2273,7 @@ async function scout() {
         writeJsonFileSync(WHALE_FILE, currentWhales);
 
   console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${effectiveVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
-  await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Status: <b>MIGRATED</b> (${seed.reason})\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${effectiveVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
+  await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Route: <b>${seed.reason.toUpperCase()}</b>\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${effectiveVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {
           dedupeKey: `scout-new-whale:${mintAddress}:${walletAddress}`,
           cooldownMs: 24 * 60 * 60 * 1000,
         });
@@ -2278,7 +2297,8 @@ async function scout() {
       lastToken: scoutSeeds[0]?.mintAddress,
       lastEvaluatedCandidates: evaluatedCandidates.size,
       cooldownSkippedCandidates,
-      migratedSeedCount,
+      eligibleSeedCount,
+      migratedSeedCount: eligibleSeedCount,
       highVolumeSeedCount,
       boostSeedInputCount: boostScoutSeedInputs.length,
       marketSeedInputCount: marketScoutSeedInputs.length,

@@ -23,8 +23,46 @@ function parseBigInt(value: string | undefined): bigint {
   return BigInt(value);
 }
 
+function normalizeDexId(dexId?: string | null): string | undefined {
+  const normalized = dexId?.trim().toLowerCase();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function isPumpScoutDexId(dexId?: string | null): boolean {
+  const normalized = normalizeDexId(dexId);
+  return normalized === 'pumpfun-amm' || normalized === 'pumpswap';
+}
+
+function isRaydiumScoutDexId(dexId?: string | null): boolean {
+  return normalizeDexId(dexId)?.includes('raydium') ?? false;
+}
+
+function isOrcaScoutDexId(dexId?: string | null): boolean {
+  return normalizeDexId(dexId)?.includes('orca') ?? false;
+}
+
+function isSupportedScoutDexId(dexId?: string | null): boolean {
+  return isPumpScoutDexId(dexId) || isRaydiumScoutDexId(dexId) || isOrcaScoutDexId(dexId);
+}
+
+function getScoutDexPriority(dexId?: string | null): number {
+  if (isRaydiumScoutDexId(dexId)) {
+    return 3;
+  }
+
+  if (isPumpScoutDexId(dexId)) {
+    return 2;
+  }
+
+  if (isOrcaScoutDexId(dexId)) {
+    return 1;
+  }
+
+  return 0;
+}
+
 function pickBestPool(pools: LiquidityPoolDiscovery[]): LiquidityPoolDiscovery | undefined {
-  return pools[0];
+  return [...pools].sort((left, right) => getScoutDexPriority(right.dexId) - getScoutDexPriority(left.dexId))[0];
 }
 
 function classifySupplyLock(totalSupply: bigint, burned: bigint, locked: bigint): {
@@ -202,7 +240,7 @@ export class LiquidityScreenService {
 
       const pool = await this.discoverLiquidityPool(tokenAddress, pumpFun, evidence);
 
-      if (pumpFun.status === "migrated" && pool) {
+      if (pool && (pumpFun.status === "migrated" || isSupportedScoutDexId(pool.dexId))) {
         return {
           eligible: true,
           reason: pool.dexId ?? "pumpfun-migrated",
@@ -217,7 +255,21 @@ export class LiquidityScreenService {
       if (pumpFun.status === "migrated") {
         return {
           eligible: false,
-          reason: "migration detected but no AMM pool evidence",
+          reason: pool
+            ? `migration detected but unsupported scout dex ${pool.dexId ?? 'unknown'}`
+            : "migration detected but no AMM pool evidence",
+          pumpFun,
+          ...(pool ? { pool } : {}),
+          warnings,
+          evidence,
+        };
+      }
+
+      if (pool) {
+        return {
+          eligible: false,
+          reason: `unsupported scout dex ${pool.dexId ?? 'unknown'}`,
+          pool,
           pumpFun,
           warnings,
           evidence,
@@ -226,7 +278,7 @@ export class LiquidityScreenService {
 
       return {
         eligible: false,
-        reason: `pump status ${pumpFun.status ?? "unknown"}`,
+        reason: `no supported scout pool (${pumpFun.status ?? "unknown"})`,
         pumpFun,
         warnings,
         evidence,
