@@ -52,6 +52,16 @@ const PAPER_SIGNAL_BLOCK_MAX_MEDIAN_PNL_PCT = 0.25;
 const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_WIN_RATE_PCT = 45;
 const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_AVG_PNL_PCT = 0.5;
 const PAPER_SIGNAL_BLOCK_EXTENDED_MAX_MEDIAN_PNL_PCT = 0.25;
+const PAPER_SUBSCRIPTION_PROBATION_REVIEW_TRADES = Math.max(Math.ceil(env.PAPER_PROMOTION_MIN_TRADES / 2), 4);
+const PAPER_SUBSCRIPTION_PROBATION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT - 15, 45);
+const PAPER_SUBSCRIPTION_PROBATION_MIN_AVG_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.25);
+const PAPER_SUBSCRIPTION_PROBATION_MIN_MEDIAN_PNL_PCT = Math.max(0.5, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.25);
+const PAPER_SUBSCRIPTION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES, 8);
+const PAPER_SUBSCRIPTION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT - 2, 58);
+const PAPER_SUBSCRIPTION_MIN_AVG_PNL_PCT = Math.max(2.5, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.5);
+const PAPER_SUBSCRIPTION_MIN_MEDIAN_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.5);
+const TRACKER_MAX_PROMOTABLE_PAPER_WHALES = Math.max(4, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES * 0.75));
+const TRACKER_MAX_UNPROVEN_PAPER_WHALES = Math.max(3, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES / 2));
 type MarketEntryPriceSource = Extract<PaperTradeRecord['entryPriceSource'], 'market-snapshot' | 'dexscreener-snapshot'>;
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
@@ -650,6 +660,12 @@ type WhalePerformanceProfile = {
   sourceMode: 'paper' | 'live';
 };
 
+type PaperSubscriptionCandidate = {
+  whale: WhaleRecord;
+  profile: WhalePerformanceProfile;
+  priorityScore: number;
+};
+
 function formatPerformanceLabel(positionProfile: WhalePerformanceProfile): string {
   return positionProfile.winRate === null
     ? `${positionProfile.sampleSize} Trades (${positionProfile.sourceMode})`
@@ -760,13 +776,96 @@ function getPaperSignalBlockReason(profile: WhalePerformanceProfile): string | n
   return `Paper-Wal pausiert: ${profile.sampleSize} Trades, Win-Rate ${winRate.toFixed(0)}% <= ${blockProfile.maxWinRate.toFixed(0)}%, Avg ${avgPnlPct.toFixed(2)}% <= ${blockProfile.maxAvgPnl.toFixed(2)}%, Median ${medianPnlPct.toFixed(2)}% <= ${blockProfile.maxMedianPnl.toFixed(2)}%.`;
 }
 
-function getWhaleSubscriptionBlockReason(whale: WhaleRecord): string | null {
-  if (whale.mode !== 'paper') {
+function getPaperSubscriptionPauseReason(profile: WhalePerformanceProfile): string | null {
+  if (profile.sourceMode !== 'paper') {
     return null;
   }
 
-  const profile = getPositionSizeProfile(whale);
-  return getPaperSignalBlockReason(profile);
+  const blockReason = getPaperSignalBlockReason(profile);
+  if (blockReason) {
+    return blockReason;
+  }
+
+  if (profile.sampleSize < PAPER_SUBSCRIPTION_PROBATION_REVIEW_TRADES) {
+    return null;
+  }
+
+  const winRate = profile.winRate;
+  const avgPnlPct = profile.avgPnlPct;
+  const medianPnlPct = profile.medianPnlPct ?? avgPnlPct;
+  if (winRate === null || avgPnlPct === null || medianPnlPct === null) {
+    return `Paper-Wal pausiert: ${profile.sampleSize} Trades, Historie nicht sauber auswertbar.`;
+  }
+
+  if (profile.sampleSize < PAPER_SUBSCRIPTION_REVIEW_TRADES) {
+    if (winRate >= PAPER_SUBSCRIPTION_PROBATION_MIN_WIN_RATE_PCT
+      && avgPnlPct >= PAPER_SUBSCRIPTION_PROBATION_MIN_AVG_PNL_PCT
+      && medianPnlPct >= PAPER_SUBSCRIPTION_PROBATION_MIN_MEDIAN_PNL_PCT) {
+      return null;
+    }
+
+    return `Paper-Wal pausiert: ${profile.sampleSize} Trades, Probation noch zu schwach (Win-Rate ${winRate.toFixed(0)}% < ${PAPER_SUBSCRIPTION_PROBATION_MIN_WIN_RATE_PCT.toFixed(0)}%, Avg ${avgPnlPct.toFixed(2)}% < ${PAPER_SUBSCRIPTION_PROBATION_MIN_AVG_PNL_PCT.toFixed(2)}% oder Median ${medianPnlPct.toFixed(2)}% < ${PAPER_SUBSCRIPTION_PROBATION_MIN_MEDIAN_PNL_PCT.toFixed(2)}%).`;
+  }
+
+  if (winRate >= PAPER_SUBSCRIPTION_MIN_WIN_RATE_PCT
+    && avgPnlPct >= PAPER_SUBSCRIPTION_MIN_AVG_PNL_PCT
+    && medianPnlPct >= PAPER_SUBSCRIPTION_MIN_MEDIAN_PNL_PCT) {
+    return null;
+  }
+
+  return `Paper-Wal pausiert: ${profile.sampleSize} Trades, noch kein Promotionspfad (Win-Rate ${winRate.toFixed(0)}% < ${PAPER_SUBSCRIPTION_MIN_WIN_RATE_PCT.toFixed(0)}%, Avg ${avgPnlPct.toFixed(2)}% < ${PAPER_SUBSCRIPTION_MIN_AVG_PNL_PCT.toFixed(2)}% oder Median ${medianPnlPct.toFixed(2)}% < ${PAPER_SUBSCRIPTION_MIN_MEDIAN_PNL_PCT.toFixed(2)}%).`;
+}
+
+function toFiniteNumber(value: number | null | undefined, fallback = 0): number {
+  return Number.isFinite(value) ? Number(value) : fallback;
+}
+
+function toTimestamp(value: string | undefined): number {
+  if (!value) {
+    return 0;
+  }
+
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getPaperSubscriptionPriorityScore(whale: WhaleRecord, profile: WhalePerformanceProfile): number {
+  const medianPnlPct = profile.medianPnlPct ?? profile.avgPnlPct;
+  const sampleScore = Math.min(profile.sampleSize, PAPER_SUBSCRIPTION_REVIEW_TRADES) / PAPER_SUBSCRIPTION_REVIEW_TRADES;
+  const winScore = Math.max(0, toFiniteNumber(profile.winRate, 0) / Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT, 1));
+  const avgScore = Math.max(0, toFiniteNumber(profile.avgPnlPct, 0) / Math.max(env.PAPER_PROMOTION_MIN_AVG_PNL_PCT, 1));
+  const medianScore = Math.max(0, toFiniteNumber(medianPnlPct, 0) / Math.max(env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT, 0.5));
+  const seedVolumeScore = Math.log10(Math.max(toFiniteNumber(whale.seedTokenVolumeUsd, 0), 1));
+  const estimatedVolumeScore = Math.log10(Math.max(toFiniteNumber(whale.estimatedVolumeUsd, 0), 1));
+  const volumeScore = Math.max(seedVolumeScore, estimatedVolumeScore) / 6;
+  const diversityScore = Math.min(toFiniteNumber(whale.distinctTokenCount, 0), env.PAPER_PROMOTION_MIN_TRADES) / env.PAPER_PROMOTION_MIN_TRADES;
+  const qualifyingTradeScore = Math.min(toFiniteNumber(whale.qualifyingTradeCount, 0), env.PAPER_PROMOTION_MIN_TRADES) / env.PAPER_PROMOTION_MIN_TRADES;
+
+  return (winScore * 3)
+    + (medianScore * 3)
+    + (avgScore * 2.5)
+    + (sampleScore * 2)
+    + volumeScore
+    + (diversityScore * 0.5)
+    + (qualifyingTradeScore * 0.5);
+}
+
+function comparePaperSubscriptionPriority(
+  left: PaperSubscriptionCandidate,
+  right: PaperSubscriptionCandidate,
+): number {
+  return right.priorityScore - left.priorityScore
+    || right.profile.sampleSize - left.profile.sampleSize
+    || toFiniteNumber(right.profile.winRate, -1) - toFiniteNumber(left.profile.winRate, -1)
+    || toFiniteNumber(right.profile.medianPnlPct, -Infinity) - toFiniteNumber(left.profile.medianPnlPct, -Infinity)
+    || toFiniteNumber(right.profile.avgPnlPct, -Infinity) - toFiniteNumber(left.profile.avgPnlPct, -Infinity)
+    || toFiniteNumber(right.whale.estimatedVolumeUsd, 0) - toFiniteNumber(left.whale.estimatedVolumeUsd, 0)
+    || toFiniteNumber(right.whale.seedTokenVolumeUsd, 0) - toFiniteNumber(left.whale.seedTokenVolumeUsd, 0)
+    || toFiniteNumber(right.whale.qualifyingTradeCount, 0) - toFiniteNumber(left.whale.qualifyingTradeCount, 0)
+    || toFiniteNumber(right.whale.distinctTokenCount, 0) - toFiniteNumber(left.whale.distinctTokenCount, 0)
+    || toFiniteNumber(left.whale.seedTraderRank, Number.MAX_SAFE_INTEGER) - toFiniteNumber(right.whale.seedTraderRank, Number.MAX_SAFE_INTEGER)
+    || toTimestamp(right.whale.lastScoutedAt ?? right.whale.discoveredAt) - toTimestamp(left.whale.lastScoutedAt ?? left.whale.discoveredAt)
+    || left.whale.address.localeCompare(right.whale.address);
 }
 
 function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
@@ -1562,15 +1661,64 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
 async function refreshWhaleSubscriptions() {
   const whales = getWhales();
   const blockedWhales = new Map<string, string>();
-  const trackableWhales = whales.filter((whale) => {
-    const blockReason = getWhaleSubscriptionBlockReason(whale);
-    if (blockReason) {
-      blockedWhales.set(whale.address, blockReason);
-      return false;
+  const liveWhales: WhaleRecord[] = [];
+  const maturePaperWhales: PaperSubscriptionCandidate[] = [];
+  const probationPaperWhales: PaperSubscriptionCandidate[] = [];
+
+  for (const whale of whales) {
+    if (whale.mode !== 'paper') {
+      liveWhales.push(whale);
+      continue;
     }
 
-    return true;
-  });
+    const profile = getPositionSizeProfile(whale);
+    const blockReason = getPaperSubscriptionPauseReason(profile);
+    if (blockReason) {
+      blockedWhales.set(whale.address, blockReason);
+      continue;
+    }
+
+    const candidate = {
+      whale,
+      profile,
+      priorityScore: getPaperSubscriptionPriorityScore(whale, profile),
+    };
+
+    if (profile.sampleSize >= PAPER_SUBSCRIPTION_REVIEW_TRADES) {
+      maturePaperWhales.push(candidate);
+      continue;
+    }
+
+    probationPaperWhales.push(candidate);
+  }
+
+  const selectedMaturePaperWhales = maturePaperWhales
+    .sort(comparePaperSubscriptionPriority)
+    .slice(0, TRACKER_MAX_PROMOTABLE_PAPER_WHALES);
+
+  const selectedProbationPaperWhales = probationPaperWhales
+    .sort(comparePaperSubscriptionPriority)
+    .slice(0, TRACKER_MAX_UNPROVEN_PAPER_WHALES);
+
+  for (const { whale, profile } of maturePaperWhales.slice(selectedMaturePaperWhales.length)) {
+    blockedWhales.set(
+      whale.address,
+      `Paper-Wal pausiert: ${profile.sampleSize} Trades, nur Top-${TRACKER_MAX_PROMOTABLE_PAPER_WHALES} promotionsnahe Paper-Wale bleiben aktiv.`,
+    );
+  }
+
+  for (const { whale, profile } of probationPaperWhales.slice(selectedProbationPaperWhales.length)) {
+    blockedWhales.set(
+      whale.address,
+      `Paper-Wal pausiert: ${profile.sampleSize} Trades, nur Top-${TRACKER_MAX_UNPROVEN_PAPER_WHALES} unbewiesene Kandidaten bleiben aktiv.`,
+    );
+  }
+
+  const trackableWhales = [
+    ...liveWhales,
+    ...selectedMaturePaperWhales.map(({ whale }) => whale),
+    ...selectedProbationPaperWhales.map(({ whale }) => whale),
+  ];
   const trackedAddresses = new Set(trackableWhales.map((whale) => whale.address));
 
   for (const [address, subscriptionId] of whaleLogSubscriptions.entries()) {
@@ -1609,6 +1757,8 @@ async function refreshWhaleSubscriptions() {
     state: 'tracking',
     whaleCount: whales.length,
     blockedPaperWhaleCount: blockedWhales.size,
+    probationPaperWhaleCount: probationPaperWhales.length,
+    activeProbationPaperWhaleCount: selectedProbationPaperWhales.length,
     subscribedWhaleCount: trackableWhales.length,
     activeSubscriptions: whaleLogSubscriptions.size,
     lastRefreshAt: new Date().toISOString(),
