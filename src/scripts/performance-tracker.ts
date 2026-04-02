@@ -26,6 +26,14 @@ const PAPER_EXTENDED_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 2
 const PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT = 35;
 const PAPER_EXTENDED_REJECTION_MAX_AVG_PNL_PCT = -2;
 const PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT = -0.5;
+const PAPER_STAGNATION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 3, 24);
+const PAPER_STAGNATION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT - 5, 55);
+const PAPER_STAGNATION_MIN_AVG_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.25);
+const PAPER_STAGNATION_MIN_MEDIAN_PNL_PCT = Math.max(0.5, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.25);
+const PAPER_FINAL_STAGNATION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 6, 48);
+const PAPER_FINAL_STAGNATION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT, 60);
+const PAPER_FINAL_STAGNATION_MIN_AVG_PNL_PCT = Math.max(2, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.5);
+const PAPER_FINAL_STAGNATION_MIN_MEDIAN_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.5);
 
 export interface WhalePerformanceInput extends WhaleTradeMetricInput {
   discardReason?: string | null;
@@ -161,9 +169,27 @@ function shouldRejectPaperWhale(summary: ReturnType<typeof getModeMetrics>): boo
     return false;
   }
 
-  return winRatePct <= PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT
+  if (winRatePct <= PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT
     && avgPnlPct <= PAPER_EXTENDED_REJECTION_MAX_AVG_PNL_PCT
-    && medianPnlPct <= PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT;
+    && medianPnlPct <= PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT) {
+    return true;
+  }
+
+  if (summary.evaluatedTrades >= PAPER_FINAL_STAGNATION_REVIEW_TRADES) {
+    return winRatePct < PAPER_FINAL_STAGNATION_MIN_WIN_RATE_PCT
+      || avgPnlPct < PAPER_FINAL_STAGNATION_MIN_AVG_PNL_PCT
+      || medianPnlPct < PAPER_FINAL_STAGNATION_MIN_MEDIAN_PNL_PCT;
+  }
+
+  if (summary.evaluatedTrades >= PAPER_STAGNATION_REVIEW_TRADES) {
+    return winRatePct < PAPER_STAGNATION_MIN_WIN_RATE_PCT
+      && (
+        avgPnlPct < PAPER_STAGNATION_MIN_AVG_PNL_PCT
+        || medianPnlPct < PAPER_STAGNATION_MIN_MEDIAN_PNL_PCT
+      );
+  }
+
+  return false;
 }
 
 async function maybeFinalizePaperWhale(whaleAddress: string) {
