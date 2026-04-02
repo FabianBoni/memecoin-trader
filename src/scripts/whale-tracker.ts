@@ -760,6 +760,15 @@ function getPaperSignalBlockReason(profile: WhalePerformanceProfile): string | n
   return `Paper-Wal pausiert: ${profile.sampleSize} Trades, Win-Rate ${winRate.toFixed(0)}% <= ${blockProfile.maxWinRate.toFixed(0)}%, Avg ${avgPnlPct.toFixed(2)}% <= ${blockProfile.maxAvgPnl.toFixed(2)}%, Median ${medianPnlPct.toFixed(2)}% <= ${blockProfile.maxMedianPnl.toFixed(2)}%.`;
 }
 
+function getWhaleSubscriptionBlockReason(whale: WhaleRecord): string | null {
+  if (whale.mode !== 'paper') {
+    return null;
+  }
+
+  const profile = getPositionSizeProfile(whale);
+  return getPaperSignalBlockReason(profile);
+}
+
 function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
   try {
     const liveSummary = getWhaleModeSummary(whale.address, 'live');
@@ -1552,7 +1561,17 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
 
 async function refreshWhaleSubscriptions() {
   const whales = getWhales();
-  const trackedAddresses = new Set(whales.map((whale) => whale.address));
+  const blockedWhales = new Map<string, string>();
+  const trackableWhales = whales.filter((whale) => {
+    const blockReason = getWhaleSubscriptionBlockReason(whale);
+    if (blockReason) {
+      blockedWhales.set(whale.address, blockReason);
+      return false;
+    }
+
+    return true;
+  });
+  const trackedAddresses = new Set(trackableWhales.map((whale) => whale.address));
 
   for (const [address, subscriptionId] of whaleLogSubscriptions.entries()) {
     if (trackedAddresses.has(address)) {
@@ -1561,10 +1580,15 @@ async function refreshWhaleSubscriptions() {
 
     await connection.removeOnLogsListener(subscriptionId);
     whaleLogSubscriptions.delete(address);
-    console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt.`);
+    const blockReason = blockedWhales.get(address);
+    if (blockReason) {
+      console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt: ${blockReason}`);
+    } else {
+      console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt.`);
+    }
   }
 
-  for (const whale of whales) {
+  for (const whale of trackableWhales) {
     if (whaleLogSubscriptions.has(whale.address)) {
       continue;
     }
@@ -1584,6 +1608,8 @@ async function refreshWhaleSubscriptions() {
   updateRuntimeStatus('tracker', {
     state: 'tracking',
     whaleCount: whales.length,
+    blockedPaperWhaleCount: blockedWhales.size,
+    subscribedWhaleCount: trackableWhales.length,
     activeSubscriptions: whaleLogSubscriptions.size,
     lastRefreshAt: new Date().toISOString(),
   });

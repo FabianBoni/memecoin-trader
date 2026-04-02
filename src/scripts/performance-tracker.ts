@@ -10,7 +10,7 @@ import {
   type WhaleTradeMetricInput,
   type WhaleTradeMode,
 } from '../storage/whale-stats.js';
-import { normalizeWhales } from '../storage/whales.js';
+import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
 import { sendTelegram } from './telegram-notifier.js';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -22,18 +22,24 @@ const LEGACY_HISTORY_LIMIT = Math.max(env.PAPER_PROMOTION_MIN_TRADES, env.LIVE_E
 const PAPER_HARD_REJECTION_MAX_WIN_RATE_PCT = 20;
 const PAPER_HARD_REJECTION_MAX_AVG_PNL_PCT = -10;
 const PAPER_HARD_REJECTION_MAX_MEDIAN_PNL_PCT = -5;
+const PAPER_EARLY_REJECTION_MAX_WIN_RATE_PCT = 30;
+const PAPER_EARLY_REJECTION_MAX_AVG_PNL_PCT = -3;
+const PAPER_EARLY_REJECTION_MAX_MEDIAN_PNL_PCT = -2;
 const PAPER_EXTENDED_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 2, 16);
 const PAPER_EXTENDED_REJECTION_MAX_WIN_RATE_PCT = 35;
 const PAPER_EXTENDED_REJECTION_MAX_AVG_PNL_PCT = -2;
 const PAPER_EXTENDED_REJECTION_MAX_MEDIAN_PNL_PCT = -0.5;
-const PAPER_STAGNATION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 3, 24);
+const PAPER_STAGNATION_REVIEW_TRADES = Math.max(Math.ceil(env.PAPER_PROMOTION_MIN_TRADES * 2.5), 20);
 const PAPER_STAGNATION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT - 5, 55);
 const PAPER_STAGNATION_MIN_AVG_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.25);
 const PAPER_STAGNATION_MIN_MEDIAN_PNL_PCT = Math.max(0.5, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.25);
-const PAPER_FINAL_STAGNATION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 6, 48);
+const PAPER_FINAL_STAGNATION_REVIEW_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES * 5, 40);
 const PAPER_FINAL_STAGNATION_MIN_WIN_RATE_PCT = Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT, 60);
 const PAPER_FINAL_STAGNATION_MIN_AVG_PNL_PCT = Math.max(2, env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 0.5);
 const PAPER_FINAL_STAGNATION_MIN_MEDIAN_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.5);
+const PAPER_UNPROVEN_EXPIRY_HOURS = 24;
+const PAPER_SLOW_START_EXPIRY_HOURS = 48;
+const PAPER_SLOW_START_MIN_EVALUATED_TRADES = 3;
 
 export interface WhalePerformanceInput extends WhaleTradeMetricInput {
   discardReason?: string | null;
@@ -150,6 +156,73 @@ function isPaperPromotionReady(summary: ReturnType<typeof getModeMetrics>): bool
     && (summary.medianPnlPct ?? Number.NEGATIVE_INFINITY) >= env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT;
 }
 
+function getWhaleAgeHours(whale: WhaleRecord): number | null {
+  const referenceTimestamp = whale.discoveredAt ?? whale.lastScoutedAt;
+  if (!referenceTimestamp) {
+    return null;
+  }
+
+  const discoveredAt = Date.parse(referenceTimestamp);
+  if (!Number.isFinite(discoveredAt)) {
+    return null;
+  }
+
+  return (Date.now() - discoveredAt) / (1000 * 60 * 60);
+}
+
+function getPaperExpiryReason(whale: WhaleRecord, summary: ReturnType<typeof getModeMetrics>): string | null {
+  const whaleAgeHours = getWhaleAgeHours(whale);
+  if (whaleAgeHours === null || whaleAgeHours < PAPER_UNPROVEN_EXPIRY_HOURS) {
+    return null;
+  }
+
+  if (summary.evaluatedTrades === 0) {
+    return `Keine ausgewerteten Trades nach ${Math.round(whaleAgeHours)}h seit Discovery`;
+  }
+
+  if (whaleAgeHours >= PAPER_SLOW_START_EXPIRY_HOURS && summary.evaluatedTrades < PAPER_SLOW_START_MIN_EVALUATED_TRADES) {
+    return `Nur ${summary.evaluatedTrades} ausgewertete Trades nach ${Math.round(whaleAgeHours)}h seit Discovery`;
+  }
+
+  return null;
+}
+
+async function removePaperWhaleFromQuarantine(
+  whales: WhaleRecord[],
+  whaleAddress: string,
+  summary: ReturnType<typeof getModeMetrics>,
+  telegramTitle: string,
+  dedupeKey: string,
+  logReason: string,
+) {
+  const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
+  writeJsonFileSync(WHALE_FILE, remainingWhales);
+
+  const paperData = readLegacyPerformance(PAPER_PERF_FILE);
+  delete paperData[whaleAddress];
+  writeLegacyPerformance(PAPER_PERF_FILE, paperData);
+
+  const whaleStats = readWhaleStats();
+  delete whaleStats[whaleAddress];
+  writeWhaleStats(whaleStats);
+
+  const paperTrades = readJsonFileSync<Record<string, { whale?: string }>>(PAPER_TRADES_FILE, {});
+  const filteredPaperTrades = Object.fromEntries(
+    Object.entries(paperTrades).filter(([, trade]) => trade?.whale !== whaleAddress),
+  );
+  writeJsonFileSync(PAPER_TRADES_FILE, filteredPaperTrades);
+
+  await sendTelegram(
+    `${telegramTitle}\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>\nStatus: <b>AUS QUARANTAENE ENTFERNT</b>`,
+    {
+      dedupeKey,
+      cooldownMs: 24 * 60 * 60 * 1000,
+      priority: true,
+    },
+  );
+  console.log(`[CLEANUP] Paper-Wal ${whaleAddress} entfernt: ${logReason}.`);
+}
+
 function shouldRejectPaperWhale(summary: ReturnType<typeof getModeMetrics>): boolean {
   if (summary.evaluatedTrades < env.PAPER_PROMOTION_MIN_TRADES) {
     return false;
@@ -162,6 +235,13 @@ function shouldRejectPaperWhale(summary: ReturnType<typeof getModeMetrics>): boo
   const hardReject = winRatePct <= PAPER_HARD_REJECTION_MAX_WIN_RATE_PCT
     && (avgPnlPct <= PAPER_HARD_REJECTION_MAX_AVG_PNL_PCT || medianPnlPct <= PAPER_HARD_REJECTION_MAX_MEDIAN_PNL_PCT);
   if (hardReject) {
+    return true;
+  }
+
+  const earlyReject = winRatePct <= PAPER_EARLY_REJECTION_MAX_WIN_RATE_PCT
+    && avgPnlPct <= PAPER_EARLY_REJECTION_MAX_AVG_PNL_PCT
+    && medianPnlPct <= PAPER_EARLY_REJECTION_MAX_MEDIAN_PNL_PCT;
+  if (earlyReject) {
     return true;
   }
 
@@ -200,6 +280,19 @@ async function maybeFinalizePaperWhale(whaleAddress: string) {
   }
 
   const summary = getModeMetrics(whaleAddress, 'paper');
+  const expiryReason = getPaperExpiryReason(whale, summary);
+  if (expiryReason) {
+    await removePaperWhaleFromQuarantine(
+      whales,
+      whaleAddress,
+      summary,
+      '⏳ <b>PAPER-WAL ABGELAUFEN</b>',
+      `whale-paper-expired:${whaleAddress}`,
+      expiryReason,
+    );
+    return;
+  }
+
   if (summary.evaluatedTrades < env.PAPER_PROMOTION_MIN_TRADES) {
     return;
   }
@@ -225,32 +318,14 @@ async function maybeFinalizePaperWhale(whaleAddress: string) {
     return;
   }
 
-  const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
-  writeJsonFileSync(WHALE_FILE, remainingWhales);
-
-  const paperData = readLegacyPerformance(PAPER_PERF_FILE);
-  delete paperData[whaleAddress];
-  writeLegacyPerformance(PAPER_PERF_FILE, paperData);
-
-  const whaleStats = readWhaleStats();
-  delete whaleStats[whaleAddress];
-  writeWhaleStats(whaleStats);
-
-  const paperTrades = readJsonFileSync<Record<string, { whale?: string }>>(PAPER_TRADES_FILE, {});
-  const filteredPaperTrades = Object.fromEntries(
-    Object.entries(paperTrades).filter(([, trade]) => trade?.whale !== whaleAddress),
+  await removePaperWhaleFromQuarantine(
+    whales,
+    whaleAddress,
+    summary,
+    '🧪 <b>WAL TEST NICHT BESTANDEN</b>',
+    `whale-paper-rejected:${whaleAddress}`,
+    `nach ${summary.evaluatedTrades} Trades nicht bestanden`,
   );
-  writeJsonFileSync(PAPER_TRADES_FILE, filteredPaperTrades);
-
-  await sendTelegram(
-    `🧪 <b>WAL TEST NICHT BESTANDEN</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>\nStatus: <b>AUS QUARANTAENE ENTFERNT</b>`,
-    {
-      dedupeKey: `whale-paper-rejected:${whaleAddress}`,
-      cooldownMs: 24 * 60 * 60 * 1000,
-      priority: true,
-    },
-  );
-  console.log(`[CLEANUP] Paper-Wal ${whaleAddress} nach ${summary.evaluatedTrades} Trades nicht bestanden und entfernt.`);
 }
 
 export async function reconcilePaperWhales() {
