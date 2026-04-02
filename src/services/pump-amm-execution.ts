@@ -1,10 +1,5 @@
 import BN from "bn.js";
-import {
-  OnlinePumpAmmSdk,
-  PUMP_AMM_SDK,
-  buyQuoteInput as quotePumpBuyQuoteInput,
-  sellBaseInput as quotePumpSellBaseInput,
-} from "@pump-fun/pump-swap-sdk";
+import * as pumpSwapSdk from "@pump-fun/pump-swap-sdk";
 import { NATIVE_MINT } from "@solana/spl-token";
 import {
   ComputeBudgetProgram,
@@ -21,6 +16,42 @@ import type { PreparedExecution } from "./raydium-execution.js";
 import { loadExecutionWallet } from "../wallet.js";
 
 const DIRECT_EXECUTION_COMPUTE_UNIT_LIMIT = 450_000;
+
+type PumpSwapModule = typeof import("@pump-fun/pump-swap-sdk");
+type PumpOnlineAmmSdkCtor = PumpSwapModule["OnlinePumpAmmSdk"];
+type PumpOnlineAmmSdkInstance = InstanceType<PumpOnlineAmmSdkCtor>;
+type PumpAmmSdkInstance = PumpSwapModule["PUMP_AMM_SDK"];
+type PumpBuyQuoteInput = PumpSwapModule["buyQuoteInput"];
+type PumpSellBaseInput = PumpSwapModule["sellBaseInput"];
+
+function resolvePumpSwapExport<K extends keyof PumpSwapModule>(exportName: K): NonNullable<PumpSwapModule[K]> {
+  const moduleExports = pumpSwapSdk as PumpSwapModule & {
+    default?: Partial<Record<keyof PumpSwapModule, unknown>>;
+  };
+  const resolved =
+    moduleExports[exportName] ??
+    (moduleExports.default?.[exportName] as PumpSwapModule[K] | undefined);
+
+  if (resolved === undefined || resolved === null) {
+    throw new Error(
+      `@pump-fun/pump-swap-sdk is missing export ${String(exportName)}. Reinstall dependencies on the server with the locked package versions.`,
+    );
+  }
+
+  return resolved as NonNullable<PumpSwapModule[K]>;
+}
+
+function getPumpAmmSdk(): PumpAmmSdkInstance {
+  return resolvePumpSwapExport("PUMP_AMM_SDK");
+}
+
+function getPumpBuyQuoteInput(): PumpBuyQuoteInput {
+  return resolvePumpSwapExport("buyQuoteInput");
+}
+
+function getPumpSellBaseInput(): PumpSellBaseInput {
+  return resolvePumpSwapExport("sellBaseInput");
+}
 
 function solToLamports(sol: number): BN {
   return new BN(Math.round(sol * 1_000_000_000));
@@ -55,7 +86,16 @@ function buildWarnings(dryRun: boolean): string[] {
 export class PumpAmmExecutionService {
   private readonly gate = new ExecutionGateService();
   private readonly connection = new Connection(getHeliusRpcUrl(), "confirmed");
-  private readonly sdk = new OnlinePumpAmmSdk(this.connection);
+  private sdk: PumpOnlineAmmSdkInstance | null = null;
+
+  private getOnlineSdk(): PumpOnlineAmmSdkInstance {
+    if (!this.sdk) {
+      const OnlinePumpAmmSdk = resolvePumpSwapExport("OnlinePumpAmmSdk");
+      this.sdk = new OnlinePumpAmmSdk(this.connection);
+    }
+
+    return this.sdk;
+  }
 
   private async buildQuoteContext(plan: TradePlan) {
     await this.gate.assertExecutable(plan);
@@ -68,12 +108,12 @@ export class PumpAmmExecutionService {
     const owner = wallet.publicKey;
     const tokenMint = new PublicKey(plan.tokenAddress);
     const poolKey = new PublicKey(plan.poolAddress);
-    const swapState = await this.sdk.swapSolanaState(poolKey, owner);
+    const swapState = await this.getOnlineSdk().swapSolanaState(poolKey, owner);
     const slippagePct = slippageBpsToPct(plan.maxSlippageBps);
     const quoteInLamports = solToLamports(plan.finalPositionSol);
 
     if (swapState.pool.baseMint.equals(tokenMint) && swapState.pool.quoteMint.equals(NATIVE_MINT)) {
-      const quote = quotePumpBuyQuoteInput({
+      const quote = getPumpBuyQuoteInput()({
         quote: quoteInLamports,
         slippage: slippagePct,
         baseReserve: swapState.poolBaseAmount,
@@ -101,7 +141,7 @@ export class PumpAmmExecutionService {
     }
 
     if (swapState.pool.baseMint.equals(NATIVE_MINT) && swapState.pool.quoteMint.equals(tokenMint)) {
-      const quote = quotePumpSellBaseInput({
+      const quote = getPumpSellBaseInput()({
         base: quoteInLamports,
         slippage: slippagePct,
         baseReserve: swapState.poolBaseAmount,
@@ -161,9 +201,10 @@ export class PumpAmmExecutionService {
 
   async prepareExecutionForPlan(plan: TradePlan, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
     const quoteContext = await this.buildQuoteContext(plan);
+    const pumpAmmSdk = getPumpAmmSdk();
     const swapInstructions = quoteContext.swapSide === "buy-quote"
-      ? await PUMP_AMM_SDK.buyQuoteInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct)
-      : await PUMP_AMM_SDK.sellBaseInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct);
+      ? await pumpAmmSdk.buyQuoteInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct)
+      : await pumpAmmSdk.sellBaseInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct);
 
     const allInstructions = [
       ...buildPriorityFeeInstructions(options?.priorityFeeLamports),
