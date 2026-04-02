@@ -1699,18 +1699,49 @@ async function collectTopTokenTraders(
     const poolUsableSeedTraderCount = [...traderStats.values()]
       .filter((trader) => trader.tokenVolumeUsd >= poolUsableSeedTraderFloor)
       .length;
+    const usingExtendedHighVolumeScan = signatureScanCap > env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
+    const coveredEarlyHighVolumeWindow = usingExtendedHighVolumeScan
+      && scannedSignatures >= initialSignatureTarget
+      && scannedSignatures < env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
+    const coveredBaseSeedWindow = scannedSignatures >= env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
+    const enoughQualifiedSeedTraderCandidates = qualifiedSeedTraderCount >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
+    const enoughUsableSeedCandidates = qualifiedSeedTraderCount > 0
+      && fallbackSeedTraderCount >= HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES;
     if (scanAddress !== mintAddress && scannedSignatures >= initialSignatureTarget && traderStats.size === 0) {
       mintFallbackReason = `blieb nach ${scannedSignatures} Signaturen ohne Trader`;
       console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} blieb nach ${scannedSignatures} Signaturen ohne Trader. Wechsle frueh auf Mint-Scan ${mintAddress.slice(0, 8)}.`);
       break;
     }
 
+    if (coveredEarlyHighVolumeWindow) {
+      if (scanAddress !== mintAddress) {
+        if (poolUsableSeedTraderCount === 0) {
+          mintFallbackReason = `lieferte nach Startfenster keine brauchbaren Trader >= $${poolUsableSeedTraderFloor.toFixed(0)}`;
+          console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} liefert nach Startfenster keine brauchbaren Trader >= $${poolUsableSeedTraderFloor.toFixed(0)}. Wechsle frueh auf Mint-Scan ${mintAddress.slice(0, 8)}.`);
+          break;
+        }
+
+        if (poolUsableSeedTraderCount >= HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES) {
+          console.log(`[SCOUT] Pool-Scan fuer ${mintAddress.slice(0, 8)} stoppt nach Startfenster: ${poolUsableSeedTraderCount} Kandidaten >= $${poolUsableSeedTraderFloor.toFixed(0)} reichen fuer die Wallet-Pruefung.`);
+          break;
+        }
+      } else {
+        if (enoughQualifiedSeedTraderCandidates) {
+          console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Startfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} reichen fuer die Kandidatenpruefung.`);
+          break;
+        }
+
+        if (enoughUsableSeedCandidates) {
+          console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Startfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} plus ${fallbackSeedTraderCount} Kandidaten >= $${fallbackSeedTraderFloor.toFixed(0)} reichen fuer die Wallet-Pruefung.`);
+          break;
+        }
+      }
+    }
+
     if (scannedSignatures >= initialSignatureTarget && qualifiedSeedTraderCount >= TOP_TRADERS_PER_TOKEN) {
       break;
     }
 
-    const usingExtendedHighVolumeScan = signatureScanCap > env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
-    const coveredBaseSeedWindow = scannedSignatures >= env.SCOUT_TOKEN_SIGNATURE_SCAN_CAP;
     if (usingExtendedHighVolumeScan && coveredBaseSeedWindow) {
       if (scanAddress !== mintAddress) {
         if (poolUsableSeedTraderCount === 0) {
@@ -1728,10 +1759,6 @@ async function collectTopTokenTraders(
         console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach ${scannedSignatures} Signaturen: kein Trader >= $${fallbackSeedTraderFloor.toFixed(0)} auf starkem Seed.`);
         break;
       }
-
-      const enoughQualifiedSeedTraderCandidates = qualifiedSeedTraderCount >= HIGH_VOLUME_SEED_FALLBACK_TRADER_COUNT;
-      const enoughUsableSeedCandidates = qualifiedSeedTraderCount > 0
-        && fallbackSeedTraderCount >= HIGH_VOLUME_SEED_MIN_USABLE_CANDIDATES;
 
       if (enoughQualifiedSeedTraderCandidates) {
         console.log(`[SCOUT] Seed-Scan ${mintAddress.slice(0, 8)} via ${scanAddress.slice(0, 8)} stoppt nach Basisfenster: ${qualifiedSeedTraderCount} Trader >= $${env.SCOUT_MIN_SEED_TRADER_VOLUME_USD.toFixed(0)} reichen fuer die Kandidatenpruefung.`);
