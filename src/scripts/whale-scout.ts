@@ -9,13 +9,12 @@ import { RAYDIUM_AMM_V4_PROGRAM_IDS } from '../solana/raydium.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import { sendTelegram } from "./telegram-notifier.js";
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
-import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
+import { readWhales, upsertWhale, type WhaleRecord } from '../storage/whales.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import type { DexPairSummary } from '../types/market.js';
 
 const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const SCOUT_CANDIDATE_CACHE_FILE = path.resolve(SCRIPT_DIR, '../data/scout-candidate-cache.json');
 const EMPTY_SCOUT_INTERVAL_MS = 60 * 1000;
 const FAST_SCOUT_INTERVAL_MS = 15 * 60 * 1000;
@@ -307,7 +306,7 @@ function isLikelySolanaMintAddress(value: unknown): value is string {
 }
 
 function getScoutIntervalMs(): number {
-  const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
+  const whaleCount = readWhales().length;
   if (whaleCount === 0) {
     return EMPTY_SCOUT_INTERVAL_MS;
   }
@@ -316,7 +315,7 @@ function getScoutIntervalMs(): number {
 }
 
 function logNextScoutRun() {
-  const whaleCount = normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length;
+  const whaleCount = readWhales().length;
   const intervalMs = getScoutIntervalMs();
   const intervalMinutes = Math.round(intervalMs / 60_000);
   const intervalLabel = intervalMs < 60_000
@@ -2058,7 +2057,7 @@ async function scout() {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
-        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        whaleCount: readWhales().length,
         boostSeedInputCount: 0,
         marketSeedInputCount: 0,
       });
@@ -2083,7 +2082,7 @@ async function scout() {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
-        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        whaleCount: readWhales().length,
         eligibleSeedCount: 0,
         migratedSeedCount: 0,
         highVolumeSeedCount: 0,
@@ -2097,7 +2096,7 @@ async function scout() {
         state: 'idle',
         lastSuccessAt: new Date().toISOString(),
         lastAddedCount: 0,
-        whaleCount: normalizeWhales(readJsonFileSync(WHALE_FILE, [])).length,
+        whaleCount: readWhales().length,
         eligibleSeedCount: eligibleScoutSeeds.length,
         migratedSeedCount: eligibleScoutSeeds.length,
         highVolumeSeedCount: highVolumeScoutSeeds.length,
@@ -2109,7 +2108,7 @@ async function scout() {
       console.warn(`[SCOUT] Kein scoutbarer Seed erfuellt den High-Volume-Filter (Vol24h >= $${env.SCOUT_MIN_SEED_VOLUME_USD.toFixed(0)}, Liq >= $${env.SCOUT_MIN_SEED_LIQUIDITY_USD.toFixed(0)}, Tx >= ${env.SCOUT_MIN_SEED_TX_COUNT}). Nutze nur Near-Threshold-Fallback-Seeds statt beliebiger Restkandidaten.`);
     }
 
-    const currentWhales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
+    const currentWhales = readWhales();
     const knownWhales = new Set(currentWhales.map((whale) => whale.address));
     const evaluatedCandidates = new Set<string>();
     const solUsdPrice = await fetchSolUsdPrice();
@@ -2297,7 +2296,7 @@ async function scout() {
         knownWhales.add(walletAddress);
         rejectedCandidatesDirty = clearRejectedCandidate(rejectedCandidates, walletAddress) || rejectedCandidatesDirty;
         addedCount += 1;
-        writeJsonFileSync(WHALE_FILE, currentWhales);
+        upsertWhale(newWhale);
 
   console.log(`[SCOUT] Neuer etablierter Trader entdeckt: ${walletAddress} mit ca. $${effectiveVolumeUsd.toFixed(0)} Volumen in ${candidateStats.lookbackHours}h (Seed-Rank Volumen ~$${trader.tokenVolumeUsd.toFixed(0)} aus ${trader.tokenTradeCount} Trades).`);
   await sendTelegram(`🎯 <b>NEUER WAL GEFUNDEN</b>\nSeed-Token: <code>${mintAddress}</code>\nSeed-Route: <b>${seed.reason.toUpperCase()}</b>\nSeed-Markt: <b>$${seed.marketVolume24hUsd.toFixed(0)}</b> Vol24h · <b>$${seed.marketLiquidityUsd.toFixed(0)}</b> Liq · <b>${seed.marketTxCount24h}</b> TX\nSeed-Ranking: <b>Top-${TOP_TRADERS_PER_TOKEN}</b> mit ca. <b>$${trader.tokenVolumeUsd.toFixed(0)}</b> auf diesem Coin\nWallet: <code>${walletAddress}</code>\nGeschaetztes Volumen: <b>$${effectiveVolumeUsd.toFixed(0)}</b> in ${candidateStats.lookbackHours}h\nTrades: <b>${candidateStats.qualifyingTradeCount}</b>\nTokens: <b>${candidateStats.distinctTokenCount}</b>\nStatus: <b>PAPER</b>`, {

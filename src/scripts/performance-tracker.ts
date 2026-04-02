@@ -5,17 +5,16 @@ import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.j
 import {
   appendWhaleTradeDiscard,
   appendWhaleTradeMetric,
+  deleteWhaleStats,
   readWhaleStats,
-  writeWhaleStats,
   type WhaleTradeMetricInput,
   type WhaleTradeMode,
 } from '../storage/whale-stats.js';
-import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
+import { patchWhale, readWhales, removeWhale, type WhaleRecord } from '../storage/whales.js';
 import { sendTelegram } from './telegram-notifier.js';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PERF_FILE = path.resolve(SCRIPT_DIR, '../data/performance.json');
-const WHALE_FILE = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const PAPER_PERF_FILE = path.resolve(SCRIPT_DIR, '../data/paper-performance.json');
 const PAPER_TRADES_FILE = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
 const LEGACY_HISTORY_LIMIT = Math.max(env.PAPER_PROMOTION_MIN_TRADES, env.LIVE_ELIMINATION_MIN_TRADES, 12);
@@ -54,9 +53,7 @@ function writeLegacyPerformance(filePath: string, data: Record<string, boolean[]
 }
 
 function updateWhaleTradeCounts(address: string, field: 'paperTrades' | 'liveTrades', value: number) {
-  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
-  const updatedWhales = whales.map((whale) => whale.address === address ? { ...whale, [field]: value } : whale);
-  writeJsonFileSync(WHALE_FILE, updatedWhales);
+  patchWhale(address, { [field]: value });
 }
 
 function normalizePerformanceInput(input: boolean | WhalePerformanceInput): WhalePerformanceInput {
@@ -188,23 +185,20 @@ function getPaperExpiryReason(whale: WhaleRecord, summary: ReturnType<typeof get
 }
 
 async function removePaperWhaleFromQuarantine(
-  whales: WhaleRecord[],
+  _whales: WhaleRecord[],
   whaleAddress: string,
   summary: ReturnType<typeof getModeMetrics>,
   telegramTitle: string,
   dedupeKey: string,
   logReason: string,
 ) {
-  const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
-  writeJsonFileSync(WHALE_FILE, remainingWhales);
+  removeWhale(whaleAddress);
 
   const paperData = readLegacyPerformance(PAPER_PERF_FILE);
   delete paperData[whaleAddress];
   writeLegacyPerformance(PAPER_PERF_FILE, paperData);
 
-  const whaleStats = readWhaleStats();
-  delete whaleStats[whaleAddress];
-  writeWhaleStats(whaleStats);
+  deleteWhaleStats(whaleAddress);
 
   const paperTrades = readJsonFileSync<Record<string, { whale?: string }>>(PAPER_TRADES_FILE, {});
   const filteredPaperTrades = Object.fromEntries(
@@ -273,7 +267,7 @@ function shouldRejectPaperWhale(summary: ReturnType<typeof getModeMetrics>): boo
 }
 
 async function maybeFinalizePaperWhale(whaleAddress: string) {
-  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
+  const whales = readWhales();
   const whale = whales.find((item) => item.address === whaleAddress);
   if (!whale || whale.mode !== 'paper') {
     return;
@@ -298,10 +292,7 @@ async function maybeFinalizePaperWhale(whaleAddress: string) {
   }
 
   if (isPaperPromotionReady(summary)) {
-    const promotedWhales = whales.map((item) => item.address === whaleAddress
-      ? { ...item, mode: 'live' as const, promotedAt: new Date().toISOString() }
-      : item);
-    writeJsonFileSync(WHALE_FILE, promotedWhales);
+    patchWhale(whaleAddress, { mode: 'live', promotedAt: new Date().toISOString() });
 
     await sendTelegram(
       `🏆 <b>WAL VALIDIERT</b>\nAdresse: <code>${whaleAddress.slice(0, 8)}...</code>\nBewertet: <b>${summary.evaluatedTrades}</b> Trades\nWin-Rate: <b>${(summary.winRatePct ?? 0).toFixed(0)}%</b>\nAvg PnL: <b>${(summary.avgPnlPct ?? 0).toFixed(1)}%</b>\nMedian PnL: <b>${(summary.medianPnlPct ?? 0).toFixed(1)}%</b>\nStatus: <b>LIVE AUTO-BUY AKTIV</b>`,
@@ -329,7 +320,7 @@ async function maybeFinalizePaperWhale(whaleAddress: string) {
 }
 
 export async function reconcilePaperWhales() {
-  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
+  const whales = readWhales();
   for (const whale of whales) {
     if (whale.mode !== 'paper') {
       continue;
@@ -352,9 +343,7 @@ async function maybeEliminateLiveWhale(whaleAddress: string) {
     return;
   }
 
-  const whales = normalizeWhales(readJsonFileSync(WHALE_FILE, []));
-  const remainingWhales = whales.filter((item) => item.address !== whaleAddress);
-  writeJsonFileSync(WHALE_FILE, remainingWhales);
+  removeWhale(whaleAddress);
 
   const liveData = readLegacyPerformance(PERF_FILE);
   delete liveData[whaleAddress];

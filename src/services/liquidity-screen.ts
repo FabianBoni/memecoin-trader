@@ -1,6 +1,7 @@
 import { DexscreenerClient } from "../clients/dexscreener.js";
 import { HeliusClient } from "../clients/helius.js";
 import { getKnownLockerLabel } from "../solana/lockers.js";
+import { decodeOrcaWhirlpoolState, isRecognizedOrcaWhirlpool } from "../solana/orca.js";
 import { discoverCandidatePools } from "../solana/pools.js";
 import { decodePumpAmmPool, isRecognizedPumpAmmPool } from "../solana/pump-amm.js";
 import {
@@ -213,6 +214,150 @@ export class LiquidityScreenService {
     return pool;
   }
 
+  private async screenOrcaWhirlpoolLiquidity(
+    pool: LiquidityPoolDiscovery,
+    tokenAddress: string,
+    pumpFun: PumpFunCheckResult,
+    warnings: string[],
+    evidence: string[],
+  ): Promise<LiquidityCheckResult> {
+    const rawAccount = await this.heliusClient.getRawAccountInfo(pool.pairAddress);
+    if (!isRecognizedOrcaWhirlpool(rawAccount)) {
+      evidence.push(`Orca candidate ${pool.pairAddress} owner ${rawAccount.owner} did not match the canonical Whirlpool program.`);
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca pool could not be verified against the canonical Whirlpool program."],
+        warnings,
+        evidence,
+      };
+    }
+
+    const decoded = decodeOrcaWhirlpoolState(rawAccount);
+    evidence.push(
+      `Decoded Orca Whirlpool ${pool.pairAddress}: liquidity=${decoded.liquidity.toString()} tickSpacing=${decoded.tickSpacing} feeRate=${decoded.feeRate}.`,
+    );
+
+    const decodedTokenMints = new Set([decoded.tokenMintA, decoded.tokenMintB]);
+    if (!decodedTokenMints.has(tokenAddress)) {
+      evidence.push(`Decoded Orca Whirlpool ${pool.pairAddress} does not include target token ${tokenAddress}.`);
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca Whirlpool does not contain the requested token mint."],
+        warnings,
+        evidence,
+      };
+    }
+
+    const metadataTokenMints = [pool.baseTokenAddress, pool.quoteTokenAddress].filter(
+      (value): value is string => typeof value === "string" && value.length > 0,
+    );
+    const metadataMismatch = metadataTokenMints.some((value) => !decodedTokenMints.has(value));
+    if (metadataMismatch) {
+      evidence.push(
+        `Dex metadata (${metadataTokenMints.join(",")}) disagreed with decoded Orca Whirlpool mints ${decoded.tokenMintA}/${decoded.tokenMintB}.`,
+      );
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Dex metadata does not match the on-chain Orca Whirlpool token mints."],
+        warnings,
+        evidence,
+      };
+    }
+
+    if (decoded.liquidity <= 0n) {
+      evidence.push(`Orca Whirlpool ${pool.pairAddress} reported zero in-range liquidity.`);
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca Whirlpool has zero in-range liquidity."],
+        warnings,
+        evidence,
+      };
+    }
+
+    const [vaultA, vaultB] = await Promise.all([
+      this.heliusClient.getParsedTokenAccountInfo(decoded.tokenVaultA),
+      this.heliusClient.getParsedTokenAccountInfo(decoded.tokenVaultB),
+    ]);
+
+    if (vaultA.mint !== decoded.tokenMintA || vaultB.mint !== decoded.tokenMintB) {
+      evidence.push(
+        `Orca vault mint mismatch: vaultA=${vaultA.mint ?? 'unknown'} expected=${decoded.tokenMintA}; vaultB=${vaultB.mint ?? 'unknown'} expected=${decoded.tokenMintB}.`,
+      );
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca Whirlpool vault accounts did not match the decoded pool token mints."],
+        warnings,
+        evidence,
+      };
+    }
+
+    if (vaultA.owner !== pool.pairAddress || vaultB.owner !== pool.pairAddress) {
+      evidence.push(
+        `Orca vault owner mismatch: vaultA.owner=${vaultA.owner ?? 'unknown'} vaultB.owner=${vaultB.owner ?? 'unknown'} expected=${pool.pairAddress}.`,
+      );
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca Whirlpool vault authority did not match the Whirlpool account."],
+        warnings,
+        evidence,
+      };
+    }
+
+    const vaultAmountA = parseBigInt(vaultA.tokenAmount?.amount);
+    const vaultAmountB = parseBigInt(vaultB.tokenAmount?.amount);
+    evidence.push(`Orca Whirlpool vault balances: ${decoded.tokenVaultA}=${vaultAmountA.toString()} ${decoded.tokenVaultB}=${vaultAmountB.toString()}.`);
+
+    if (vaultAmountA <= 0n || vaultAmountB <= 0n) {
+      return {
+        passed: false,
+        status: "failed",
+        pool,
+        pumpFun,
+        reasons: ["Orca Whirlpool vault balances were empty on at least one side."],
+        warnings,
+        evidence,
+      };
+    }
+
+    if (!pool.baseTokenAddress) {
+      pool.baseTokenAddress = decoded.tokenMintA;
+    }
+
+    if (!pool.quoteTokenAddress) {
+      pool.quoteTokenAddress = decoded.tokenMintB;
+    }
+
+    evidence.push(`Orca Whirlpool ${pool.pairAddress} passed strict live validation and will execute via Jupiter.`);
+
+    return {
+      passed: true,
+      status: "passed",
+      pool,
+      pumpFun,
+      reasons: [],
+      warnings,
+      evidence,
+    };
+  }
+
   async screenScoutSeedLiquidity(tokenAddress: string): Promise<{
     eligible: boolean;
     reason: string;
@@ -322,6 +467,22 @@ export class LiquidityScreenService {
         warnings,
         evidence,
       };
+    }
+
+    if (isOrcaScoutDexId(pool.dexId)) {
+      try {
+        return await this.screenOrcaWhirlpoolLiquidity(pool, tokenAddress, pumpFun, warnings, evidence);
+      } catch (error) {
+        return {
+          passed: false,
+          status: "unknown",
+          pool,
+          pumpFun,
+          reasons: [`Orca Whirlpool Validierung fehlgeschlagen: ${error instanceof Error ? error.message : String(error)}`],
+          warnings,
+          evidence,
+        };
+      }
     }
 
     const lpMintAddress = await this.resolveLpMintAddress(pool, tokenAddress, evidence);

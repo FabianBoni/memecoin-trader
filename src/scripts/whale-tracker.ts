@@ -10,12 +10,13 @@ import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.j
 import { getWhaleModeSummary, type WhaleModeSummary } from '../storage/whale-stats.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import { loadExecutionWallet } from "../wallet.js";
-import { normalizeWhales, type WhaleRecord } from '../storage/whales.js';
+import { readWhales, type WhaleRecord } from '../storage/whales.js';
 import { createAsyncLimiter, isSolanaRpcRateLimitError, withRpcRetry } from '../solana/rpc-guard.js';
 import type { DexPairSummary } from '../types/market.js';
 import type { TokenSecurityScreen } from '../types/token.js';
 import type { ExecutionMode, TradePlan } from '../types/trade.js';
-import { chooseHotExecutionMode } from '../services/execution-routing.js';
+import { suggestExecutionModeForPool } from '../services/execution-routing.js';
+import { BuyExecutionRouteSelector } from '../services/execution-route-selector.js';
 import { sendTelegram } from "./telegram-notifier.js";
 
 const PRIMARY_RPC_URL = getHeliusRpcUrl();
@@ -34,7 +35,6 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
 const PAPER_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/paper-trades.json');
-const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
 const WHALE_ACTIVITY_PATH = path.resolve(SCRIPT_DIR, '../data/whale-activity.json');
 const WHALE_SUBSCRIPTION_REFRESH_MS = 60 * 1000;
 const WHALE_SIGNAL_COOLDOWN_MS = 90 * 1000;
@@ -42,6 +42,19 @@ const TRACKER_PRICE_CACHE_TTL_MS = 15_000;
 const TRACKER_PRICE_CONCURRENCY = 3;
 const TRACKER_RPC_CONCURRENCY = 2;
 const TRACKER_RPC_RETRY_DELAYS_MS = [250, 500, 1000, 2000];
+const TRACKER_SIGNAL_CLUSTER_WINDOW_MS = Math.max(WHALE_SIGNAL_COOLDOWN_MS, env.TRACKER_SIGNAL_CLUSTER_WINDOW_MS);
+const TRACKER_SIGNAL_CLUSTER_MIN_WALLETS = Math.max(1, env.TRACKER_SIGNAL_CLUSTER_MIN_WALLETS);
+const TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS = Math.min(
+  TRACKER_SIGNAL_CLUSTER_MIN_WALLETS,
+  Math.max(0, env.TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS),
+);
+const TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS = Math.min(
+  TRACKER_SIGNAL_CLUSTER_MIN_WALLETS,
+  Math.max(0, env.TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS),
+);
+const TRACKER_SIGNAL_MIN_BUY_USD = env.TRACKER_SIGNAL_MIN_BUY_USD;
+const PREMIUM_SIGNAL_MIN_QUALITY_SCORE = 55;
+const INSIDER_SIGNAL_MIN_QUALITY_SCORE = 72;
 const MIN_SOL_RESERVE = Number(process.env.MIN_SOL_RESERVE || '0.05');
 const MIN_RELIABLE_WHALE_SOL_DELTA = 0.01;
 const PAPER_SIGNAL_BLOCK_MIN_TRADES = Math.max(env.PAPER_PROMOTION_MIN_TRADES, 8);
@@ -63,11 +76,13 @@ const PAPER_SUBSCRIPTION_MIN_MEDIAN_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MI
 const TRACKER_MAX_PROMOTABLE_PAPER_WHALES = Math.max(4, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES * 0.75));
 const TRACKER_MAX_UNPROVEN_PAPER_WHALES = Math.max(3, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES / 2));
 type MarketEntryPriceSource = Extract<PaperTradeRecord['entryPriceSource'], 'market-snapshot' | 'dexscreener-snapshot'>;
+type SignalStrategy = 'single-wallet' | 'cluster-insider';
 
 // Fallback auf die echte Execution-Wallet, falls WALLET_ADDRESS nicht gesetzt ist.
 const executionWallet = loadExecutionWallet();
 const WALLET_ADDRESS = process.env.WALLET_ADDRESS?.trim() || executionWallet.publicKey.toBase58();
 const tokenScreenService = new TokenScreenService();
+const executionRouteSelector = new BuyExecutionRouteSelector();
 const dexscreenerClient = new DexscreenerClient();
 const dexPairCache = new Map<string, { fetchedAt: number; pairs: DexPairSummary[] }>();
 const inFlightDexPairRequests = new Map<string, Promise<DexPairSummary[]>>();
@@ -171,11 +186,6 @@ async function executeBuyWithRetry(params: {
 }) {
   const { executeTradePlan } = await import('./execute-trade.js');
   const slippageLadder = getBuySlippageLadder(params.mint);
-  const executionModes: ExecutionMode[] = params.preferredExecutionMode
-    && params.preferredExecutionMode !== 'jupiter'
-    && params.poolAddress
-    ? [params.preferredExecutionMode, 'jupiter']
-    : ['jupiter'];
   let lastError: unknown;
 
   const buildExecutionPlan = (executionMode: ExecutionMode, maxSlippageBps: number): TradePlan => ({
@@ -209,13 +219,34 @@ async function executeBuyWithRetry(params: {
       continue;
     }
 
-    for (let modeIndex = 0; modeIndex < executionModes.length; modeIndex += 1) {
-      const executionMode = executionModes[modeIndex]!;
-      const isDirectFallback = executionMode !== 'jupiter';
+    const directPlan = params.preferredExecutionMode
+      && params.preferredExecutionMode !== 'jupiter'
+      && params.poolAddress
+      ? buildExecutionPlan(params.preferredExecutionMode, maxSlippageBps)
+      : undefined;
+    const jupiterPlan = buildExecutionPlan('jupiter', maxSlippageBps);
+    let executionPlans: TradePlan[] = directPlan ? [directPlan, jupiterPlan] : [jupiterPlan];
+
+    try {
+      const routeSelection = await executionRouteSelector.selectBuyExecutionOrder({
+        jupiterPlan,
+        ...(directPlan ? { directPlan } : {}),
+      });
+      executionPlans = routeSelection.executionOrder
+        .map((executionMode) => executionMode === 'jupiter' ? jupiterPlan : directPlan!)
+        .filter(Boolean);
+      console.log(`[ROUTING] ${params.mint.slice(0,6)} mit ${maxSlippageBps} bps: ${routeSelection.summary}`);
+    } catch (error) {
+      console.warn(`[ROUTING] Quote-Vergleich fuer ${params.mint.slice(0,6)} fehlgeschlagen, nutze Fallback-Reihenfolge: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    for (let modeIndex = 0; modeIndex < executionPlans.length; modeIndex += 1) {
+      const plan = executionPlans[modeIndex]!;
+      const executionMode = plan.executionMode!;
 
       try {
         console.log(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} mit ${maxSlippageBps} bps via ${executionMode}.`);
-        const receipt = await executeTradePlan(buildExecutionPlan(executionMode, maxSlippageBps));
+        const receipt = await executeTradePlan(plan);
 
         if (!receipt?.confirmed) {
           throw new Error(`Buy execution returned without on-chain confirmation for ${params.mint}.`);
@@ -226,9 +257,10 @@ async function executeBuyWithRetry(params: {
         lastError = error;
         console.error(`[BUY] Versuch ${attemptIndex + 1}/${slippageLadder.length} fuer ${params.mint.slice(0,6)} via ${executionMode} fehlgeschlagen:`, error);
 
-        const hasModeFallback = modeIndex < executionModes.length - 1;
-        if (hasModeFallback && isDirectFallback) {
-          console.warn(`[BUY] Direkter Pfad ${executionMode} fehlgeschlagen. Fallback auf Jupiter fuer ${params.mint.slice(0,6)} im selben Versuch.`);
+        const hasModeFallback = modeIndex < executionPlans.length - 1;
+        if (hasModeFallback) {
+          const fallbackMode = executionPlans[modeIndex + 1]?.executionMode ?? 'jupiter';
+          console.warn(`[BUY] Route ${executionMode} fehlgeschlagen. Fallback auf ${fallbackMode} fuer ${params.mint.slice(0,6)} im selben Versuch.`);
           continue;
         }
 
@@ -273,6 +305,11 @@ type PaperTradeRecord = {
   lastObservedChangePct?: number;
   panic?: boolean;
   panicMarkedAt?: string;
+  signalStrategy?: SignalStrategy;
+  clusterLeadWhale?: string;
+  clusterWalletCount?: number;
+  clusterPremiumWalletCount?: number;
+  clusterInsiderWalletCount?: number;
 };
 
 type WhaleActivityRecord = {
@@ -284,11 +321,37 @@ type WhaleActivityRecord = {
   botMode: 'paper' | 'live';
 };
 
+type WhaleSignalClass = 'standard' | 'premium' | 'insider';
+
+type ClusterSignalMember = {
+  whale: WhaleRecord;
+  profile: WhalePerformanceProfile;
+  detectedAtMs: number;
+  signature?: string;
+  signalClass: WhaleSignalClass;
+  buySizeSol: number | null;
+  buySizeUsd: number | null;
+};
+
+type WhaleBuyCluster = {
+  mint: string;
+  detectedAt: string;
+  leader: ClusterSignalMember;
+  members: ClusterSignalMember[];
+  premiumWalletCount: number;
+  insiderWalletCount: number;
+  maxBuyUsd: number | null;
+  qualified: boolean;
+  signalStrategy: SignalStrategy;
+};
+
 const whaleLogSubscriptions = new Map<string, number>();
 const processedSignatures = new Map<string, number>();
 const inFlightSignatures = new Set<string>();
 const recentWhaleSignals = new Map<string, number>();
 const recentWhaleSignalSuppressionLogs = new Map<string, number>();
+const recentWhaleBuyClusters = new Map<string, Map<string, ClusterSignalMember>>();
+const recentQualifiedMintSignals = new Map<string, number>();
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null; source: MarketEntryPriceSource }>();
 const solUsdPriceCache = { fetchedAt: 0, price: null as number | null };
 let activePriceRequests = 0;
@@ -298,7 +361,7 @@ const inFlightParsedTransactions = new Map<string, Promise<Awaited<ReturnType<Co
 
 const getWhales = (): WhaleRecord[] => {
   try {
-    return normalizeWhales(readJsonFileSync(WHALES_PATH, []));
+    return readWhales();
   } catch (e) {
     return [];
   }
@@ -656,6 +719,7 @@ type WhalePerformanceProfile = {
   winRate: number | null;
   avgPnlPct: number | null;
   medianPnlPct: number | null;
+  qualityScore: number | null;
   tier: 'test' | 'caution' | 'standard' | 'elite' | 'blocked';
   sourceMode: 'paper' | 'live';
 };
@@ -667,9 +731,138 @@ type PaperSubscriptionCandidate = {
 };
 
 function formatPerformanceLabel(positionProfile: WhalePerformanceProfile): string {
-  return positionProfile.winRate === null
+  const baseLabel = positionProfile.winRate === null
     ? `${positionProfile.sampleSize} Trades (${positionProfile.sourceMode})`
     : `${formatPct(positionProfile.winRate, 0)} Win / Avg ${formatPct(positionProfile.avgPnlPct, 1)} aus ${positionProfile.sampleSize} ${positionProfile.sourceMode}`;
+
+  return positionProfile.qualityScore === null
+    ? baseLabel
+    : `${baseLabel} · Q${positionProfile.qualityScore.toFixed(0)}`;
+}
+
+function canWhaleAutoTradeLive(whale: WhaleRecord): boolean {
+  return whale.mode === 'live' && typeof whale.promotedAt === 'string' && whale.promotedAt.trim().length > 0;
+}
+
+function getWhaleSignalClassRank(signalClass: WhaleSignalClass): number {
+  switch (signalClass) {
+    case 'insider':
+      return 3;
+    case 'premium':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function getWhaleSignalClass(whale: WhaleRecord, profile: WhalePerformanceProfile): WhaleSignalClass {
+  const qualityScore = toFiniteNumber(profile.qualityScore, 0);
+  const seedVolumeUsd = Math.max(
+    toFiniteNumber(whale.seedTokenVolumeUsd, 0),
+    toFiniteNumber(whale.estimatedVolumeUsd, 0),
+  );
+  const strongSeedSpecialist = toFiniteNumber(whale.seedTraderRank, Number.MAX_SAFE_INTEGER) <= 3
+    && seedVolumeUsd >= Math.max(env.SCOUT_MIN_SEED_TRADER_VOLUME_USD * 2, 2_500);
+
+  if (canWhaleAutoTradeLive(whale)
+    || profile.tier === 'elite'
+    || (qualityScore >= INSIDER_SIGNAL_MIN_QUALITY_SCORE && profile.sampleSize >= PAPER_SUBSCRIPTION_REVIEW_TRADES)
+    || (qualityScore >= PREMIUM_SIGNAL_MIN_QUALITY_SCORE
+      && profile.sampleSize >= PAPER_SUBSCRIPTION_PROBATION_REVIEW_TRADES
+      && strongSeedSpecialist)) {
+    return 'insider';
+  }
+
+  if (qualityScore >= PREMIUM_SIGNAL_MIN_QUALITY_SCORE
+    || (profile.tier === 'standard' && profile.sampleSize >= PAPER_SUBSCRIPTION_PROBATION_REVIEW_TRADES)
+    || (strongSeedSpecialist && profile.sampleSize >= Math.max(2, PAPER_SUBSCRIPTION_PROBATION_REVIEW_TRADES - 1))) {
+    return 'premium';
+  }
+
+  return 'standard';
+}
+
+function compareClusterSignalMembers(left: ClusterSignalMember, right: ClusterSignalMember): number {
+  return Number(canWhaleAutoTradeLive(right.whale)) - Number(canWhaleAutoTradeLive(left.whale))
+    || getWhaleSignalClassRank(right.signalClass) - getWhaleSignalClassRank(left.signalClass)
+    || toFiniteNumber(right.buySizeUsd, -1) - toFiniteNumber(left.buySizeUsd, -1)
+    || toFiniteNumber(right.profile.qualityScore, -1) - toFiniteNumber(left.profile.qualityScore, -1)
+    || right.profile.sampleSize - left.profile.sampleSize
+    || toFiniteNumber(right.whale.seedTokenVolumeUsd, 0) - toFiniteNumber(left.whale.seedTokenVolumeUsd, 0)
+    || toFiniteNumber(right.whale.estimatedVolumeUsd, 0) - toFiniteNumber(left.whale.estimatedVolumeUsd, 0)
+    || left.whale.address.localeCompare(right.whale.address);
+}
+
+function pruneRecentWhaleBuyClusters() {
+  const cutoff = Date.now() - TRACKER_SIGNAL_CLUSTER_WINDOW_MS;
+  for (const [mint, members] of recentWhaleBuyClusters.entries()) {
+    for (const [address, member] of members.entries()) {
+      if (member.detectedAtMs < cutoff) {
+        members.delete(address);
+      }
+    }
+
+    if (members.size === 0) {
+      recentWhaleBuyClusters.delete(mint);
+    }
+  }
+}
+
+function pruneRecentQualifiedMintSignals() {
+  const cutoff = Date.now() - TRACKER_SIGNAL_CLUSTER_WINDOW_MS;
+  for (const [mint, seenAt] of recentQualifiedMintSignals.entries()) {
+    if (seenAt < cutoff) {
+      recentQualifiedMintSignals.delete(mint);
+    }
+  }
+}
+
+function markQualifiedMintSignalProcessed(mint: string): boolean {
+  pruneRecentQualifiedMintSignals();
+  if (recentQualifiedMintSignals.has(mint)) {
+    return false;
+  }
+
+  recentQualifiedMintSignals.set(mint, Date.now());
+  return true;
+}
+
+function registerRelevantBuyClusterSignal(mint: string, member: ClusterSignalMember): WhaleBuyCluster {
+  pruneRecentWhaleBuyClusters();
+
+  const members = recentWhaleBuyClusters.get(mint) ?? new Map<string, ClusterSignalMember>();
+  members.set(member.whale.address, member);
+  recentWhaleBuyClusters.set(mint, members);
+
+  const rankedMembers = [...members.values()].sort(compareClusterSignalMembers);
+  const premiumWalletCount = rankedMembers.filter((candidate) => candidate.signalClass !== 'standard').length;
+  const insiderWalletCount = rankedMembers.filter((candidate) => candidate.signalClass === 'insider').length;
+  const leader = rankedMembers[0] ?? member;
+  const maxBuyUsd = rankedMembers.reduce<number | null>((best, candidate) => {
+    if (candidate.buySizeUsd === null) {
+      return best;
+    }
+
+    return best === null ? candidate.buySizeUsd : Math.max(best, candidate.buySizeUsd);
+  }, null);
+
+  return {
+    mint,
+    detectedAt: new Date(member.detectedAtMs).toISOString(),
+    leader,
+    members: rankedMembers,
+    premiumWalletCount,
+    insiderWalletCount,
+    maxBuyUsd,
+    qualified: rankedMembers.length >= TRACKER_SIGNAL_CLUSTER_MIN_WALLETS
+      && premiumWalletCount >= TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS
+      && insiderWalletCount >= TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS,
+    signalStrategy: 'cluster-insider',
+  };
+}
+
+function formatClusterSummary(cluster: WhaleBuyCluster): string {
+  return `${cluster.members.length} Wallets, ${cluster.insiderWalletCount} insider, ${cluster.premiumWalletCount} premium, Lead ${cluster.leader.whale.address.slice(0,8)} ${formatUsdAmount(cluster.leader.buySizeUsd)} (${cluster.leader.signalClass})`;
 }
 
 type PositionSizingDecision = {
@@ -719,6 +912,11 @@ function logSizingConfiguration() {
     minEntryLiquidityUsd: env.MIN_ENTRY_LIQUIDITY_USD,
     minWhaleBuySizeSol: env.MIN_WHALE_BUY_SIZE_SOL,
     maxEntryPriceExtensionPct: env.MAX_ENTRY_PRICE_EXTENSION_PCT,
+    clusterWindowMs: TRACKER_SIGNAL_CLUSTER_WINDOW_MS,
+    clusterMinWallets: TRACKER_SIGNAL_CLUSTER_MIN_WALLETS,
+    clusterMinPremiumWallets: TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS,
+    clusterMinInsiderWallets: TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS,
+    clusterMinBuyUsd: TRACKER_SIGNAL_MIN_BUY_USD,
   });
 }
 
@@ -820,6 +1018,10 @@ function toFiniteNumber(value: number | null | undefined, fallback = 0): number 
   return Number.isFinite(value) ? Number(value) : fallback;
 }
 
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 function toTimestamp(value: string | undefined): number {
   if (!value) {
     return 0;
@@ -829,25 +1031,66 @@ function toTimestamp(value: string | undefined): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function getWhaleQualityScore(summary: WhaleModeSummary, whale: WhaleRecord): number | null {
+  const medianPnlPct = summary.medianPnlPct ?? summary.avgPnlPct;
+  if (summary.evaluatedTrades === 0 || summary.winRatePct === null || summary.avgPnlPct === null || medianPnlPct === null) {
+    return null;
+  }
+
+  const sampleScore = clampNumber(
+    summary.evaluatedTrades / Math.max(env.PAPER_PROMOTION_MIN_TRADES * 2, 1),
+    0,
+    1,
+  );
+  const winScore = clampNumber(summary.winRatePct / 100, 0, 1);
+  const avgScore = clampNumber(
+    summary.avgPnlPct / Math.max(env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 2, 1),
+    -1,
+    1,
+  );
+  const medianScore = clampNumber(
+    medianPnlPct / Math.max(env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 2, 0.5),
+    -1,
+    1,
+  );
+  const excursionScore = clampNumber((summary.positiveExcursionRatePct ?? 0) / 100, 0, 1);
+  const panicPenalty = clampNumber((summary.panicExitRatePct ?? 0) / 100, 0, 1);
+  const discardPenalty = clampNumber(
+    summary.noPriceDiscards / Math.max(summary.evaluatedTrades + summary.noPriceDiscards, 1),
+    0,
+    1,
+  );
+  const volumeUsd = Math.max(
+    toFiniteNumber(whale.seedTokenVolumeUsd, 0),
+    toFiniteNumber(whale.estimatedVolumeUsd, 0),
+    1,
+  );
+  const seedScore = clampNumber(Math.log10(volumeUsd) / 6, 0, 1);
+  const rawScore = (winScore * 30)
+    + (avgScore * 18)
+    + (medianScore * 24)
+    + (sampleScore * 10)
+    + (excursionScore * 10)
+    + (seedScore * 8)
+    - (panicPenalty * 8)
+    - (discardPenalty * 6);
+
+  return clampNumber(rawScore, 0, 100);
+}
+
 function getPaperSubscriptionPriorityScore(whale: WhaleRecord, profile: WhalePerformanceProfile): number {
-  const medianPnlPct = profile.medianPnlPct ?? profile.avgPnlPct;
   const sampleScore = Math.min(profile.sampleSize, PAPER_SUBSCRIPTION_REVIEW_TRADES) / PAPER_SUBSCRIPTION_REVIEW_TRADES;
-  const winScore = Math.max(0, toFiniteNumber(profile.winRate, 0) / Math.max(env.PAPER_PROMOTION_MIN_WIN_RATE_PCT, 1));
-  const avgScore = Math.max(0, toFiniteNumber(profile.avgPnlPct, 0) / Math.max(env.PAPER_PROMOTION_MIN_AVG_PNL_PCT, 1));
-  const medianScore = Math.max(0, toFiniteNumber(medianPnlPct, 0) / Math.max(env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT, 0.5));
   const seedVolumeScore = Math.log10(Math.max(toFiniteNumber(whale.seedTokenVolumeUsd, 0), 1));
   const estimatedVolumeScore = Math.log10(Math.max(toFiniteNumber(whale.estimatedVolumeUsd, 0), 1));
   const volumeScore = Math.max(seedVolumeScore, estimatedVolumeScore) / 6;
   const diversityScore = Math.min(toFiniteNumber(whale.distinctTokenCount, 0), env.PAPER_PROMOTION_MIN_TRADES) / env.PAPER_PROMOTION_MIN_TRADES;
   const qualifyingTradeScore = Math.min(toFiniteNumber(whale.qualifyingTradeCount, 0), env.PAPER_PROMOTION_MIN_TRADES) / env.PAPER_PROMOTION_MIN_TRADES;
 
-  return (winScore * 3)
-    + (medianScore * 3)
-    + (avgScore * 2.5)
-    + (sampleScore * 2)
-    + volumeScore
-    + (diversityScore * 0.5)
-    + (qualifyingTradeScore * 0.5);
+  return (profile.qualityScore ?? 0)
+    + (sampleScore * 4)
+    + (volumeScore * 3)
+    + (diversityScore * 2)
+    + (qualifyingTradeScore * 2);
 }
 
 function comparePaperSubscriptionPriority(
@@ -855,6 +1098,7 @@ function comparePaperSubscriptionPriority(
   right: PaperSubscriptionCandidate,
 ): number {
   return right.priorityScore - left.priorityScore
+    || toFiniteNumber(right.profile.qualityScore, -1) - toFiniteNumber(left.profile.qualityScore, -1)
     || right.profile.sampleSize - left.profile.sampleSize
     || toFiniteNumber(right.profile.winRate, -1) - toFiniteNumber(left.profile.winRate, -1)
     || toFiniteNumber(right.profile.medianPnlPct, -Infinity) - toFiniteNumber(left.profile.medianPnlPct, -Infinity)
@@ -874,18 +1118,19 @@ function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
     const paperSummary = getWhaleModeSummary(whale.address, 'paper');
     const sourceMode = whale.mode === 'live' && liveSummary.evaluatedTrades > 0 ? 'live' : 'paper';
     const summary = sourceMode === 'live' ? liveSummary : paperSummary;
+    const qualityScore = getWhaleQualityScore(summary, whale);
 
     let tier: WhalePerformanceProfile['tier'] = 'test';
     if (summary.evaluatedTrades >= env.PAPER_PROMOTION_MIN_TRADES) {
-      if ((summary.winRatePct ?? 0) >= 70 && (summary.avgPnlPct ?? 0) >= env.PAPER_PROMOTION_MIN_AVG_PNL_PCT * 1.5) {
+      if ((qualityScore ?? 0) >= 72) {
         tier = 'elite';
-      } else if ((summary.winRatePct ?? 100) < 50 || (summary.avgPnlPct ?? 0) < 0) {
+      } else if ((qualityScore ?? 100) < 40) {
         tier = 'caution';
       } else {
         tier = 'standard';
       }
     } else if (summary.evaluatedTrades >= 3) {
-      tier = (summary.avgPnlPct ?? 0) < 0 ? 'caution' : 'standard';
+      tier = (qualityScore ?? 0) < 32 ? 'caution' : 'standard';
     }
 
     if (sourceMode === 'paper' && shouldBlockPaperSignals(summary)) {
@@ -897,6 +1142,7 @@ function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
       winRate: summary.winRatePct,
       avgPnlPct: summary.avgPnlPct,
       medianPnlPct: summary.medianPnlPct,
+      qualityScore,
       tier,
       sourceMode,
     };
@@ -907,6 +1153,7 @@ function getPositionSizeProfile(whale: WhaleRecord): WhalePerformanceProfile {
       winRate: null,
       avgPnlPct: null,
       medianPnlPct: null,
+      qualityScore: null,
       tier: 'test',
       sourceMode: whale.mode,
     };
@@ -1098,7 +1345,11 @@ function isSoftPaperTokenScreenFailure(screen: TokenSecurityScreen): boolean {
 async function evaluateEntryDecision(
   whale: WhaleRecord,
   mint: string,
-  parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null,
+  options?: {
+    parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null;
+    signalWhaleAddress?: string;
+    whaleBuySizeSolOverride?: number | null;
+  },
 ): Promise<EntryDecision> {
   const rejectionReasons: string[] = [];
   const notes: string[] = [];
@@ -1107,11 +1358,13 @@ async function evaluateEntryDecision(
   let preferredExecutionMode: ExecutionMode = 'jupiter';
   const marketEntry = await fetchEntryPriceUsd(mint);
   const marketEntryPriceUsd = marketEntry.price;
-  const whaleEntry = await inferEntryPriceFromWhaleTransaction({ ...(parsedTx !== undefined ? { parsedTx } : {}), whaleAddress: whale.address, mint });
+  const parsedTx = options?.parsedTx;
+  const signalWhaleAddress = options?.signalWhaleAddress ?? whale.address;
+  const whaleEntry = await inferEntryPriceFromWhaleTransaction({ ...(parsedTx !== undefined ? { parsedTx } : {}), whaleAddress: signalWhaleAddress, mint });
   const entryPrice = marketEntryPriceUsd ?? whaleEntry?.entryPrice ?? null;
   const entryPriceSource = marketEntryPriceUsd ? marketEntry.source : (whaleEntry?.source ?? 'market-snapshot');
   const liquidityUsd = await getLiquidityUsd(mint);
-  const whaleBuySizeSol = getReliableWhaleBuySizeSol(parsedTx, whale.address);
+  const whaleBuySizeSol = options?.whaleBuySizeSolOverride ?? getReliableWhaleBuySizeSol(parsedTx, signalWhaleAddress);
 
   if (entryPrice === null || entryPrice <= 0) {
     rejectionReasons.push('Kein belastbarer Einstiegspreis verfuegbar.');
@@ -1162,12 +1415,7 @@ async function evaluateEntryDecision(
       }
       poolAddress = screen.liquidity?.pool?.pairAddress ?? null;
       dexId = screen.liquidity?.pool?.dexId ?? null;
-      preferredExecutionMode = chooseHotExecutionMode({
-        mint,
-        dexId,
-        liquidityUsd,
-        whaleBuySizeSol,
-      });
+      preferredExecutionMode = suggestExecutionModeForPool(screen.liquidity?.pool ?? null);
       if (screen.warnings.length > 0) {
         notes.push(screen.warnings[0]!);
       }
@@ -1237,6 +1485,7 @@ async function openPaperTrade(
   positionProfile: WhalePerformanceProfile,
   entryDecision: EntryDecision,
   signature?: string,
+  cluster?: WhaleBuyCluster,
 ) {
   const entryPrice = entryDecision.entryPrice;
 
@@ -1265,6 +1514,15 @@ async function openPaperTrade(
     whaleBuySizeSol: entryDecision.whaleBuySizeSol ?? null,
     liquidityUsd: entryDecision.liquidityUsd ?? null,
     priceExtensionPct: entryDecision.priceExtensionPct ?? null,
+    signalStrategy: cluster?.signalStrategy ?? 'single-wallet',
+    ...(cluster
+      ? {
+          clusterLeadWhale: cluster.leader.whale.address,
+          clusterWalletCount: cluster.members.length,
+          clusterPremiumWalletCount: cluster.premiumWalletCount,
+          clusterInsiderWalletCount: cluster.insiderWalletCount,
+        }
+      : {}),
   };
   if (signature) {
     paperTradeRecord.entryTxid = signature;
@@ -1273,6 +1531,36 @@ async function openPaperTrade(
   paperTrades[tradeId] = paperTradeRecord;
   writePaperTrades(paperTrades);
   console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert (${paperTradeRecord.entryPriceSource}).`);
+}
+
+async function openClusterPaperTrades(
+  cluster: WhaleBuyCluster,
+  mint: string,
+  entryDecision: EntryDecision,
+  fallbackSignature?: string,
+) {
+  for (const member of cluster.members) {
+    if (member.whale.mode !== 'paper') {
+      continue;
+    }
+
+    await openPaperTrade(
+      member.whale,
+      mint,
+      member.profile,
+      {
+        ...entryDecision,
+        whaleBuySizeSol: member.buySizeSol ?? entryDecision.whaleBuySizeSol,
+      },
+      member.signature ?? fallbackSignature,
+      cluster,
+    );
+  }
+}
+
+function hasActiveLiveTradeForMint(mint: string): boolean {
+  const activeTrades = readJsonFileSync<Record<string, unknown>>(ACTIVE_TRADES_PATH, {});
+  return mint in activeTrades;
 }
 
 function getLiveTradeBlockReason(whale: WhaleRecord): string | null {
@@ -1292,8 +1580,12 @@ async function logDecision(
   mint: string,
   parsedTx?: Awaited<ReturnType<Connection['getParsedTransaction']>> | null,
   signature?: string,
+  cluster?: WhaleBuyCluster,
+  signalMember?: ClusterSignalMember,
 ) {
-  const positionProfile = getPositionSizeProfile(whale);
+  const positionProfile = cluster?.leader.whale.address === whale.address
+    ? cluster.leader.profile
+    : getPositionSizeProfile(whale);
   const paperSignalBlockReason = whale.mode === 'paper'
     ? getPaperSignalBlockReason(positionProfile)
     : null;
@@ -1309,19 +1601,56 @@ async function logDecision(
     return;
   }
 
-  const entryDecision = await evaluateEntryDecision(whale, mint, parsedTx);
+  const entryDecision = await evaluateEntryDecision(whale, mint, {
+    ...(parsedTx !== undefined ? { parsedTx } : {}),
+    ...(signalMember ? { signalWhaleAddress: signalMember.whale.address } : {}),
+    ...(signalMember
+      ? { whaleBuySizeSolOverride: signalMember.buySizeSol }
+      : cluster
+        ? { whaleBuySizeSolOverride: cluster.leader.buySizeSol }
+        : {}),
+  });
 
   const performanceLabel = formatPerformanceLabel(positionProfile);
+  const clusterLabel = cluster ? ` cluster=${formatClusterSummary(cluster)}` : '';
 
-  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} perf=${performanceLabel} liq=${formatUsdAmount(entryDecision.liquidityUsd)} ext=${formatPct(entryDecision.priceExtensionPct, 1)} rr=${formatMetric(entryDecision.rewardRiskRatio, 2)} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}`);
+  console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} perf=${performanceLabel} liq=${formatUsdAmount(entryDecision.liquidityUsd)} ext=${formatPct(entryDecision.priceExtensionPct, 1)} rr=${formatMetric(entryDecision.rewardRiskRatio, 2)} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}${clusterLabel}`);
 
   if (!entryDecision.allowed) {
     console.log(`[BUY] ${mint.slice(0,6)} uebersprungen: ${entryDecision.rejectionReasons.join(' | ')}`);
+    if (cluster) {
+      updateRuntimeStatus('tracker', {
+        lastRejectedClusterAt: new Date().toISOString(),
+        lastRejectedClusterMint: mint,
+        lastRejectedClusterReason: entryDecision.rejectionReasons.join(' | '),
+        lastRejectedClusterLeadWhale: cluster.leader.whale.address,
+        lastRejectedClusterWalletCount: cluster.members.length,
+      });
+    }
     return;
   }
 
+  if (cluster) {
+    await openClusterPaperTrades(cluster, mint, entryDecision, signature);
+  }
+
   if (whale.mode === 'paper') {
-    await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    if (!cluster) {
+      await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    }
+    return;
+  }
+
+  if (hasActiveLiveTradeForMint(mint)) {
+    console.log(`[BUY] ${mint.slice(0,6)} nicht live gehandelt: Position fuer diese Mint ist bereits aktiv.`);
+    if (cluster) {
+      updateRuntimeStatus('tracker', {
+        lastSkippedClusterAt: new Date().toISOString(),
+        lastSkippedClusterMint: mint,
+        lastSkippedClusterReason: 'Position fuer diese Mint bereits aktiv.',
+        lastSkippedClusterLeadWhale: cluster.leader.whale.address,
+      });
+    }
     return;
   }
 
@@ -1335,7 +1664,9 @@ async function logDecision(
       lastBlockedLiveMint: mint,
       lastBlockedLiveReason: liveTradeBlockReason,
     });
-    await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    if (!cluster) {
+      await openPaperTrade(whale, mint, positionProfile, entryDecision, signature);
+    }
     await sendTelegram(`🛑 <b>LIVE-BUY BLOCKIERT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGrund: <b>${liveTradeBlockReason}</b>\nAktion: Signal nur als Paper-Trade erfasst.`, {
       dedupeKey: `live-buy-blocked:${whale.address}:${mint}:${liveTradeBlockReason}`,
       cooldownMs: 60 * 60 * 1000,
@@ -1410,6 +1741,15 @@ async function logDecision(
       rewardRiskRatio: entryDecision.rewardRiskRatio ?? null,
       riskBudgetSol: sizingDecision.riskBudgetSol,
       effectiveLossPct: sizingDecision.effectiveLossPct,
+      signalStrategy: cluster?.signalStrategy ?? 'single-wallet',
+      ...(cluster
+        ? {
+            clusterLeadWhale: cluster.leader.whale.address,
+            clusterWalletCount: cluster.members.length,
+            clusterPremiumWalletCount: cluster.premiumWalletCount,
+            clusterInsiderWalletCount: cluster.insiderWalletCount,
+          }
+        : {}),
     };
 
     writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
@@ -1417,7 +1757,7 @@ async function logDecision(
     const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     const activeCount = Object.keys(persistedTrades).length;
 
-    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}%</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${formatPerformanceLabel(positionProfile)}\nModus: ${positionProfile.tier}\nExecution: <b>${executionMode}</b>${entryDecision.dexId ? ` via ${entryDecision.dexId}` : ''}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
+    await sendTelegram(`🚀 <b>WAL-SIGNAL GEKAUFT</b>\nWal: <code>${whale.address.slice(0,8)}</code>\nToken: <code>${mint}</code>\nGroesse: ${formatSolAmount(actualSizeSol)} SOL\nRisk-Budget: <b>${formatSolAmount(sizingDecision.riskBudgetSol)} SOL</b> bei ${sizingDecision.effectiveLossPct.toFixed(1)}% Risiko\nEdge: <b>${entryDecision.expectedNetProfitPct?.toFixed(1) ?? 'n/a'}</b> netto | RR <b>${entryDecision.rewardRiskRatio?.toFixed(2) ?? 'n/a'}</b>\nWin-Rate: ${formatPerformanceLabel(positionProfile)}\nModus: ${positionProfile.tier}\n${cluster ? `Cluster: <b>${cluster.members.length}</b> Wallets | Insider <b>${cluster.insiderWalletCount}</b> | Premium <b>${cluster.premiumWalletCount}</b>\nLead: <code>${cluster.leader.whale.address.slice(0,8)}</code> ${formatUsdAmount(cluster.leader.buySizeUsd)} (${cluster.leader.signalClass})\n` : ''}Execution: <b>${executionMode}</b>${entryDecision.dexId ? ` via ${entryDecision.dexId}` : ''}\nKaufversuche: <b>${attempts}</b>\nSlippage: <b>${maxSlippageBps} bps</b>\nAktive Positionen: <b>${activeCount}</b>\nQuelle: ${fillSource}${fillTxid ? `\nTx: <code>${fillTxid}</code>` : ''}`, {
       dedupeKey: `buy-success:${mint}:${fillTxid ?? 'no-txid'}`,
       cooldownMs: 300_000,
       priority: true,
@@ -1652,7 +1992,78 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       signature,
       botMode: currentWhale.mode,
     });
-    await logDecision(currentWhale, tokenChange.mint, tx, signature);
+
+    const positionProfile = getPositionSizeProfile(currentWhale);
+    const whaleBuySizeSol = getReliableWhaleBuySizeSol(tx, currentWhale.address);
+    const solUsdPrice = whaleBuySizeSol !== null ? await fetchSolUsdPrice() : null;
+    const whaleBuySizeUsd = whaleBuySizeSol !== null && solUsdPrice && solUsdPrice > 0
+      ? whaleBuySizeSol * solUsdPrice
+      : null;
+
+    if (whaleBuySizeUsd === null || whaleBuySizeUsd < TRACKER_SIGNAL_MIN_BUY_USD) {
+      console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} ignoriert: Buy ${formatUsdAmount(whaleBuySizeUsd)} unter Insider-Floor ${formatUsdAmount(TRACKER_SIGNAL_MIN_BUY_USD)} oder nicht sauber ableitbar.`);
+      updateRuntimeStatus('tracker', {
+        lastIgnoredClusterSignalAt: new Date().toISOString(),
+        lastIgnoredClusterSignalMint: tokenChange.mint,
+        lastIgnoredClusterSignalWhale: currentWhale.address,
+        lastIgnoredClusterSignalBuyUsd: whaleBuySizeUsd,
+        lastIgnoredClusterSignalMinBuyUsd: TRACKER_SIGNAL_MIN_BUY_USD,
+      });
+      return;
+    }
+
+    const cluster = registerRelevantBuyClusterSignal(tokenChange.mint, {
+      whale: currentWhale,
+      profile: positionProfile,
+      detectedAtMs: Date.now(),
+      signature,
+      signalClass: getWhaleSignalClass(currentWhale, positionProfile),
+      buySizeSol: whaleBuySizeSol,
+      buySizeUsd: whaleBuySizeUsd,
+    });
+
+    if (!cluster.qualified) {
+      console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} wartet auf Konfluenz: ${cluster.members.length}/${TRACKER_SIGNAL_CLUSTER_MIN_WALLETS} Wallets, ${cluster.premiumWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS} premium, ${cluster.insiderWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS} insider.`);
+      updateRuntimeStatus('tracker', {
+        lastPendingClusterAt: cluster.detectedAt,
+        lastPendingClusterMint: tokenChange.mint,
+        lastPendingClusterLeadWhale: cluster.leader.whale.address,
+        lastPendingClusterLeadClass: cluster.leader.signalClass,
+        lastPendingClusterLeadBuyUsd: cluster.leader.buySizeUsd,
+        lastPendingClusterWalletCount: cluster.members.length,
+        lastPendingClusterPremiumWalletCount: cluster.premiumWalletCount,
+        lastPendingClusterInsiderWalletCount: cluster.insiderWalletCount,
+      });
+      return;
+    }
+
+    if (!markQualifiedMintSignalProcessed(tokenChange.mint)) {
+      console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} bereits als qualifizierter Insider-Cluster verarbeitet.`);
+      return;
+    }
+
+    console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} qualifiziert: ${formatClusterSummary(cluster)}`);
+    updateRuntimeStatus('tracker', {
+      lastClusterSignalAt: cluster.detectedAt,
+      lastClusterSignalMint: tokenChange.mint,
+      lastClusterLeadWhale: cluster.leader.whale.address,
+      lastClusterLeadMode: cluster.leader.whale.mode,
+      lastClusterLeadClass: cluster.leader.signalClass,
+      lastClusterLeadBuyUsd: cluster.leader.buySizeUsd,
+      lastClusterWalletCount: cluster.members.length,
+      lastClusterPremiumWalletCount: cluster.premiumWalletCount,
+      lastClusterInsiderWalletCount: cluster.insiderWalletCount,
+      lastClusterStrategy: cluster.signalStrategy,
+    });
+
+    await logDecision(
+      cluster.leader.whale,
+      tokenChange.mint,
+      tx,
+      signature,
+      cluster,
+      cluster.members.find((member) => member.whale.address === currentWhale.address),
+    );
   } finally {
     finalizeSignatureProcessing(signature, wasHandled);
   }

@@ -20,6 +20,22 @@ function optionalNonNegativeInt() {
   return z.preprocess(emptyStringToUndefined, z.coerce.number().int().nonnegative().optional());
 }
 
+function optionalBoolean(defaultValue: boolean) {
+  return z
+    .preprocess(emptyStringToUndefined, z.union([z.boolean(), z.string()]).optional())
+    .transform((value) => {
+      if (typeof value === "boolean") {
+        return value;
+      }
+
+      if (typeof value === "string") {
+        return value.toLowerCase() === "true";
+      }
+
+      return defaultValue;
+    });
+}
+
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -32,6 +48,9 @@ const envSchema = z.object({
     .optional()
     .transform((value) => value === undefined ? false : value.toLowerCase() === "true"),
   STORE_PATH: z.string().default("./data"),
+  DATABASE_PATH: z.string().default("./data/memecoin-trader.sqlite"),
+  DATABASE_AUTO_MIGRATE: optionalBoolean(true),
+  DATABASE_BUSY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
   HELIUS_API_KEY: optionalString(),
   HELIUS_RPC_URL: optionalUrl(),
   BIRDEYE_API_KEY: optionalString(),
@@ -82,6 +101,11 @@ const envSchema = z.object({
   MIN_REWARD_RISK_RATIO: z.coerce.number().positive().default(1.35),
   WHALE_SELL_TRIM_IGNORE_FRACTION_PCT: z.coerce.number().min(0).max(100).default(25),
   WHALE_PANIC_SELL_MIN_FRACTION_PCT: z.coerce.number().min(0).max(100).default(70),
+  TRACKER_SIGNAL_CLUSTER_WINDOW_MS: z.coerce.number().int().positive().default(180000),
+  TRACKER_SIGNAL_CLUSTER_MIN_WALLETS: z.coerce.number().int().positive().default(2),
+  TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS: z.coerce.number().int().nonnegative().default(1),
+  TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS: z.coerce.number().int().nonnegative().default(1),
+  TRACKER_SIGNAL_MIN_BUY_USD: z.coerce.number().nonnegative().default(500),
   SCOUT_BOOST_SCAN_LIMIT: z.coerce.number().int().positive().default(12),
   SCOUT_BOOST_TOKEN_LIMIT: z.coerce.number().int().positive().default(5),
   SCOUT_MARKET_TOKEN_LIMIT: z.coerce.number().int().positive().default(12),

@@ -69,21 +69,7 @@ export class RaydiumExecutionService {
   private readonly connection = new Connection(getHeliusRpcUrl(), "confirmed");
   private readonly heliusClient = new HeliusClient();
 
-  async getPlan(planId: string): Promise<TradePlan> {
-    const plans = await loadTradePlans();
-    const plan = plans.find((item) => item.planId === planId);
-    if (!plan) {
-      throw new Error(`Trade plan not found: ${planId}`);
-    }
-    return plan;
-  }
-
-  async prepareExecution(planId: string, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
-    const plan = await this.getPlan(planId);
-    return this.prepareExecutionForPlan(plan, options);
-  }
-
-  async prepareExecutionForPlan(plan: TradePlan, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+  private async buildQuoteContext(plan: TradePlan) {
     await this.gate.assertExecutable(plan);
 
     if (!plan.poolAddress) {
@@ -106,20 +92,64 @@ export class RaydiumExecutionService {
       slippageBps: plan.maxSlippageBps,
     });
 
-    const tokenAccounts = await getWalletTokenAccounts(this.heliusClient, owner);
-    const tokenIn = new Token(poolKeys.programId, inputMint, 9);
-    const tokenOut = new Token(poolKeys.programId, outputMint, poolKeys.baseMint.equals(outputMint) ? poolKeys.baseDecimals : poolKeys.quoteDecimals);
+    return {
+      wallet,
+      owner,
+      poolKeys,
+      inputMint,
+      outputMint,
+      quote,
+    };
+  }
+
+  async getPlan(planId: string): Promise<TradePlan> {
+    const plans = await loadTradePlans();
+    const plan = plans.find((item) => item.planId === planId);
+    if (!plan) {
+      throw new Error(`Trade plan not found: ${planId}`);
+    }
+    return plan;
+  }
+
+  async prepareExecution(planId: string, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+    const plan = await this.getPlan(planId);
+    return this.prepareExecutionForPlan(plan, options);
+  }
+
+  async quoteForPlan(plan: TradePlan): Promise<PreparedExecution["quote"]> {
+    const quoteContext = await this.buildQuoteContext(plan);
+
+    return {
+      inputMint: quoteContext.inputMint.toBase58(),
+      outputMint: quoteContext.outputMint.toBase58(),
+      amountInRaw: quoteContext.quote.amountInRaw,
+      amountOutRaw: quoteContext.quote.amountOutRaw,
+      minAmountOutRaw: quoteContext.quote.minAmountOutRaw,
+    };
+  }
+
+  async prepareExecutionForPlan(plan: TradePlan, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+    const quoteContext = await this.buildQuoteContext(plan);
+    const tokenAccounts = await getWalletTokenAccounts(this.heliusClient, quoteContext.owner);
+    const tokenIn = new Token(quoteContext.poolKeys.programId, quoteContext.inputMint, 9);
+    const tokenOut = new Token(
+      quoteContext.poolKeys.programId,
+      quoteContext.outputMint,
+      quoteContext.poolKeys.baseMint.equals(quoteContext.outputMint)
+        ? quoteContext.poolKeys.baseDecimals
+        : quoteContext.poolKeys.quoteDecimals,
+    );
 
     const amountIn = new TokenAmount(tokenIn, solToLamports(plan.finalPositionSol));
-    const amountOut = new TokenAmount(tokenOut, new BN(quote.minAmountOutRaw));
+    const amountOut = new TokenAmount(tokenOut, new BN(quoteContext.quote.minAmountOutRaw));
 
     const built = await Liquidity.makeSwapInstructionSimple({
       connection: this.connection,
-      poolKeys: poolKeys as any,
+      poolKeys: quoteContext.poolKeys as any,
       userKeys: {
         tokenAccounts: tokenAccounts as any,
-        owner,
-        payer: owner,
+        owner: quoteContext.owner,
+        payer: quoteContext.owner,
       },
       amountIn,
       amountOut,
@@ -138,28 +168,28 @@ export class RaydiumExecutionService {
     ];
     const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
     const messageV0 = new TransactionMessage({
-      payerKey: owner,
+      payerKey: quoteContext.owner,
       recentBlockhash: latestBlockhash.blockhash,
       instructions: allInstructions,
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet]);
+    transaction.sign([quoteContext.wallet]);
 
     return {
       plan,
-      ownerPublicKey: owner.toBase58(),
+      ownerPublicKey: quoteContext.owner.toBase58(),
       rpcUrl: getHeliusRpcUrl(),
       dryRun: env.DRY_RUN,
       executionMode: "raydium-sdk",
       lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
       warnings: buildWarnings(env.DRY_RUN),
       quote: {
-        inputMint: inputMint.toBase58(),
-        outputMint: outputMint.toBase58(),
-        amountInRaw: quote.amountInRaw,
-        amountOutRaw: quote.amountOutRaw,
-        minAmountOutRaw: quote.minAmountOutRaw,
+        inputMint: quoteContext.inputMint.toBase58(),
+        outputMint: quoteContext.outputMint.toBase58(),
+        amountInRaw: quoteContext.quote.amountInRaw,
+        amountOutRaw: quoteContext.quote.amountOutRaw,
+        minAmountOutRaw: quoteContext.quote.minAmountOutRaw,
       },
       instructionsSummary: allInstructions.map((ix, index) => `ix[${index}] program=${ix.programId.toBase58()} dataLen=${ix.data.length}`),
       serializedTransactionBase64: Buffer.from(transaction.serialize()).toString("base64"),

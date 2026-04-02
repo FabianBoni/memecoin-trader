@@ -57,21 +57,7 @@ export class PumpAmmExecutionService {
   private readonly connection = new Connection(getHeliusRpcUrl(), "confirmed");
   private readonly sdk = new OnlinePumpAmmSdk(this.connection);
 
-  async getPlan(planId: string): Promise<TradePlan> {
-    const plans = await loadTradePlans();
-    const plan = plans.find((item) => item.planId === planId);
-    if (!plan) {
-      throw new Error(`Trade plan not found: ${planId}`);
-    }
-    return plan;
-  }
-
-  async prepareExecution(planId: string, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
-    const plan = await this.getPlan(planId);
-    return this.prepareExecutionForPlan(plan, options);
-  }
-
-  async prepareExecutionForPlan(plan: TradePlan, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+  private async buildQuoteContext(plan: TradePlan) {
     await this.gate.assertExecutable(plan);
 
     if (!plan.poolAddress) {
@@ -85,12 +71,6 @@ export class PumpAmmExecutionService {
     const swapState = await this.sdk.swapSolanaState(poolKey, owner);
     const slippagePct = slippageBpsToPct(plan.maxSlippageBps);
     const quoteInLamports = solToLamports(plan.finalPositionSol);
-
-    let inputMint = NATIVE_MINT;
-    let outputMint = tokenMint;
-    let amountOutRaw: string;
-    let minAmountOutRaw: string;
-    let swapInstructions;
 
     if (swapState.pool.baseMint.equals(tokenMint) && swapState.pool.quoteMint.equals(NATIVE_MINT)) {
       const quote = quotePumpBuyQuoteInput({
@@ -106,10 +86,21 @@ export class PumpAmmExecutionService {
         feeConfig: swapState.feeConfig,
       });
 
-      amountOutRaw = quote.base.toString();
-      minAmountOutRaw = quote.base.toString();
-      swapInstructions = await PUMP_AMM_SDK.buyQuoteInput(swapState, quoteInLamports, slippagePct);
-    } else if (swapState.pool.baseMint.equals(NATIVE_MINT) && swapState.pool.quoteMint.equals(tokenMint)) {
+      return {
+        wallet,
+        owner,
+        swapState,
+        slippagePct,
+        quoteInLamports,
+        inputMint: NATIVE_MINT,
+        outputMint: tokenMint,
+        amountOutRaw: quote.base.toString(),
+        minAmountOutRaw: quote.base.toString(),
+        swapSide: "buy-quote" as const,
+      };
+    }
+
+    if (swapState.pool.baseMint.equals(NATIVE_MINT) && swapState.pool.quoteMint.equals(tokenMint)) {
       const quote = quotePumpSellBaseInput({
         base: quoteInLamports,
         slippage: slippagePct,
@@ -123,14 +114,56 @@ export class PumpAmmExecutionService {
         feeConfig: swapState.feeConfig,
       });
 
-      amountOutRaw = quote.uiQuote.toString();
-      minAmountOutRaw = quote.minQuote.toString();
-      swapInstructions = await PUMP_AMM_SDK.sellBaseInput(swapState, quoteInLamports, slippagePct);
-    } else {
-      throw new Error(
-        `Pump AMM pool ${plan.poolAddress} does not expose a SOL/token orientation for ${plan.tokenAddress}.`,
-      );
+      return {
+        wallet,
+        owner,
+        swapState,
+        slippagePct,
+        quoteInLamports,
+        inputMint: NATIVE_MINT,
+        outputMint: tokenMint,
+        amountOutRaw: quote.uiQuote.toString(),
+        minAmountOutRaw: quote.minQuote.toString(),
+        swapSide: "sell-base" as const,
+      };
     }
+
+    throw new Error(
+      `Pump AMM pool ${plan.poolAddress} does not expose a SOL/token orientation for ${plan.tokenAddress}.`,
+    );
+  }
+
+  async getPlan(planId: string): Promise<TradePlan> {
+    const plans = await loadTradePlans();
+    const plan = plans.find((item) => item.planId === planId);
+    if (!plan) {
+      throw new Error(`Trade plan not found: ${planId}`);
+    }
+    return plan;
+  }
+
+  async prepareExecution(planId: string, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+    const plan = await this.getPlan(planId);
+    return this.prepareExecutionForPlan(plan, options);
+  }
+
+  async quoteForPlan(plan: TradePlan): Promise<PreparedExecution["quote"]> {
+    const quoteContext = await this.buildQuoteContext(plan);
+
+    return {
+      inputMint: quoteContext.inputMint.toBase58(),
+      outputMint: quoteContext.outputMint.toBase58(),
+      amountInRaw: quoteContext.quoteInLamports.toString(),
+      amountOutRaw: quoteContext.amountOutRaw,
+      minAmountOutRaw: quoteContext.minAmountOutRaw,
+    };
+  }
+
+  async prepareExecutionForPlan(plan: TradePlan, options?: { priorityFeeLamports?: number }): Promise<PreparedExecution> {
+    const quoteContext = await this.buildQuoteContext(plan);
+    const swapInstructions = quoteContext.swapSide === "buy-quote"
+      ? await PUMP_AMM_SDK.buyQuoteInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct)
+      : await PUMP_AMM_SDK.sellBaseInput(quoteContext.swapState, quoteContext.quoteInLamports, quoteContext.slippagePct);
 
     const allInstructions = [
       ...buildPriorityFeeInstructions(options?.priorityFeeLamports),
@@ -138,28 +171,28 @@ export class PumpAmmExecutionService {
     ];
     const latestBlockhash = await this.connection.getLatestBlockhash("confirmed");
     const messageV0 = new TransactionMessage({
-      payerKey: owner,
+      payerKey: quoteContext.owner,
       recentBlockhash: latestBlockhash.blockhash,
       instructions: allInstructions,
     }).compileToV0Message();
 
     const transaction = new VersionedTransaction(messageV0);
-    transaction.sign([wallet]);
+    transaction.sign([quoteContext.wallet]);
 
     return {
       plan,
-      ownerPublicKey: owner.toBase58(),
+      ownerPublicKey: quoteContext.owner.toBase58(),
       rpcUrl: getHeliusRpcUrl(),
       dryRun: env.DRY_RUN,
       executionMode: "pumpfun-amm",
       lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
       warnings: buildWarnings(env.DRY_RUN),
       quote: {
-        inputMint: inputMint.toBase58(),
-        outputMint: outputMint.toBase58(),
-        amountInRaw: quoteInLamports.toString(),
-        amountOutRaw,
-        minAmountOutRaw,
+        inputMint: quoteContext.inputMint.toBase58(),
+        outputMint: quoteContext.outputMint.toBase58(),
+        amountInRaw: quoteContext.quoteInLamports.toString(),
+        amountOutRaw: quoteContext.amountOutRaw,
+        minAmountOutRaw: quoteContext.minAmountOutRaw,
       },
       instructionsSummary: allInstructions.map((ix, index) => `ix[${index}] program=${ix.programId.toBase58()} dataLen=${ix.data.length}`),
       serializedTransactionBase64: Buffer.from(transaction.serialize()).toString("base64"),

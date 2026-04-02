@@ -7,12 +7,14 @@ import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from '../config/env.js';
 import { readJsonFileSync, writeJsonFileSync } from '../storage/json-file-sync.js';
 import {
     buildWhaleModeSummary,
+    clearWhaleStats,
     readWhaleStats,
-    writeWhaleStats,
+    resetWhaleModeStats,
     type WhaleModeSummary,
     type WhaleStatsStore,
 } from '../storage/whale-stats.js';
-import { normalizeWhales } from '../storage/whales.js';
+import { clearWhales, patchWhale, readWhales, writeWhales } from '../storage/whales.js';
+import { readRuntimeStatus } from '../storage/runtime-status.js';
 
 const app = express();
 
@@ -33,7 +35,6 @@ const WHALE_DETAIL_CACHE_MS = 60 * 1000;
 const WHALE_DETAIL_PAGE_LIMIT = 3;
 const WHALE_DETAIL_SIGNATURES_PER_PAGE = 15;
 const WHALE_DETAIL_PARSE_BATCH_SIZE = 5;
-const WHALES_FILE = path.join(DATA_DIR, 'whales.json');
 const PAPER_PERFORMANCE_FILE = path.join(DATA_DIR, 'paper-performance.json');
 const PAPER_TRADES_FILE = path.join(DATA_DIR, 'paper-trades.json');
 
@@ -103,31 +104,11 @@ function isPromotionReady(summary: WhaleModeSummary): boolean {
 }
 
 function resetPaperStats(address?: string) {
-    const whaleStats = readWhaleStats();
-
-    if (!address) {
-        for (const stats of Object.values(whaleStats)) {
-            stats.paper = { trades: [], discards: [] };
-        }
-        writeWhaleStats(whaleStats);
-        return;
-    }
-
-    const existing = whaleStats[address];
-    if (!existing) {
-        return;
-    }
-
-    whaleStats[address] = {
-        live: existing.live,
-        paper: { trades: [], discards: [] },
-    };
-    writeWhaleStats(whaleStats);
+    resetWhaleModeStats('paper', address);
 }
 
 function resetPaperWhale(address: string) {
-    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
-    const updatedWhales = whales.map((whale) => whale.address === address ? { ...whale, paperTrades: 0 } : whale);
+    patchWhale(address, { paperTrades: 0 });
 
     const paperPerformance = readJsonFileSync<Record<string, boolean[]>>(PAPER_PERFORMANCE_FILE, {});
     delete paperPerformance[address];
@@ -137,25 +118,23 @@ function resetPaperWhale(address: string) {
         Object.entries(paperTrades).filter(([, trade]) => trade?.whale !== address),
     );
 
-    writeJsonFileSync(WHALES_FILE, updatedWhales);
     writeJsonFileSync(PAPER_PERFORMANCE_FILE, paperPerformance);
     writeJsonFileSync(PAPER_TRADES_FILE, filteredPaperTrades);
     resetPaperStats(address);
 }
 
 function resetAllPaperWhales() {
-    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
+    const whales = readWhales();
     const updatedWhales = whales.map((whale) => whale.mode === 'paper' ? { ...whale, paperTrades: 0 } : whale);
-
-    writeJsonFileSync(WHALES_FILE, updatedWhales);
+    writeWhales(updatedWhales);
     writeDataJSON('paper-performance.json', {});
     writeDataJSON('paper-trades.json', {});
     resetPaperStats();
 }
 
 function resetAllWhales() {
-    writeJsonFileSync(WHALES_FILE, []);
-    writeWhaleStats({});
+    clearWhales();
+    clearWhaleStats();
     writeDataJSON('performance.json', {});
     writeDataJSON('paper-performance.json', {});
     writeDataJSON('paper-trades.json', {});
@@ -425,7 +404,7 @@ app.post('/actions/reset-paper-whale', (req, res) => {
         return;
     }
 
-    const whales = normalizeWhales(readJsonFileSync(WHALES_FILE, []));
+    const whales = readWhales();
     const whale = whales.find((entry) => entry.address === whaleAddress);
     if (!whale) {
         redirectWithMessage(res, { error: `Wal ${whaleAddress.slice(0, 8)} wurde nicht gefunden.` });
@@ -448,7 +427,7 @@ app.post('/actions/reset-whales-all', (_req, res) => {
 
 app.get('/whale/:address', async (req, res) => {
     const whaleAddress = String(req.params.address ?? '').trim();
-    const whales = normalizeWhales(safeReadJSON('whales.json', []));
+    const whales = readWhales();
     const whale = whales.find((entry) => entry.address === whaleAddress);
     const whaleStatsStore = readWhaleStats();
     const activity = Array.isArray(safeReadJSON('whale-activity.json', []))
@@ -582,12 +561,12 @@ app.get('/whale/:address', async (req, res) => {
 app.get('/', (req, res) => {
     const actionMessage = typeof req.query.message === 'string' ? req.query.message : '';
     const actionError = typeof req.query.error === 'string' ? req.query.error : '';
-    const whales = normalizeWhales(safeReadJSON('whales.json', []));
+    const whales = readWhales();
     const activeTrades = safeReadJSON('active-trades.json', {});
     const paperTrades = safeReadJSON('paper-trades.json', {});
     const whaleStatsStore = readWhaleStats();
     const whaleActivity = safeReadJSON('whale-activity.json', []);
-    const runtimeStatus = safeReadJSON('runtime-status.json', {});
+    const runtimeStatus = readRuntimeStatus();
     const history = safeReadJSON('trade-history.json', []); // NEU: Historie laden!
     const paperWhales = whales.filter((whale) => whale.mode === 'paper').length;
     const liveWhales = whales.length - paperWhales;
