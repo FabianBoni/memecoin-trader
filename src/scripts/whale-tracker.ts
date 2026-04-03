@@ -22,6 +22,7 @@ import { describeNonTargetWhaleMint, isNonTargetWhaleMint } from '../utils/whale
 
 const PRIMARY_RPC_URL = getHeliusRpcUrl();
 const READ_RPC_URL = getReadOnlyRpcUrl(PRIMARY_RPC_URL);
+const DISTINCT_READ_RPC_URL = getReadOnlyRpcUrl(PRIMARY_RPC_URL, { preferDistinct: true });
 const WS_URL = PRIMARY_RPC_URL.replace("https://", "wss://");
 const connection = new Connection(PRIMARY_RPC_URL, {
   wsEndpoint: WS_URL,
@@ -32,6 +33,12 @@ const readConnection = new Connection(READ_RPC_URL, {
   commitment: 'confirmed',
   disableRetryOnRateLimit: true,
 });
+const fallbackReadConnection = DISTINCT_READ_RPC_URL !== READ_RPC_URL
+  ? new Connection(DISTINCT_READ_RPC_URL, {
+      commitment: 'confirmed',
+      disableRetryOnRateLimit: true,
+    })
+  : null;
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ACTIVE_TRADES_PATH = path.resolve(SCRIPT_DIR, '../data/active-trades.json');
@@ -768,10 +775,24 @@ async function getParsedTransactionQueued(signature: string): Promise<Awaited<Re
   }
 
   const request = limitTrackerRpc(async () => withRpcRetry(
-    () => readConnection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed',
-    }),
+    async () => {
+      try {
+        return await readConnection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+      } catch (error) {
+        if (!fallbackReadConnection || !isSolanaRpcRateLimitError(error)) {
+          throw error;
+        }
+
+        console.warn(`[TRACKER] Primaerer Read-RPC fuer TX ${signature.slice(0,8)} rate-limited. Wechsle auf Fallback-RPC.`);
+        return fallbackReadConnection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+          commitment: 'confirmed',
+        });
+      }
+    },
     {
       delaysMs: TRACKER_RPC_RETRY_DELAYS_MS,
       onRetry: (delayMs, attempt) => {
