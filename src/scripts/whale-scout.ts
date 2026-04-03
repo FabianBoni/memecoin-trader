@@ -80,6 +80,7 @@ const scoutTokenUsdPriceCache = new Map<string, { expiresAt: number; priceUsd: n
 const inFlightScoutTokenUsdPriceRequests = new Map<string, Promise<number | null>>();
 const limitScoutDirectRpc = createAsyncLimiter(1);
 let scoutDirectRpcNextAllowedAt = 0;
+let scoutParsedTransactionBatchUnsupported = false;
 
 type ParsedTransactionResponse = Awaited<ReturnType<Connection['getParsedTransaction']>>;
 type SignatureInfoResponse = Awaited<ReturnType<Connection['getSignaturesForAddress']>>[number];
@@ -203,6 +204,80 @@ async function getSignaturesForAddressWithRetry(
       },
     },
   );
+}
+
+function isScoutParsedTransactionBatchUnsupportedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+
+  return normalized.includes('batch requests are only available for paid plans')
+    || normalized.includes('batch requests are only available')
+    || normalized.includes('does not provide batch support')
+    || normalized.includes('does not support batch');
+}
+
+async function getParsedTransactionWithRetry(
+  connection: Connection,
+  signature: string,
+): Promise<ParsedTransactionResponse> {
+  return withRpcRetry(
+    () => runScoutDirectRpc(
+      `getParsedTransaction ${signature.slice(0, 8)}`,
+      async () => {
+        const parsedTx = await connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+        });
+
+        return parsedTx;
+      },
+    ),
+    {
+      delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+      onRetry: (delayMs, attempt) => {
+        console.warn(`[SCOUT] RPC Retry getParsedTransaction ${signature.slice(0, 8)} in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+      },
+    },
+  );
+}
+
+async function getParsedTransactionsForScout(
+  connection: Connection,
+  signatures: string[],
+  options?: {
+    onBatchRetry?: (delayMs: number, attempt: number) => void;
+  },
+): Promise<Array<ParsedTransactionResponse | null>> {
+  if (!scoutParsedTransactionBatchUnsupported) {
+    try {
+      return await withRpcRetry(
+        () => runScoutDirectRpc(
+          `getParsedTransactions batch(${signatures.length})`,
+          () => connection.getParsedTransactions(signatures, { maxSupportedTransactionVersion: 0 }),
+        ),
+        {
+          delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
+          onRetry: (delayMs, attempt) => {
+            options?.onBatchRetry?.(delayMs, attempt);
+            console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${signatures.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
+          },
+        },
+      );
+    } catch (error) {
+      if (!isScoutParsedTransactionBatchUnsupportedError(error)) {
+        throw error;
+      }
+
+      scoutParsedTransactionBatchUnsupported = true;
+      console.warn('[SCOUT] RPC-Provider unterstuetzt keine JSON-RPC-Batch-Requests. Wechsle fuer Parsed-TX-Scans auf Einzelabfragen.');
+    }
+  }
+
+  const parsedTransactions: Array<ParsedTransactionResponse | null> = [];
+  for (const signature of signatures) {
+    parsedTransactions.push(await getParsedTransactionWithRetry(connection, signature));
+  }
+
+  return parsedTransactions;
 }
 
 function reduceParsedTxBatchSize(currentBatchSize: number, scope: string): number {
@@ -1579,19 +1654,12 @@ async function collectTopTokenTraders(
       let batchRateLimited = false;
 
       try {
-        const parsedTransactions = await withRpcRetry(
-          () => runScoutDirectRpc(
-            `getParsedTransactions batch(${eligibleBatch.length})`,
-            () => connection.getParsedTransactions(
-              eligibleBatch.map((signature) => signature.signature),
-              { maxSupportedTransactionVersion: 0 },
-            ),
-          ),
+        const parsedTransactions = await getParsedTransactionsForScout(
+          connection,
+          eligibleBatch.map((signature) => signature.signature),
           {
-            delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
-            onRetry: (delayMs, attempt) => {
+            onBatchRetry: () => {
               batchRateLimited = true;
-              console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${eligibleBatch.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
             },
           },
         );
@@ -1860,19 +1928,12 @@ async function evaluateWhaleCandidate(
     let batchRateLimited = false;
 
     try {
-      const parsedTransactions = await withRpcRetry(
-        () => runScoutDirectRpc(
-          `getParsedTransactions batch(${eligibleBatch.length})`,
-          () => connection.getParsedTransactions(
-            eligibleBatch.map((signature) => signature.signature),
-            { maxSupportedTransactionVersion: 0 },
-          ),
-        ),
+      const parsedTransactions = await getParsedTransactionsForScout(
+        connection,
+        eligibleBatch.map((signature) => signature.signature),
         {
-          delaysMs: SCOUT_RPC_RETRY_DELAYS_MS,
-          onRetry: (delayMs, attempt) => {
+          onBatchRetry: () => {
             batchRateLimited = true;
-            console.warn(`[SCOUT] RPC Retry getParsedTransactions batch(${eligibleBatch.length}) in ${delayMs}ms (${attempt}/${SCOUT_RPC_RETRY_DELAYS_MS.length}).`);
           },
         },
       );
