@@ -1,10 +1,8 @@
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { getDatabase, isDatabaseEnabled } from './database.js';
 import { readJsonFileSync, writeJsonFileSync } from './json-file-sync.js';
+import { resolveSrcDataPath } from '../utils/repo-paths.js';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const WHALE_STATS_PATH = path.resolve(SCRIPT_DIR, '../data/whale-stats.json');
+const WHALE_STATS_PATH = resolveSrcDataPath('whale-stats.json');
 const MAX_TRADE_METRICS = 50;
 const MAX_DISCARD_METRICS = 50;
 

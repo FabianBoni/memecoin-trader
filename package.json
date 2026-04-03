@@ -20,7 +20,11 @@
     "position:manager": "tsx src/scripts/position-manager-bootstrap.ts",
     "whale:tracker": "tsx src/scripts/whale-tracker-bootstrap.ts",
     "whale:scout": "tsx src/scripts/whale-scout-bootstrap.ts",
-    "dashboard": "tsx src/scripts/dashboard-bootstrap.ts",
+    "dashboard:legacy": "tsx src/scripts/dashboard-bootstrap.ts",
+    "dashboard:web:dev": "npm --prefix web run dev",
+    "dashboard:web:build": "npm --prefix web run build",
+    "dashboard:web:start": "npm --prefix web run start",
+    "dashboard": "npm run dashboard:web:build && npm run dashboard:web:start",
     "profit:report": "tsx src/scripts/profit-report.ts",
     "audit:storage": "tsx src/scripts/audit-storage.ts"
   },

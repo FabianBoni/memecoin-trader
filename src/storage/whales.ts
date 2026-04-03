@@ -1,10 +1,8 @@
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { getDatabase, isDatabaseEnabled } from './database.js';
 import { readJsonFileSync, writeJsonFileSync } from './json-file-sync.js';
+import { resolveSrcDataPath } from '../utils/repo-paths.js';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const WHALES_PATH = path.resolve(SCRIPT_DIR, '../data/whales.json');
+const WHALES_PATH = resolveSrcDataPath('whales.json');
 
 export type WhaleMode = 'paper' | 'live';
 

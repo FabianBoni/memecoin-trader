@@ -6,6 +6,7 @@ import { DexscreenerClient } from '../clients/dexscreener.js';
 import { env, getHeliusRpcUrl, getReadOnlyRpcUrl } from "../config/env.js";
 import { riskConfig } from '../config/risk.js';
 import { TokenScreenService } from '../services/token-screen.js';
+import { appendDecisionLog, type DecisionLogCategory, type DecisionLogOutcome } from '../storage/decision-log.js';
 import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.js";
 import { getWhaleModeSummary, type WhaleModeSummary } from '../storage/whale-stats.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
@@ -480,6 +481,58 @@ function appendWhaleActivity(entry: WhaleActivityRecord) {
     lastSignalMint: entry.mint,
     lastSignalSide: entry.side,
     lastSignalMode: entry.botMode,
+  });
+}
+
+function appendTrackerDecisionLog(params: {
+  category: DecisionLogCategory;
+  outcome: DecisionLogOutcome;
+  whale: WhaleRecord;
+  mint: string;
+  detail: string;
+  signature?: string | undefined;
+  positionProfile?: WhalePerformanceProfile | undefined;
+  cluster?: WhaleBuyCluster | undefined;
+  signalMember?: ClusterSignalMember | undefined;
+  entryDecision?: EntryDecision | undefined;
+  reasons?: string[] | undefined;
+  notes?: string[] | undefined;
+  whaleBuySizeSol?: number | null | undefined;
+  whaleBuySizeUsd?: number | null | undefined;
+  preferredExecutionMode?: ExecutionMode | undefined;
+  buyAttemptCount?: number | undefined;
+  errorMessage?: string | undefined;
+}) {
+  appendDecisionLog({
+    category: params.category,
+    outcome: params.outcome,
+    whale: params.whale.address,
+    mint: params.mint,
+    mode: params.whale.mode,
+    detail: params.detail,
+    reasons: params.reasons ?? params.entryDecision?.rejectionReasons ?? [],
+    notes: params.notes ?? params.entryDecision?.notes ?? [],
+    signature: params.signature ?? null,
+    performanceTier: params.positionProfile?.tier ?? null,
+    sampleSize: params.positionProfile?.sampleSize ?? null,
+    signalClass: params.signalMember?.signalClass ?? params.cluster?.leader.signalClass ?? null,
+    signalStrategy: params.cluster?.signalStrategy ?? 'single-wallet',
+    clusterWalletCount: params.cluster?.members.length ?? null,
+    clusterPremiumWalletCount: params.cluster?.premiumWalletCount ?? null,
+    clusterInsiderWalletCount: params.cluster?.insiderWalletCount ?? null,
+    whaleBuySizeSol: params.whaleBuySizeSol ?? params.signalMember?.buySizeSol ?? params.entryDecision?.whaleBuySizeSol ?? null,
+    whaleBuySizeUsd: params.whaleBuySizeUsd ?? params.signalMember?.buySizeUsd ?? params.cluster?.leader.buySizeUsd ?? null,
+    liquidityUsd: params.entryDecision?.liquidityUsd ?? null,
+    entryPrice: params.entryDecision?.entryPrice ?? null,
+    entryPriceSource: params.entryDecision?.entryPriceSource ?? null,
+    priceExtensionPct: params.entryDecision?.priceExtensionPct ?? null,
+    expectedNetProfitPct: params.entryDecision?.expectedNetProfitPct ?? null,
+    rewardRiskRatio: params.entryDecision?.rewardRiskRatio ?? null,
+    dexId: params.entryDecision?.dexId ?? null,
+    poolAddress: params.entryDecision?.poolAddress ?? null,
+    preferredExecutionMode: params.preferredExecutionMode ?? params.entryDecision?.preferredExecutionMode ?? null,
+    buyAttemptCount: params.buyAttemptCount ?? null,
+    errorMessage: params.errorMessage ?? null,
   });
 }
 
@@ -996,6 +1049,24 @@ function registerRelevantBuyClusterSignal(mint: string, member: ClusterSignalMem
 
 function formatClusterSummary(cluster: WhaleBuyCluster): string {
   return `${cluster.members.length} Wallets, ${cluster.insiderWalletCount} insider, ${cluster.premiumWalletCount} premium, Lead ${cluster.leader.whale.address.slice(0,8)} ${formatUsdAmount(cluster.leader.buySizeUsd)} (${cluster.leader.signalClass})`;
+}
+
+function normalizeEntryPriceSource(
+  source: string | null | undefined,
+  fallback: PaperTradeRecord['entryPriceSource'],
+): PaperTradeRecord['entryPriceSource'] {
+  switch (source) {
+    case 'market-snapshot':
+    case 'dexscreener-snapshot':
+    case 'wallet-receipt':
+    case 'wallet-receipt-sol-only':
+      return source;
+    case 'receipt':
+      return 'wallet-receipt';
+    case 'fallback-quote':
+    default:
+      return fallback;
+  }
 }
 
 type PositionSizingDecision = {
@@ -1623,6 +1694,17 @@ async function openPaperTrade(
   const entryPrice = entryDecision.entryPrice;
 
   if (!entryPrice) {
+    appendTrackerDecisionLog({
+      category: 'paper',
+      outcome: 'paper-entry-missing',
+      whale,
+      mint,
+      detail: 'Paper-Trade nicht angelegt: kein belastbarer Einstiegspreis verfuegbar.',
+      signature,
+      positionProfile,
+      cluster,
+      entryDecision,
+    });
     console.warn(`[PAPER] ${mint.slice(0,6)} fuer ${whale.address.slice(0,8)} konnte ohne Einstiegspreis nicht als Paper-Trade angelegt werden.`);
     return;
   }
@@ -1663,6 +1745,17 @@ async function openPaperTrade(
 
   paperTrades[tradeId] = paperTradeRecord;
   writePaperTrades(paperTrades);
+  appendTrackerDecisionLog({
+    category: 'paper',
+    outcome: 'paper-opened',
+    whale,
+    mint,
+    detail: `Paper-Trade geoeffnet (${paperTradeRecord.entryPriceSource}).`,
+    signature,
+    positionProfile,
+    cluster,
+    entryDecision,
+  });
   console.log(`[PAPER] Neuer Schatten-Trade fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} gespeichert (${paperTradeRecord.entryPriceSource}).`);
 }
 
@@ -1724,6 +1817,18 @@ async function logDecision(
     : null;
 
   if (paperSignalBlockReason) {
+    appendTrackerDecisionLog({
+      category: 'entry',
+      outcome: 'paper-signal-blocked',
+      whale,
+      mint,
+      detail: paperSignalBlockReason,
+      signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      reasons: [paperSignalBlockReason],
+    });
     console.log(`[BUY] ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)} blockiert: ${paperSignalBlockReason}`);
     updateRuntimeStatus('tracker', {
       lastBlockedPaperSignalAt: new Date().toISOString(),
@@ -1750,6 +1855,18 @@ async function logDecision(
   console.log(`[BUY] Entscheidung fuer ${mint.slice(0,6)} von Wal ${whale.address.slice(0,8)}... mode=${whale.mode} tier=${positionProfile.tier} perf=${performanceLabel} liq=${formatUsdAmount(entryDecision.liquidityUsd)} ext=${formatPct(entryDecision.priceExtensionPct, 1)} rr=${formatMetric(entryDecision.rewardRiskRatio, 2)} exec=${entryDecision.preferredExecutionMode}${entryDecision.dexId ? ` dex=${entryDecision.dexId}` : ''}${clusterLabel}`);
 
   if (!entryDecision.allowed) {
+    appendTrackerDecisionLog({
+      category: 'entry',
+      outcome: 'entry-rejected',
+      whale,
+      mint,
+      detail: entryDecision.rejectionReasons.join(' | '),
+      signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      entryDecision,
+    });
     console.log(`[BUY] ${mint.slice(0,6)} uebersprungen: ${entryDecision.rejectionReasons.join(' | ')}`);
     if (cluster) {
       updateRuntimeStatus('tracker', {
@@ -1775,6 +1892,18 @@ async function logDecision(
   }
 
   if (hasActiveLiveTradeForMint(mint)) {
+    appendTrackerDecisionLog({
+      category: 'live',
+      outcome: 'live-skipped-active-position',
+      whale,
+      mint,
+      detail: 'Position fuer diese Mint ist bereits aktiv.',
+      signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      entryDecision,
+    });
     console.log(`[BUY] ${mint.slice(0,6)} nicht live gehandelt: Position fuer diese Mint ist bereits aktiv.`);
     if (cluster) {
       updateRuntimeStatus('tracker', {
@@ -1790,6 +1919,19 @@ async function logDecision(
   const liveTradeBlockReason = getLiveTradeBlockReason(whale);
 
   if (liveTradeBlockReason) {
+    appendTrackerDecisionLog({
+      category: 'live',
+      outcome: 'live-blocked',
+      whale,
+      mint,
+      detail: liveTradeBlockReason,
+      signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      entryDecision,
+      reasons: [liveTradeBlockReason],
+    });
     console.log(`[BUY] ${mint.slice(0,6)} nicht live gehandelt: ${liveTradeBlockReason}. Signal wird nur als Paper-Trade gespiegelt.`);
     updateRuntimeStatus('tracker', {
       lastBlockedLiveSignalAt: new Date().toISOString(),
@@ -1810,6 +1952,19 @@ async function logDecision(
   try {
     const sizingDecision = await calculatePositionSize();
     if (!sizingDecision.executable) {
+      appendTrackerDecisionLog({
+        category: 'live',
+        outcome: 'live-sizing-blocked',
+        whale,
+        mint,
+        detail: sizingDecision.blockingReason ?? 'Sizing blockiert.',
+        signature,
+        positionProfile,
+        cluster,
+        signalMember,
+        entryDecision,
+        reasons: sizingDecision.blockingReason ? [sizingDecision.blockingReason] : [],
+      });
       console.log(`[BUY] ${mint.slice(0,6)} nicht live gehandelt: ${sizingDecision.blockingReason}`);
       return;
     }
@@ -1835,8 +1990,16 @@ async function logDecision(
     }
 
     const fillSource = executionReceipt?.priceSource ?? entryDecision.entryPriceSource;
+    const normalizedFillSource = normalizeEntryPriceSource(fillSource, entryDecision.entryPriceSource);
     const fillTxid = executionReceipt?.txid;
     const fillPriceSol = executionReceipt?.fillPriceSol ?? entryDecision.entryPriceSol;
+    const loggedEntryDecision: EntryDecision = {
+      ...entryDecision,
+      entryPrice,
+      entryPriceSol: fillPriceSol ?? entryDecision.entryPriceSol,
+      entryPriceSource: normalizedFillSource,
+      preferredExecutionMode: executionMode,
+    };
     if (entryPrice) {
       console.log(`[KASSENZETTEL] Kaufpreis fuer ${mint.slice(0,6)} gesichert: $${entryPrice} (${fillSource})`);
     } else {
@@ -1886,6 +2049,20 @@ async function logDecision(
     };
 
     writeJsonFileSync(ACTIVE_TRADES_PATH, activeTrades);
+    appendTrackerDecisionLog({
+      category: 'live',
+      outcome: 'live-opened',
+      whale,
+      mint,
+      detail: `Live-Buy bestaetigt via ${executionMode}${entryDecision.dexId ? ` auf ${entryDecision.dexId}` : ''}.`,
+      signature: fillTxid ?? signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      entryDecision: loggedEntryDecision,
+      buyAttemptCount: attempts,
+      preferredExecutionMode: executionMode,
+    });
 
     const persistedTrades = readJsonFileSync<Record<string, any>>(ACTIVE_TRADES_PATH, {});
     const activeCount = Object.keys(persistedTrades).length;
@@ -1897,6 +2074,19 @@ async function logDecision(
     });
 
   } catch (e: any) {
+    appendTrackerDecisionLog({
+      category: 'live',
+      outcome: 'live-buy-failed',
+      whale,
+      mint,
+      detail: e.message,
+      signature,
+      positionProfile,
+      cluster,
+      signalMember,
+      entryDecision,
+      errorMessage: e.message,
+    });
     console.error(`❌ [BUY] Kauf fuer ${mint.slice(0,6)} fehlgeschlagen:`, e);
 
     if (shouldSuppressBuyFailureTelegram(e)) {
@@ -2144,7 +2334,8 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       : null;
 
     if (whaleBuySizeUsd === null || whaleBuySizeUsd < TRACKER_SIGNAL_MIN_BUY_USD) {
-      console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} ignoriert: Buy ${formatUsdAmount(whaleBuySizeUsd)} unter Insider-Floor ${formatUsdAmount(TRACKER_SIGNAL_MIN_BUY_USD)} oder nicht sauber ableitbar.`);
+      const floorReason = `Buy ${formatUsdAmount(whaleBuySizeUsd)} unter Insider-Floor ${formatUsdAmount(TRACKER_SIGNAL_MIN_BUY_USD)} oder nicht sauber ableitbar.`;
+      console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} ignoriert: ${floorReason}`);
       updateRuntimeStatus('tracker', {
         lastIgnoredClusterSignalAt: new Date().toISOString(),
         lastIgnoredClusterSignalMint: tokenChange.mint,
@@ -2152,6 +2343,41 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
         lastIgnoredClusterSignalBuyUsd: whaleBuySizeUsd,
         lastIgnoredClusterSignalMinBuyUsd: TRACKER_SIGNAL_MIN_BUY_USD,
       });
+
+      if (currentWhale.mode === 'paper') {
+        appendTrackerDecisionLog({
+          category: 'cluster',
+          outcome: 'paper-bypass',
+          whale: currentWhale,
+          mint: tokenChange.mint,
+          detail: `Paper-Bypass trotz Insider-Floor: ${floorReason}`,
+          signature,
+          positionProfile,
+          whaleBuySizeSol,
+          whaleBuySizeUsd,
+        });
+        console.log(`[PAPER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} wird trotz fehlender Insider-Groesse als Bewertungs-Trade geprueft.`);
+        updateRuntimeStatus('tracker', {
+          lastPaperBypassAt: new Date().toISOString(),
+          lastPaperBypassMint: tokenChange.mint,
+          lastPaperBypassWhale: currentWhale.address,
+          lastPaperBypassReason: floorReason,
+        });
+        await logDecision(currentWhale, tokenChange.mint, tx, signature);
+      } else {
+        appendTrackerDecisionLog({
+          category: 'cluster',
+          outcome: 'cluster-floor-blocked',
+          whale: currentWhale,
+          mint: tokenChange.mint,
+          detail: floorReason,
+          signature,
+          positionProfile,
+          whaleBuySizeSol,
+          whaleBuySizeUsd,
+        });
+      }
+
       return;
     }
 
@@ -2180,6 +2406,19 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       });
 
       if (currentWhale.mode === 'paper') {
+        appendTrackerDecisionLog({
+          category: 'cluster',
+          outcome: 'paper-bypass',
+          whale: currentWhale,
+          mint: tokenChange.mint,
+          detail: `Paper-Bypass trotz fehlender Cluster-Konfluenz: ${cluster.members.length}/${TRACKER_SIGNAL_CLUSTER_MIN_WALLETS} Wallets, ${cluster.premiumWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS} premium, ${cluster.insiderWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS} insider.`,
+          signature,
+          positionProfile,
+          cluster,
+          signalMember,
+          whaleBuySizeSol,
+          whaleBuySizeUsd,
+        });
         console.log(`[PAPER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} wird trotz fehlender Cluster-Konfluenz als Bewertungs-Trade geprueft.`);
         await logDecision(
           currentWhale,

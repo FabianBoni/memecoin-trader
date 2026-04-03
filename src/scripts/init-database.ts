@@ -91,6 +91,7 @@ async function main(): Promise<void> {
     importSnapshot("paper-trades", path.join(SRC_DATA_DIR, "paper-trades.json"), {}),
     importSnapshot("trade-history", path.join(SRC_DATA_DIR, "trade-history.json"), []),
     importSnapshot("whale-activity", path.join(SRC_DATA_DIR, "whale-activity.json"), []),
+    importSnapshot("decision-log", path.join(SRC_DATA_DIR, "decision-log.json"), []),
     importSnapshot("scout-candidate-cache", path.join(SRC_DATA_DIR, "scout-candidate-cache.json"), {}),
     importSnapshot("performance", path.join(SRC_DATA_DIR, "performance.json"), {}),
     importSnapshot("paper-performance", path.join(SRC_DATA_DIR, "paper-performance.json"), {}),

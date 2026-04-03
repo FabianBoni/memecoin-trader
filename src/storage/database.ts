@@ -1,11 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { env } from "../config/env.js";
+import { resolveConfiguredPath, resolveRepoPath, resolveSrcDataPath } from "../utils/repo-paths.js";
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const SCHEMA_PATH = path.resolve(SCRIPT_DIR, "../../db/schema.sql");
+const SCHEMA_PATH = resolveRepoPath("db", "schema.sql");
 
 let databaseInstance: Database.Database | null = null;
 
@@ -48,13 +47,13 @@ type SpecialJsonLoadResult<T> = {
 };
 
 const SPECIAL_JSON_DOCUMENT_KIND_BY_PATH: Partial<Record<string, SpecialJsonDocumentKind>> = {
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/active-trades.json"))]: "active-trades",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/paper-trades.json"))]: "paper-trades",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/trade-history.json"))]: "trade-history",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/whale-activity.json"))]: "whale-activity",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/performance.json"))]: "performance",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/paper-performance.json"))]: "paper-performance",
-  [normalizeFilePath(path.resolve(SCRIPT_DIR, "../data/scout-candidate-cache.json"))]: "scout-candidate-cache",
+  [normalizeFilePath(resolveSrcDataPath("active-trades.json"))]: "active-trades",
+  [normalizeFilePath(resolveSrcDataPath("paper-trades.json"))]: "paper-trades",
+  [normalizeFilePath(resolveSrcDataPath("trade-history.json"))]: "trade-history",
+  [normalizeFilePath(resolveSrcDataPath("whale-activity.json"))]: "whale-activity",
+  [normalizeFilePath(resolveSrcDataPath("performance.json"))]: "performance",
+  [normalizeFilePath(resolveSrcDataPath("paper-performance.json"))]: "paper-performance",
+  [normalizeFilePath(resolveSrcDataPath("scout-candidate-cache.json"))]: "scout-candidate-cache",
 };
 
 function nowIso(): string {
@@ -66,7 +65,7 @@ function serializeJson(value: unknown): string {
 }
 
 function resolveDatabasePath(): string {
-  return path.resolve(process.cwd(), env.DATABASE_PATH);
+  return resolveConfiguredPath(env.DATABASE_PATH);
 }
 
 function normalizeFilePath(filePath: string): string {

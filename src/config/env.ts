@@ -1,8 +1,10 @@
+import path from "node:path";
 import { config as loadDotEnv } from "dotenv";
 import { z } from "zod";
+import { resolveRepoRoot } from "../utils/repo-paths.js";
 import { createLogger, type LogLevel } from "../utils/logger.js";
 
-loadDotEnv();
+loadDotEnv({ path: path.join(resolveRepoRoot(), ".env") });
 
 function emptyStringToUndefined(value: unknown): unknown {
   return typeof value === "string" && value.trim().length === 0 ? undefined : value;

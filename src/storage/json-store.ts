@@ -1,10 +1,11 @@
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { env } from "../config/env.js";
+import { resolveConfiguredPath } from "../utils/repo-paths.js";
 import { loadJsonDocument, saveJsonDocument } from "./database.js";
 
 async function ensureStoreDir(): Promise<string> {
-  const storeDir = path.resolve(process.cwd(), env.STORE_PATH);
+  const storeDir = resolveConfiguredPath(env.STORE_PATH);
   await mkdir(storeDir, { recursive: true });
   return storeDir;
 }

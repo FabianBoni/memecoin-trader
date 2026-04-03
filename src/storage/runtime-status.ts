@@ -1,10 +1,8 @@
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { getDatabase, isDatabaseEnabled } from './database.js';
 import { readJsonFileSync, writeJsonFileSync } from './json-file-sync.js';
+import { resolveSrcDataPath } from '../utils/repo-paths.js';
 
-const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
-const RUNTIME_STATUS_PATH = path.resolve(SCRIPT_DIR, '../data/runtime-status.json');
+const RUNTIME_STATUS_PATH = resolveSrcDataPath('runtime-status.json');
 
 export type RuntimeStatusSection = Record<string, unknown>;
 export type RuntimeStatusStore = Record<string, RuntimeStatusSection>;
