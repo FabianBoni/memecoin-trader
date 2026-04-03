@@ -233,7 +233,7 @@ export class HeliusClient {
           writeRpcCache(cacheKey, result, cacheTtlMs);
           return result;
         } catch (error) {
-          const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl);
+          const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl, { preferDistinct: true });
           if (
             rpcUrl === this.rpcUrl
             && fallbackRpcUrl !== rpcUrl
@@ -267,7 +267,7 @@ export class HeliusClient {
       [tokenAddress, { encoding: "jsonParsed" }],
     );
 
-    const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl);
+    const fallbackRpcUrl = getReadOnlyRpcUrl(this.rpcUrl, { preferDistinct: true });
 
     if (result.value === null && fallbackRpcUrl !== this.rpcUrl) {
       result = await this.rpcRequest<GetAccountInfoResult<SplTokenMintAccountInfo>>(

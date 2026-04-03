@@ -195,8 +195,14 @@ export function getHeliusRpcUrl(): string {
   return rpcUrl;
 }
 
-export function getReadOnlyRpcUrl(primaryRpcUrl?: string): string {
-  const normalizedPrimary = primaryRpcUrl ? assertMainnetish(primaryRpcUrl, "PRIMARY_RPC_URL") : undefined;
+export function getReadOnlyRpcUrl(
+  primaryRpcUrl?: string,
+  options?: { preferDistinct?: boolean },
+): string {
+  const normalizedPrimary = primaryRpcUrl
+    ? assertMainnetish(primaryRpcUrl, "PRIMARY_RPC_URL")
+    : getHeliusRpcUrl();
+  const preferDistinct = options?.preferDistinct === true;
   const candidates: Array<{ key: string; value: string | undefined }> = [
     { key: "FALLBACK_MAINNET_RPC_URL", value: env.FALLBACK_MAINNET_RPC_URL },
     { key: "SOLANA_RPC_URL", value: env.SOLANA_RPC_URL },
@@ -209,16 +215,20 @@ export function getReadOnlyRpcUrl(primaryRpcUrl?: string): string {
     },
   ];
 
+  if (!preferDistinct) {
+    return normalizedPrimary;
+  }
+
   for (const candidate of candidates) {
     if (!candidate.value || candidate.value.trim().length === 0) {
       continue;
     }
 
     const normalizedCandidate = assertMainnetish(candidate.value, candidate.key);
-    if (!normalizedPrimary || normalizedCandidate !== normalizedPrimary) {
+    if (normalizedCandidate !== normalizedPrimary) {
       return normalizedCandidate;
     }
   }
 
-  return normalizedPrimary ?? getHeliusRpcUrl();
+  return normalizedPrimary;
 }

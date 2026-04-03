@@ -12,6 +12,7 @@ import { readJsonFileSync, writeJsonFileSync } from "../storage/json-file-sync.j
 import { readWhales, upsertWhale, type WhaleRecord } from '../storage/whales.js';
 import { updateRuntimeStatus } from '../storage/runtime-status.js';
 import type { DexPairSummary } from '../types/market.js';
+import { describeNonTargetWhaleMint, filterMeaningfulWhaleTargetMints, isNonTargetWhaleMint } from '../utils/whale-targeting.js';
 
 const RPC_URL = getReadOnlyRpcUrl();
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1901,6 +1902,11 @@ async function evaluateWhaleCandidate(
           continue;
         }
 
+        const meaningfulTradedMints = filterMeaningfulWhaleTargetMints(tradedMints);
+        if (meaningfulTradedMints.length === 0) {
+          continue;
+        }
+
         const tradeVolumeUsd = await estimateWalletTradeVolumeUsd(
           tx,
           walletAddress,
@@ -1913,7 +1919,7 @@ async function evaluateWhaleCandidate(
 
         estimatedVolumeUsd += tradeVolumeUsd;
         qualifyingTradeCount += 1;
-        tradedMints.forEach((mint) => distinctTokenMints.add(mint));
+        meaningfulTradedMints.forEach((mint) => distinctTokenMints.add(mint));
         if (!lastTradeAt && typeof signature.blockTime === 'number') {
           lastTradeAt = new Date(signature.blockTime * 1000).toISOString();
         }
@@ -1968,6 +1974,16 @@ async function buildScoutSeeds(seedInputs: RawScoutSeedInput[]): Promise<ScoutSe
 
   for (const seedInput of seedInputs) {
     const mintAddress = seedInput.tokenAddress;
+    if (isNonTargetWhaleMint(mintAddress)) {
+      const skippedLabel = describeNonTargetWhaleMint(mintAddress);
+      console.log(`[SCOUT] Ueberspringe Seed ${mintAddress}: ${skippedLabel} ist ein bekannter Core-/Quote-Token und kein Scout-Ziel.`);
+      updateRuntimeStatus('scout', {
+        lastSkippedSeedToken: mintAddress,
+        lastSkippedSeedReason: `${skippedLabel} ist ein bekannter Core-/Quote-Token.`,
+      });
+      continue;
+    }
+
     const migratedSeed = await checkMigratedScoutSeed(mintAddress);
     if (!migratedSeed.eligible) {
       console.log(`[SCOUT] Ueberspringe Seed ${mintAddress}: ${migratedSeed.reason}.`);

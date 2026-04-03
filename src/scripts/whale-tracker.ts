@@ -18,6 +18,7 @@ import type { ExecutionMode, TradePlan } from '../types/trade.js';
 import { suggestExecutionModeForPool } from '../services/execution-routing.js';
 import { BuyExecutionRouteSelector } from '../services/execution-route-selector.js';
 import { sendTelegram } from "./telegram-notifier.js";
+import { describeNonTargetWhaleMint, isNonTargetWhaleMint } from '../utils/whale-targeting.js';
 
 const PRIMARY_RPC_URL = getHeliusRpcUrl();
 const READ_RPC_URL = getReadOnlyRpcUrl(PRIMARY_RPC_URL);
@@ -75,6 +76,10 @@ const PAPER_SUBSCRIPTION_MIN_AVG_PNL_PCT = Math.max(2.5, env.PAPER_PROMOTION_MIN
 const PAPER_SUBSCRIPTION_MIN_MEDIAN_PNL_PCT = Math.max(1, env.PAPER_PROMOTION_MIN_MEDIAN_PNL_PCT * 0.5);
 const TRACKER_MAX_PROMOTABLE_PAPER_WHALES = Math.max(4, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES * 0.75));
 const TRACKER_MAX_UNPROVEN_PAPER_WHALES = Math.max(3, Math.ceil(env.PAPER_PROMOTION_MIN_TRADES / 2));
+const TRACKER_IGNORED_SIGNAL_WINDOW_MS = 15 * 60 * 1000;
+const TRACKER_IGNORED_SIGNAL_THRESHOLD = 6;
+const TRACKER_IGNORED_SIGNAL_DISTINCT_MINT_THRESHOLD = 3;
+const TRACKER_IGNORED_SIGNAL_COOLDOWN_MS = 60 * 60 * 1000;
 type MarketEntryPriceSource = Extract<PaperTradeRecord['entryPriceSource'], 'market-snapshot' | 'dexscreener-snapshot'>;
 type SignalStrategy = 'single-wallet' | 'cluster-insider';
 
@@ -333,6 +338,16 @@ type ClusterSignalMember = {
   buySizeUsd: number | null;
 };
 
+type PositiveTokenChange = {
+  mint: string;
+  deltaUi: number;
+};
+
+type IgnoredPaperSignalEvent = {
+  detectedAtMs: number;
+  mint: string;
+};
+
 type WhaleBuyCluster = {
   mint: string;
   detectedAt: string;
@@ -350,6 +365,8 @@ const processedSignatures = new Map<string, number>();
 const inFlightSignatures = new Set<string>();
 const recentWhaleSignals = new Map<string, number>();
 const recentWhaleSignalSuppressionLogs = new Map<string, number>();
+const recentIgnoredPaperSignals = new Map<string, IgnoredPaperSignalEvent[]>();
+const paperWhaleSignalCooldowns = new Map<string, { untilMs: number; reason: string }>();
 const recentWhaleBuyClusters = new Map<string, Map<string, ClusterSignalMember>>();
 const recentQualifiedMintSignals = new Map<string, number>();
 const tokenPriceCache = new Map<string, { fetchedAt: number; price: number | null; source: MarketEntryPriceSource }>();
@@ -385,6 +402,57 @@ async function removeTrackedWhaleSubscription(address: string, reason: string) {
 
   whaleLogSubscriptions.delete(address);
   console.log(`[TRACKER] Subscription fuer ${address.slice(0,8)} entfernt (${reason}).`);
+}
+
+function prunePaperWhaleSignalCooldowns() {
+  const now = Date.now();
+  for (const [address, cooldown] of paperWhaleSignalCooldowns.entries()) {
+    if (cooldown.untilMs <= now) {
+      paperWhaleSignalCooldowns.delete(address);
+    }
+  }
+}
+
+function getPaperWhaleSignalCooldownReason(address: string): string | null {
+  prunePaperWhaleSignalCooldowns();
+  return paperWhaleSignalCooldowns.get(address)?.reason ?? null;
+}
+
+function registerIgnoredPaperSignal(whale: WhaleRecord, mint: string): string | null {
+  if (whale.mode !== 'paper') {
+    return null;
+  }
+
+  const existingCooldownReason = getPaperWhaleSignalCooldownReason(whale.address);
+  if (existingCooldownReason) {
+    return existingCooldownReason;
+  }
+
+  const now = Date.now();
+  const activeEvents = (recentIgnoredPaperSignals.get(whale.address) ?? [])
+    .filter((event) => (now - event.detectedAtMs) <= TRACKER_IGNORED_SIGNAL_WINDOW_MS);
+  activeEvents.push({ detectedAtMs: now, mint });
+  recentIgnoredPaperSignals.set(whale.address, activeEvents);
+
+  const distinctMints = [...new Set(activeEvents.map((event) => event.mint))];
+  if (
+    activeEvents.length < TRACKER_IGNORED_SIGNAL_THRESHOLD
+    || distinctMints.length < TRACKER_IGNORED_SIGNAL_DISTINCT_MINT_THRESHOLD
+  ) {
+    return null;
+  }
+
+  const mintPreview = distinctMints
+    .slice(0, 4)
+    .map((candidateMint) => describeNonTargetWhaleMint(candidateMint))
+    .join(', ');
+  const reason = `Paper-Wal pausiert: ${activeEvents.length} ignorierte Core-Signale in ${Math.round(TRACKER_IGNORED_SIGNAL_WINDOW_MS / 60000)}m ueber ${distinctMints.length} Mints (${mintPreview}). Cooldown ${Math.round(TRACKER_IGNORED_SIGNAL_COOLDOWN_MS / 60000)}m.`;
+  paperWhaleSignalCooldowns.set(whale.address, {
+    untilMs: now + TRACKER_IGNORED_SIGNAL_COOLDOWN_MS,
+    reason,
+  });
+  recentIgnoredPaperSignals.delete(whale.address);
+  return reason;
 }
 
 function readPaperTrades(): Record<string, PaperTradeRecord> {
@@ -583,6 +651,50 @@ function getTokenDeltaUi(parsedTx: Awaited<ReturnType<Connection['getParsedTrans
   }
 
   return Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+}
+
+function getSignedTokenDeltaUi(parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>, walletAddress: string, mint: string): number | undefined {
+  const postBalances = parsedTx?.meta?.postTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances?.filter(
+    (balance) => balance.owner === walletAddress && balance.mint === mint,
+  ) ?? [];
+
+  const postRaw = postBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const preRaw = preBalances.reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount.amount), 0n);
+  const deltaRaw = postRaw - preRaw;
+  const decimals = postBalances[0]?.uiTokenAmount.decimals ?? preBalances[0]?.uiTokenAmount.decimals ?? 0;
+
+  if (deltaRaw === 0n) {
+    return undefined;
+  }
+
+  const absoluteUi = Number(deltaRaw < 0n ? -deltaRaw : deltaRaw) / 10 ** decimals;
+  return deltaRaw < 0n ? -absoluteUi : absoluteUi;
+}
+
+function getPositiveTokenChanges(
+  parsedTx: Awaited<ReturnType<Connection['getParsedTransaction']>>,
+  walletAddress: string,
+): PositiveTokenChange[] {
+  const candidateMints = new Set<string>();
+  const postBalances = parsedTx?.meta?.postTokenBalances ?? [];
+  const preBalances = parsedTx?.meta?.preTokenBalances ?? [];
+
+  for (const balance of [...preBalances, ...postBalances]) {
+    if (balance.owner === walletAddress && balance.mint !== SOL_MINT) {
+      candidateMints.add(balance.mint);
+    }
+  }
+
+  return [...candidateMints]
+    .map((mint) => ({
+      mint,
+      deltaUi: getSignedTokenDeltaUi(parsedTx, walletAddress, mint) ?? 0,
+    }))
+    .filter((change) => change.deltaUi > 0)
+    .sort((left, right) => right.deltaUi - left.deltaUi || left.mint.localeCompare(right.mint));
 }
 
 async function inferEntryPriceFromWhaleTransaction(params: {
@@ -1962,24 +2074,36 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       console.log(`Fehler beim Panik-Check fuer ${currentWhale.address.slice(0,8)}.`);
     }
 
-    const tokenChange = tx.meta?.postTokenBalances?.find((balance) =>
-      balance.owner === currentWhale.address && balance.mint !== SOL_MINT,
-    );
-
-    if (!tokenChange) {
+    const positiveTokenChanges = getPositiveTokenChanges(tx, currentWhale.address);
+    if (positiveTokenChanges.length === 0) {
       return;
     }
 
-    const preBalance = tx.meta?.preTokenBalances?.find((balance) => balance.owner === currentWhale.address && balance.mint === tokenChange.mint);
-    const preAmt = preBalance ? Number(preBalance.uiTokenAmount.uiAmount) : 0;
-    const postAmt = Number(tokenChange.uiTokenAmount.uiAmount);
-
-    if (postAmt <= preAmt) {
-      return;
-    }
+    const tokenChange = positiveTokenChanges.find((change) => !isNonTargetWhaleMint(change.mint))
+      ?? positiveTokenChanges[0]!;
+    const positionProfile = getPositionSizeProfile(currentWhale);
 
     if (!markWhaleSignalProcessed(currentWhale.address, tokenChange.mint, 'buy')) {
       logSuppressedWhaleSignal(currentWhale.address, tokenChange.mint, 'buy');
+      return;
+    }
+
+    if (isNonTargetWhaleMint(tokenChange.mint)) {
+      const ignoredMintLabel = describeNonTargetWhaleMint(tokenChange.mint);
+      const cooldownReason = positionProfile.sampleSize < PAPER_SUBSCRIPTION_REVIEW_TRADES
+        ? registerIgnoredPaperSignal(currentWhale, tokenChange.mint)
+        : null;
+      console.log(`[TRACKER] ${ignoredMintLabel} (${tokenChange.mint.slice(0,6)}) von Wal ${currentWhale.address.slice(0,8)} ignoriert: Core-/Quote-Token ist kein Zielsignal.`);
+      updateRuntimeStatus('tracker', {
+        lastIgnoredSignalAt: new Date().toISOString(),
+        lastIgnoredSignalWhale: currentWhale.address,
+        lastIgnoredSignalMint: tokenChange.mint,
+        lastIgnoredSignalReason: cooldownReason ?? `${ignoredMintLabel} ist als Core-/Quote-Token ausgefiltert.`,
+      });
+      if (cooldownReason) {
+        console.log(`[TRACKER] ${currentWhale.address.slice(0,8)} wird temporaer pausiert: ${cooldownReason}`);
+        await removeTrackedWhaleSubscription(currentWhale.address, cooldownReason);
+      }
       return;
     }
 
@@ -1992,8 +2116,6 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       signature,
       botMode: currentWhale.mode,
     });
-
-    const positionProfile = getPositionSizeProfile(currentWhale);
     const whaleBuySizeSol = getReliableWhaleBuySizeSol(tx, currentWhale.address);
     const solUsdPrice = whaleBuySizeSol !== null ? await fetchSolUsdPrice() : null;
     const whaleBuySizeUsd = whaleBuySizeSol !== null && solUsdPrice && solUsdPrice > 0
@@ -2012,7 +2134,7 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       return;
     }
 
-    const cluster = registerRelevantBuyClusterSignal(tokenChange.mint, {
+    const signalMember: ClusterSignalMember = {
       whale: currentWhale,
       profile: positionProfile,
       detectedAtMs: Date.now(),
@@ -2020,7 +2142,8 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       signalClass: getWhaleSignalClass(currentWhale, positionProfile),
       buySizeSol: whaleBuySizeSol,
       buySizeUsd: whaleBuySizeUsd,
-    });
+    };
+    const cluster = registerRelevantBuyClusterSignal(tokenChange.mint, signalMember);
 
     if (!cluster.qualified) {
       console.log(`[CLUSTER] ${tokenChange.mint.slice(0,6)} wartet auf Konfluenz: ${cluster.members.length}/${TRACKER_SIGNAL_CLUSTER_MIN_WALLETS} Wallets, ${cluster.premiumWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_PREMIUM_WALLETS} premium, ${cluster.insiderWalletCount}/${TRACKER_SIGNAL_CLUSTER_MIN_INSIDER_WALLETS} insider.`);
@@ -2034,6 +2157,19 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
         lastPendingClusterPremiumWalletCount: cluster.premiumWalletCount,
         lastPendingClusterInsiderWalletCount: cluster.insiderWalletCount,
       });
+
+      if (currentWhale.mode === 'paper') {
+        console.log(`[PAPER] ${tokenChange.mint.slice(0,6)} von Wal ${currentWhale.address.slice(0,8)} wird trotz fehlender Cluster-Konfluenz als Bewertungs-Trade geprueft.`);
+        await logDecision(
+          currentWhale,
+          tokenChange.mint,
+          tx,
+          signature,
+          undefined,
+          signalMember,
+        );
+      }
+
       return;
     }
 
@@ -2062,7 +2198,7 @@ async function processTrackedWhaleLog(whale: WhaleRecord, signature: string) {
       tx,
       signature,
       cluster,
-      cluster.members.find((member) => member.whale.address === currentWhale.address),
+      signalMember,
     );
   } finally {
     finalizeSignatureProcessing(signature, wasHandled);
@@ -2079,6 +2215,12 @@ async function refreshWhaleSubscriptions() {
   for (const whale of whales) {
     if (whale.mode !== 'paper') {
       liveWhales.push(whale);
+      continue;
+    }
+
+    const runtimeCooldownReason = getPaperWhaleSignalCooldownReason(whale.address);
+    if (runtimeCooldownReason) {
+      blockedWhales.set(whale.address, runtimeCooldownReason);
       continue;
     }
 
