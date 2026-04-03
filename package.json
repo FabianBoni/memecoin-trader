@@ -24,7 +24,7 @@
     "dashboard:web:ensure": "tsx src/scripts/ensure-web-deps.ts",
     "dashboard:web:dev": "npm run dashboard:web:ensure && npm --prefix web run dev",
     "dashboard:web:build": "npm run dashboard:web:ensure && npm --prefix web run build",
-    "dashboard:web:start": "npm --prefix web run start",
+    "dashboard:web:start": "npm run dashboard:web:ensure && npm --prefix web run start",
     "dashboard": "npm run dashboard:web:build && npm run dashboard:web:start",
     "profit:report": "tsx src/scripts/profit-report.ts",
     "audit:storage": "tsx src/scripts/audit-storage.ts"

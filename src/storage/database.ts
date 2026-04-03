@@ -5,6 +5,7 @@ import { env } from "../config/env.js";
 import { resolveConfiguredPath, resolveRepoPath, resolveSrcDataPath } from "../utils/repo-paths.js";
 
 const SCHEMA_PATH = resolveRepoPath("db", "schema.sql");
+const DATABASE_OPEN_RETRY_DELAYS_MS = [150, 350, 750, 1500] as const;
 
 let databaseInstance: Database.Database | null = null;
 let databaseRecoveryAttempted = false;
@@ -549,14 +550,60 @@ function closeDatabaseQuietly(db: Database.Database | null): void {
   }
 }
 
+function sleepSync(delayMs: number): void {
+  const buffer = new SharedArrayBuffer(4);
+  const view = new Int32Array(buffer);
+  Atomics.wait(view, 0, 0, delayMs);
+}
+
+function getSqliteErrorCode(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : "";
+}
+
+function getSqliteErrorMessage(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+
+  const message = (error as { message?: unknown }).message;
+  return typeof message === "string" ? message : "";
+}
+
+function isRetryableSqliteOpenError(error: unknown): boolean {
+  const code = getSqliteErrorCode(error);
+  const message = getSqliteErrorMessage(error).toLowerCase();
+
+  return code.startsWith("SQLITE_IOERR")
+    || code.startsWith("SQLITE_BUSY")
+    || code.startsWith("SQLITE_LOCKED")
+    || message.includes("disk i/o error")
+    || message.includes("database is locked")
+    || message.includes("resource busy")
+    || message.includes("unable to open database file");
+}
+
 function quarantineFileIfExists(filePath: string, suffix: string): string | null {
   if (!fs.existsSync(filePath)) {
     return null;
   }
 
   const targetPath = `${filePath}${suffix}`;
-  fs.renameSync(filePath, targetPath);
-  return targetPath;
+  try {
+    fs.renameSync(filePath, targetPath);
+    return targetPath;
+  } catch (error) {
+    const errorCode = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (errorCode === "ENOENT") {
+      return null;
+    }
+
+    throw error;
+  }
 }
 
 function quarantineCorruptDatabaseFiles(databasePath: string): string[] {
@@ -596,31 +643,44 @@ export function getDatabase(): Database.Database {
   }
 
   const databasePath = resolveDatabasePath();
-  let openedDatabase: Database.Database | null = null;
+  let lastError: unknown;
 
-  try {
-    openedDatabase = openDatabase(databasePath);
-    databaseInstance = openedDatabase;
-    return openedDatabase;
-  } catch (error) {
-    closeDatabaseQuietly(openedDatabase);
+  for (let attempt = 0; attempt <= DATABASE_OPEN_RETRY_DELAYS_MS.length; attempt += 1) {
+    let openedDatabase: Database.Database | null = null;
 
-    if (!isSqliteCorruptionError(error) || databaseRecoveryAttempted) {
+    try {
+      openedDatabase = openDatabase(databasePath);
+      databaseInstance = openedDatabase;
+      return openedDatabase;
+    } catch (error) {
+      closeDatabaseQuietly(openedDatabase);
+      lastError = error;
+
+      if (isSqliteCorruptionError(error) && !databaseRecoveryAttempted) {
+        databaseRecoveryAttempted = true;
+        const movedPaths = quarantineCorruptDatabaseFiles(databasePath);
+        console.error(`[DB] SQLite corruption detected at ${databasePath}. Corrupt files were quarantined and a fresh database will be created.`);
+        if (movedPaths.length > 0) {
+          console.error(`[DB] Quarantined: ${movedPaths.join(", ")}`);
+        }
+        console.warn("[DB] Fresh SQLite database will now be recreated from runtime snapshots.");
+        continue;
+      }
+
+      if (isRetryableSqliteOpenError(error) && attempt < DATABASE_OPEN_RETRY_DELAYS_MS.length) {
+        const delayMs = DATABASE_OPEN_RETRY_DELAYS_MS[attempt] ?? DATABASE_OPEN_RETRY_DELAYS_MS[DATABASE_OPEN_RETRY_DELAYS_MS.length - 1] ?? 250;
+        const errorCode = getSqliteErrorCode(error) || "SQLITE_OPEN_RETRY";
+        const errorMessage = getSqliteErrorMessage(error) || "transient startup race";
+        console.warn(`[DB] Retry database open in ${delayMs}ms after ${errorCode}: ${errorMessage}`);
+        sleepSync(delayMs);
+        continue;
+      }
+
       throw error;
     }
-
-    databaseRecoveryAttempted = true;
-    const movedPaths = quarantineCorruptDatabaseFiles(databasePath);
-    console.error(`[DB] SQLite corruption detected at ${databasePath}. Corrupt files were quarantined and a fresh database will be created.`);
-    if (movedPaths.length > 0) {
-      console.error(`[DB] Quarantined: ${movedPaths.join(", ")}`);
-    }
-
-    const recoveredDatabase = openDatabase(databasePath);
-    databaseInstance = recoveredDatabase;
-    console.warn("[DB] Fresh SQLite database created after corruption recovery. Runtime JSON snapshots will repopulate state.");
-    return recoveredDatabase;
   }
+
+  throw lastError instanceof Error ? lastError : new Error("Unknown database open failure.");
 }
 
 export function readJsonFileFromDiskSync<T>(filePath: string, fallback: T): T {
