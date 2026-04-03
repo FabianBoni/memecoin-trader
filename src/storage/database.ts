@@ -7,6 +7,7 @@ import { resolveConfiguredPath, resolveRepoPath, resolveSrcDataPath } from "../u
 const SCHEMA_PATH = resolveRepoPath("db", "schema.sql");
 
 let databaseInstance: Database.Database | null = null;
+let databaseRecoveryAttempted = false;
 
 type JsonDocumentRow = {
   payload_json: string;
@@ -520,6 +521,71 @@ export function isDatabaseEnabled(): boolean {
   return env.DATABASE_PATH.trim().length > 0;
 }
 
+function isSqliteCorruptionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate.code === "string" ? candidate.code : "";
+  const message = typeof candidate.message === "string" ? candidate.message.toLowerCase() : "";
+  return code === "SQLITE_CORRUPT"
+    || code === "SQLITE_NOTADB"
+    || message.includes("database disk image is malformed")
+    || message.includes("database corrupt")
+    || message.includes("file is not a database")
+    || message.includes("sqlite_corrupt");
+}
+
+function closeDatabaseQuietly(db: Database.Database | null): void {
+  if (!db) {
+    return;
+  }
+
+  try {
+    db.close();
+  } catch {
+    // Ignore close failures during corruption recovery.
+  }
+}
+
+function quarantineFileIfExists(filePath: string, suffix: string): string | null {
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+
+  const targetPath = `${filePath}${suffix}`;
+  fs.renameSync(filePath, targetPath);
+  return targetPath;
+}
+
+function quarantineCorruptDatabaseFiles(databasePath: string): string[] {
+  const suffix = `.corrupt-${new Date().toISOString().replaceAll(":", "").replaceAll(".", "-")}`;
+  const movedPaths = [
+    quarantineFileIfExists(databasePath, suffix),
+    quarantineFileIfExists(`${databasePath}-wal`, suffix),
+    quarantineFileIfExists(`${databasePath}-shm`, suffix),
+  ].filter((filePath): filePath is string => filePath !== null);
+
+  return movedPaths;
+}
+
+function openDatabase(databasePath: string): Database.Database {
+  ensureParentDirectory(databasePath);
+
+  const db = new Database(databasePath);
+  try {
+    db.pragma("journal_mode = WAL");
+    db.pragma("foreign_keys = ON");
+    db.pragma(`busy_timeout = ${env.DATABASE_BUSY_TIMEOUT_MS}`);
+    ensureSchema(db);
+    return db;
+  } catch (error) {
+    closeDatabaseQuietly(db);
+    throw error;
+  }
+}
+
 export function getDatabase(): Database.Database {
   if (!isDatabaseEnabled()) {
     throw new Error("Database support is disabled because DATABASE_PATH is empty.");
@@ -530,16 +596,31 @@ export function getDatabase(): Database.Database {
   }
 
   const databasePath = resolveDatabasePath();
-  ensureParentDirectory(databasePath);
+  let openedDatabase: Database.Database | null = null;
 
-  const db = new Database(databasePath);
-  db.pragma("journal_mode = WAL");
-  db.pragma("foreign_keys = ON");
-  db.pragma(`busy_timeout = ${env.DATABASE_BUSY_TIMEOUT_MS}`);
-  ensureSchema(db);
+  try {
+    openedDatabase = openDatabase(databasePath);
+    databaseInstance = openedDatabase;
+    return openedDatabase;
+  } catch (error) {
+    closeDatabaseQuietly(openedDatabase);
 
-  databaseInstance = db;
-  return db;
+    if (!isSqliteCorruptionError(error) || databaseRecoveryAttempted) {
+      throw error;
+    }
+
+    databaseRecoveryAttempted = true;
+    const movedPaths = quarantineCorruptDatabaseFiles(databasePath);
+    console.error(`[DB] SQLite corruption detected at ${databasePath}. Corrupt files were quarantined and a fresh database will be created.`);
+    if (movedPaths.length > 0) {
+      console.error(`[DB] Quarantined: ${movedPaths.join(", ")}`);
+    }
+
+    const recoveredDatabase = openDatabase(databasePath);
+    databaseInstance = recoveredDatabase;
+    console.warn("[DB] Fresh SQLite database created after corruption recovery. Runtime JSON snapshots will repopulate state.");
+    return recoveredDatabase;
+  }
 }
 
 export function readJsonFileFromDiskSync<T>(filePath: string, fallback: T): T {

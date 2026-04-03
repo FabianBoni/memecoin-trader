@@ -1,5 +1,30 @@
 [
   {
+    "planId": "PLAN-20260325190147-4B6E",
+    "createdAt": "2026-03-25T19:01:47.214Z",
+    "tokenAddress": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "requestedPositionSol": 0.2,
+    "allowedPositionSol": 0.3,
+    "currentOpenExposureSol": 0,
+    "projectedOpenExposureSol": 0.2,
+    "remainingExposureCapacitySol": 0.5,
+    "finalPositionSol": 0.2,
+    "maxSlippageBps": 250,
+    "stopLossPct": 30,
+    "takeProfitPct": 100,
+    "takeProfitSellFraction": 0.5,
+    "dryRun": true,
+    "requiresGo": true,
+    "screenPassed": false,
+    "executable": false,
+    "blockingReasons": [
+      "Unable to determine LP mint address for discovered pool."
+    ],
+    "notes": [],
+    "poolAddress": "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",
+    "dexId": "orca"
+  },
+  {
     "planId": "PLAN-20260326091236-YTWZ",
     "createdAt": "2026-03-26T09:12:36.623Z",
     "tokenAddress": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
@@ -206,31 +231,6 @@
   {
     "planId": "PLAN-20260325190246-S388",
     "createdAt": "2026-03-25T19:02:46.323Z",
-    "tokenAddress": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
-    "requestedPositionSol": 0.2,
-    "allowedPositionSol": 0.3,
-    "currentOpenExposureSol": 0,
-    "projectedOpenExposureSol": 0.2,
-    "remainingExposureCapacitySol": 0.5,
-    "finalPositionSol": 0.2,
-    "maxSlippageBps": 250,
-    "stopLossPct": 30,
-    "takeProfitPct": 100,
-    "takeProfitSellFraction": 0.5,
-    "dryRun": true,
-    "requiresGo": true,
-    "screenPassed": false,
-    "executable": false,
-    "blockingReasons": [
-      "Unable to determine LP mint address for discovered pool."
-    ],
-    "notes": [],
-    "poolAddress": "D6NdKrKNQPmRZCCnG1GqXtF7MMoHB7qR6GU5TkG59Qz1",
-    "dexId": "orca"
-  },
-  {
-    "planId": "PLAN-20260325190147-4B6E",
-    "createdAt": "2026-03-25T19:01:47.214Z",
     "tokenAddress": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
     "requestedPositionSol": 0.2,
     "allowedPositionSol": 0.3,
